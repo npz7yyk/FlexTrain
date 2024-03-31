@@ -1,208 +1,110 @@
+import os
 import torch
 
+from constants import (
+    DEFAULT_PROCESS_GROUP_TIMEOUT,
+    DEFAULT_TORCH_DISTRIBUTED_BACKEND,
+    DEFAULT_TORCH_DISTRIBUTED_INIT_METHOD
+)
+from logging_utils import rank0_info as info
+from torch_utils import (
+    has_all_reduce_coalesced,
+    has_coalescing_manager,
+    get_all_gather_function,
+    get_coalescing_manager,
+    get_reduce_scatter_function
+)
 
-def init_distributed(dist_backend=None,
-                     auto_mpi_discovery=True,
-                     distributed_port=TORCH_DISTRIBUTED_DEFAULT_PORT,
-                     verbose=True,
-                     timeout=default_pg_timeout,
-                     init_method=None,
-                     dist_init_required=None,
-                     config=None,
-                     rank=-1,
-                     world_size=-1):
-    ''' Initialize dist backend, potentially performing MPI discovery if needed
+
+# TODO: comments
+_BACKEND = None
+
+
+def is_distributed_intialized():
+    return _BACKEND is not None
+
+
+def init_distributed(
+    dist_backend=DEFAULT_TORCH_DISTRIBUTED_BACKEND,
+    timeout=DEFAULT_PROCESS_GROUP_TIMEOUT,
+    init_method=DEFAULT_TORCH_DISTRIBUTED_INIT_METHOD,
+    rank=-1,
+    world_size=-1
+):
+    """
+    Initialize dist backend, potentially performing MPI discovery if needed
 
     Arguments:
-        dist_backend: Optional (str). torch distributed backend, e.g., nccl, mpi, gloo
-        auto_mpi_discovery Optional (bool). if distributed environment variables are not set, attempt to discover them from MPI
-        distributed_port: Optional (int). torch distributed backend port
-        verbose: Optional (bool). verbose logging
-        timeout: Optional (timedelta). Timeout for operations executed against the process group. Default value equals 30 minutes.
-        init_method: Optional (string). Torch distributed, URL specifying how to initialize the process group. Default is “env://” if no init_method or store is specified.
-        config: Optional (dict). DeepSpeed configuration for setting up comms options (e.g. Comms profiling)
-        rank: Optional (int). The current manually specified rank. Some init_method like “tcp://” need the rank and world_size as well (see: https://pytorch.org/docs/stable/distributed.html#tcp-initialization)
-        world_size: Optional (int). Desired world_size for the TCP or Shared file-system initialization.
-    '''
-    global cdb
-
-    configure(deepspeed_config=config)
-
-    if dist_init_required is None:
-        dist_init_required = cdb is None or not cdb.is_initialized()
-
-    if cdb is None and torch.distributed.is_initialized():
-        # The user initialized torch.dist themselves, create cdb and short-circuit
-        cdb = TorchBackend(dist_backend, timeout, init_method)
+        dist_backend: Optional (str). Default is nccl.
+            torch distributed backend, e.g., nccl, mpi, gloo
+        timeout: Optional (timedelta). Default value equals 30 minutes.
+            Timeout for operations executed against the process group.
+        init_method: Optional (string). Default is “env://”.
+            URL specifying how to initialize the process group.
+        rank: Optional (int). Default is -1.
+            The current manually specified rank. Needed by some init_methods.
+        world_size: Optional (int). Default is -1.
+            Desired world_size for the TCP / Shared file-system initialization.
+    """
+    if is_distributed_intialized():
         return
 
-    # Initialize torch distributed if needed
-    required_env = ["RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT", "LOCAL_RANK"]
+    global _BACKEND
 
-    if cdb is not None and cdb.is_initialized():
-        if int(os.getenv('RANK', '0')) == 0:
-            utils.logger.info('Distributed backend already initialized')
-    else:
-        assert isinstance(timeout, timedelta)
-        if dist_backend is None:
-            dist_backend = get_accelerator().communication_backend_name()
-        if int(os.getenv('RANK', '0')) == 0:
-            utils.logger.info('Initializing TorchBackend in DeepSpeed with backend {}'.format(dist_backend))
-        # Create a torch backend object, initialize torch distributed, and assign to cdb
-        cdb = TorchBackend(dist_backend, timeout, init_method, rank, world_size)
+    info(f"FlexTrain initializing TorchBackend with backend {dist_backend}")
+    _BACKEND = TorchBackend(
+        dist_backend=dist_backend,
+        timeout=timeout,
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
 
 
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
-
-# DeepSpeed Team
-
-from deepspeed import utils
-
-from .utils import *
-from .backend import *
-from .comm import *
-import os
-
-DS_COMM_ALL_GATHER_OFF = False
-DS_COMM_REDUCE_SCATTER_OFF = False
-DS_COMM_BROADCAST_OFF = False
-DS_COMM_ALL_REDUCE_OFF = False
-DS_COMM_REDUCE_OFF = False
-
-
-def is_torch_ver_eq_2_0():
-    TORCH_MAJOR, TORCH_MINOR = map(int, torch.__version__.split('.')[:2])
-    if TORCH_MAJOR == 2 and TORCH_MINOR == 0:
-        return True
-    return False
-
-
-def is_torch_ver_ge_2_1():
-    TORCH_MAJOR, TORCH_MINOR = map(int, torch.__version__.split('.')[:2])
-    if TORCH_MAJOR >= 2 and TORCH_MINOR >= 1:
-        return True
-    return False
-
-
-def torch_ver_ge_1_13():
-    TORCH_MAJOR, TORCH_MINOR = map(int, torch.__version__.split('.')[:2])
-    if TORCH_MAJOR >= 1 and TORCH_MINOR >= 13:
-        return True
-    return False
-
-
-def has_coalescing_manager():
-    has_c10d = hasattr(torch.distributed, 'distributed_c10d')
-    return has_c10d and hasattr(torch.distributed.distributed_c10d, '_coalescing_manager')
-
-
-def has_all_reduce_coalesced():
-    return hasattr(torch.distributed, "all_reduce_coalesced") and torch_ver_ge_1_13()
-
-
-def get_coalescing_manager(group, device, reqs, async_op):
-    if is_torch_ver_eq_2_0():
-        return torch.distributed.distributed_c10d._coalescing_manager(group, device=device, reqs=reqs)
-    elif is_torch_ver_ge_2_1():
-        return torch.distributed.distributed_c10d._coalescing_manager(group, device=device, async_ops=async_op)
-    else:
-        return torch.distributed.distributed_c10d._coalescing_manager(group, reqs)
-
-
-##Utilities to turn comm off
-##TODO: move to base comm (wrapper)
-def all_gather_comm_off(flag=False):
-    global DS_COMM_ALL_GATHER_OFF
-    DS_COMM_ALL_GATHER_OFF = flag
-
-
-def reduce_scatter_comm_off(flag=False):
-    global DS_COMM_REDUCE_SCATTER_OFF
-    DS_COMM_REDUCE_SCATTER_OFF = flag
-
-
-def broadcast_comm_off(flag=False):
-    global DS_COMM_BROADCAST_OFF
-    DS_COMM_BROADCAST_OFF = flag
-
-
-def all_reduce_comm_off(flag=False):
-    global DS_COMM_ALL_REDUCE_OFF
-    DS_COMM_ALL_REDUCE_OFF = flag
-
-
-def reduce_comm_off(flag=False):
-    global DS_COMM_REDUCE_OFF
-    DS_COMM_REDUCE_OFF = flag
-
-
-#assumption: all_gather and reduce scatter
-## are what we care about
-def backward_comm_off(flag=False):
-    all_gather_comm_off(flag)
-    reduce_scatter_comm_off(flag)
-
-
-class Noop:
-
-    def wait(self):
-        return None
-
-
-class TorchBackend(Backend):
+class TorchBackend(object):
     """
         A light-weight wrapper class for torch.distributed API.
         Only a subset of functions are wrapped. Once the init_process_group
-        is initialized, standard torch.distributed.* can be used directly
-        so no need to wrap all the functions. We can keep adding wrappers as
-        needed.
+        is initialized, standard torch.distributed.* can be used directly.
     """
 
-    def __init__(self, backend, timeout, init_method, rank=-1, world_size=-1, name='torch'):
-        super(TorchBackend, self).__init__()
+    def __init__(
+        self,
+        dist_backend,
+        timeout,
+        init_method,
+        rank,
+        world_size
+    ):
+        self.world_size = world_size
+        self.rank = rank
+
         self.has_all_reduce_coalesced = has_all_reduce_coalesced()
         self.has_coalescing_manager = has_coalescing_manager()
-        self.all_gather_function = self.get_all_gather_function()
-        self.reduce_scatter_function = self.get_reduce_scatter_function()
-        self.initialized = True
-        self.name = name
+        self.all_gather_function = get_all_gather_function()
+        self.reduce_scatter_function = get_reduce_scatter_function()
+
         # Future functionality to support ds.initialize() on a single GPU
-        # The idea is to fake that dist backend is initialized even when
-        # it is not so we can run on a single GPU without doing any init_process_group
+        # The idea is to fake that dist backend is initialized even when it is
+        # not so we can run on a single GPU without init_process_group
         self.single_gpu_mode = True
-        self.init_process_group(backend, timeout, init_method, rank, world_size)
 
-    @classmethod
-    def get_all_gather_function(self):
-        if hasattr(torch.distributed, "all_gather_into_tensor"):
-            return torch.distributed.all_gather_into_tensor
-        elif hasattr(torch.distributed, "_all_gather_base"):
-            return torch.distributed._all_gather_base
-        return None
+        if torch.distributed.is_initialized():
+            return
 
-    @classmethod
-    def get_reduce_scatter_function(self):
-        if hasattr(torch.distributed, "reduce_scatter_tensor"):
-            return torch.distributed.reduce_scatter_tensor
-        elif hasattr(torch.distributed, "_reduce_scatter_base"):
-            return torch.distributed._reduce_scatter_base
-        return None
+        torch.distributed.init_process_group(
+            dist_backend,
+            timeout=timeout,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size
+        )
 
     def has_all_gather_into_tensor(self):
         return self.all_gather_function is not None
 
     def has_reduce_scatter_tensor(self):
         return self.reduce_scatter_function is not None
-
-    def init_process_group(self, backend, timeout, init_method, rank, world_size):
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend,
-                                                 timeout=timeout,
-                                                 init_method=init_method,
-                                                 rank=rank,
-                                                 world_size=world_size)
-        self.using_mpi = torch.distributed.get_backend() == 'mpi'
 
     def all_reduce(self, tensor, op=torch.distributed.ReduceOp.SUM, group=None, async_op=False):
         op = self._reduce_op(op)
@@ -223,39 +125,20 @@ class TorchBackend(Backend):
         return torch.distributed.all_reduce_coalesced(tensors=tensors, op=op, group=group, async_op=async_op)
 
     def reduce(self, tensor, dst, op=ReduceOp.SUM, group=None, async_op=False):
-        if DS_COMM_REDUCE_OFF:
-            if int(os.getenv('RANK', '0')) == 0:
-                utils.logger.warning("REDUCE is OFF")
-            return Noop()
         return torch.distributed.reduce(tensor=tensor, dst=dst, op=self._reduce_op(op), group=group, async_op=async_op)
 
     def reduce_scatter(self, output, input_list, op=ReduceOp.SUM, group=None, async_op=False):
-        if DS_COMM_REDUCE_SCATTER_OFF:
-            if int(os.getenv('RANK', '0')) == 0:
-                utils.logger.warning("REDUCE SCATTER  is OFF")
-            return Noop()
-        else:
-            return torch.distributed.reduce_scatter(output=output,
-                                                    input_list=input_list,
-                                                    op=self._reduce_op(op),
-                                                    group=group,
-                                                    async_op=async_op)
+        return torch.distributed.reduce_scatter(output=output,
+                                                input_list=input_list,
+                                                op=self._reduce_op(op),
+                                                group=group,
+                                                async_op=async_op)
 
     def broadcast(self, tensor, src, group=None, async_op=False):
-        if DS_COMM_BROADCAST_OFF:
-            if int(os.getenv('RANK', '0')) == 0:
-                utils.logger.warning("BROADCAST  is OFF")
-            return Noop()
-        else:
-            return torch.distributed.broadcast(tensor=tensor, src=src, group=group, async_op=async_op)
+        return torch.distributed.broadcast(tensor=tensor, src=src, group=group, async_op=async_op)
 
-    def all_gather(self, tensor_list, tensor, group=None, async_op=False):
-        if DS_COMM_ALL_GATHER_OFF:
-            if int(os.getenv('RANK', '0')) == 0:
-                utils.logger.warning("All Gather is OFF")
-            return Noop()
-        else:
-            return torch.distributed.all_gather(tensor_list=tensor_list, tensor=tensor, group=group, async_op=async_op)
+    def all_gather(self, tensor_list, tensor, group=None, async_op=False):    
+        return torch.distributed.all_gather(tensor_list=tensor_list, tensor=tensor, group=group, async_op=async_op)
 
     def all_gather_into_tensor(self, output_tensor, input_tensor, group=None, async_op=False):
         if self.has_all_gather_into_tensor():
@@ -421,8 +304,3 @@ class TorchBackend(Backend):
                 op = torch.distributed.ReduceOp.BXOR
         return op
 
-
-# This will become a light-weight wrapper around torch.distributed functions
-# TODO: create some example to show how this wrapper can help profile communication
-# TODO: make sure there is no performance regression with this approach
-# TODO: explore monkey-patching if this does not work
