@@ -1,7 +1,9 @@
 from argparse import ArgumentParser
 
-from .optimizer import LLMFuncPack as LLMFuncPack
+from .config import init_flextrain_config
 from .model_initializer import Init
+from .optimizer import LLMFuncPack as LLMFuncPack
+
 # from checkpointing import (
 #     data_parallel_cuda_manual_seed,
 #     FWDContext,
@@ -20,7 +22,7 @@ def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
     Update the argument parser to enabling FlexTrain args parsing.
     The set of FlexTrain arguments include the following:
     1) --flextrain: boolean flag to enable FlexTrain
-    2) --flextrain_config <json file path>: path of a json configuration
+    2) --flextrain-config <json file path>: path of a json configuration
 
     Arguments:
         parser: argument parser
@@ -37,10 +39,10 @@ def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
     )
 
     group.add_argument(
-        "--flextrain_config",
+        "--flextrain-config",
         default=None,
         type=str,
-        help="FlexTrain json configuration."
+        help="Path to FlexTrain json configuration."
     )
 
     return parser
