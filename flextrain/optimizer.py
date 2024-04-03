@@ -1,24 +1,23 @@
 import torch
 from torch.nn import Module
 
-from deepspeed.runtime import DeepSpeedOptimizer
-from deepspeed.runtime.flex.config import FLEX_CONFIG
-from deepspeed.runtime.flex.scheduler import GreedySnakeBatchScheduler
+# from deepspeed.runtime.flex.config import FLEX_CONFIG
+# from deepspeed.runtime.flex.scheduler import GreedySnakeBatchScheduler
 
-from deepspeed.runtime.flex.checkpointing import (
-    detach_variable,
-    checkpointed_forward,
-    retrieve_tensor_grads,
-    checkpointed_backward
-)
+# from deepspeed.runtime.flex.checkpointing import (
+#     detach_variable,
+#     checkpointed_forward,
+#     retrieve_tensor_grads,
+#     checkpointed_backward
+# )
 
 from typing import Sequence, Callable, Iterable, Any, Tuple
 
 
-class FlexTrainFuncPack:
+class LLMFuncPack:
     """
-    FlexTrainFuncPack is a class that contains the necessary
-    functions for FlexTrainOptimizer to work properly.
+    LLMFuncPack is a class that contains the necessary
+    functions for FlexTrain to work properly.
     Users is responsible for providing relevant functions.
 
     Here are the functions that users need to provide:
@@ -117,7 +116,7 @@ class FlexTrainFuncPack:
         return self.loss_fn(llm_output, loss_input)
 
 
-class FlexTrainOptimizer(DeepSpeedOptimizer):
+class FlexTrainOptimizer(object):
     """
     FlexTrainOptimizer is designed to maximize the training throughput.
     ZeRO Stage 3 optimization is used to support multi-GPU training.
@@ -134,8 +133,8 @@ class FlexTrainOptimizer(DeepSpeedOptimizer):
         self.module = module
         self.init_optimizer = init_optimizer
 
-        # Link to the FuncPack from module
-        self.func_pack: FlexTrainFuncPack = module.func_pack
+        # Link to LLM funcs from module
+        # self.llm_funcs: LLMFuncPack = module.
 
         # Create the GreedySnakeBatchScheduler
         self.scheduler = GreedySnakeBatchScheduler(
@@ -175,7 +174,7 @@ def hash_tensor(tensor):
 def test(model, data_iterator):
     model = model.cuda()
     model = model.to(dtype=torch.float16)
-    func_pack: FlexTrainFuncPack = model.func_pack
+    func_pack: LLMFuncPack = model.func_pack
     func_pack.bind_data_iterator(data_iterator)
 
     # with torch.no_grad():

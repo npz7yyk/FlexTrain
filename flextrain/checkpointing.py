@@ -212,7 +212,7 @@ def checkpointed_forward(run_function, *args):
             FWDContext: The context used for recomputation
         )
     """
-    
+
     # Copy the rng states before the forward pass.
     fwd_rng_state = RNGStatePack()
 
@@ -259,7 +259,7 @@ def retrieve_tensor_grads(
 
 def checkpointed_backward(fwd_ctx: FWDContext, *grads):
     """Conduct the recomputation and backward pass.
-    
+
     Args:
         fwd_ctx (FWDContext): The forward context.
         *grads: The gradients to backpropagate.

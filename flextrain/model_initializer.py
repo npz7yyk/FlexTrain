@@ -6,23 +6,25 @@ from torch import Tensor
 from torch.nn import Parameter, Module
 from typing import Callable, Iterable
 
-from config import get_flextrain_config
-from memory_coordinator import (
+from .config import get_flextrain_config
+from .memory_coordinator import (
     is_memory_coordinator_initialized,
     init_memory_coordinator,
     get_memory_coordinator,
     FlexTrainMemoryCoordinator
 )
-from memory_utils import (
+from .utils.memory import (
     move_into_contiguous
 )
 
 
-# Decorator of the layer initialization function
-# This decorator is used to:
-# 1. concatenate the parameters of the layer into a contiguous tensor
-# 2. partition the contiguous tensor for dp and memory hierarchy
-def concat_partition(layer_init_func: Callable):
+def _concat_partition(layer_init_func: Callable):
+    """
+    Decorator of the layer initialization function
+    This decorator is used to:
+    1. concatenate the parameters of the layer into a contiguous tensor
+    2. partition the contiguous tensor for dp and memory hierarchy
+    """
 
     @functools.wraps(layer_init_func)
     def wrapper(module: Module, *args, **kwargs):
@@ -64,7 +66,7 @@ class Init(object):
 
     def _override_layer_init(self, layer_class):
         self._original_layer_init = layer_class.__init__
-        layer_class.__init__ = concat_partition(layer_class.__init__)
+        layer_class.__init__ = _concat_partition(layer_class.__init__)
 
     def _restore_layer_init(self, layer_class):
         layer_class.__init__ = self._original_layer_init
@@ -72,7 +74,7 @@ class Init(object):
 
 if __name__ == "__main__":
     from torch import nn
-    from config import init_flextrain_config
+    from .config import init_flextrain_config
     torch.manual_seed(0)
     init_flextrain_config({
         "dtype": "fp16",

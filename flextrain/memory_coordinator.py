@@ -2,7 +2,7 @@ import torch
 
 from typing import SupportsIndex
 
-from config import get_flextrain_config
+from .config import get_flextrain_config
 
 
 class LoopIndexer:
