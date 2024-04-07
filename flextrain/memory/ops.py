@@ -1,9 +1,13 @@
 import torch
 
+from torch import Tensor
+from torch.nn import Parameter
 from typing import Iterable
 
+from flextrain.utils import dist
 
-def free_tensor(tensor: torch.Tensor):
+
+def free_tensor(tensor: Tensor):
     # Record the current stream if the tensor is on CUDA.
     if tensor.is_cuda:
         tensor.record_stream(torch.cuda.current_stream())
@@ -14,7 +18,7 @@ def free_tensor(tensor: torch.Tensor):
     tensor.data = torch.empty(0, device=device, dtype=dtype)
 
 
-def move_into_contiguous(src: Iterable[torch.Tensor], dst: torch.Tensor):
+def move_into_contiguous(src: Iterable[Parameter], dst: Tensor):
 
     offset = 0
     for tensor in src:
@@ -26,7 +30,7 @@ def move_into_contiguous(src: Iterable[torch.Tensor], dst: torch.Tensor):
 
         # Copy the tensor into the destination tensor.
         dst_target = dst[offset: offset + numel]
-        dst_target.copy_(tensor.view(-1))
+        dst_target.copy_(tensor.data.view(-1))
 
         # Free the memory of the source tensor.
         free_tensor(tensor)

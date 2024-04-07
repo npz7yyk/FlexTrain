@@ -1,8 +1,13 @@
 from argparse import ArgumentParser
 
 from .config import init_flextrain_config
-from .model_initializer import Init
-from .optimizer import LLMFuncPack as LLMFuncPack
+# from .model_initializer import Init
+from .utils import distributed
+from .utils.distributed import (
+    init_distributed,
+    is_distributed_initialized
+)
+# from .optimizer import LLMFuncPack
 
 # from checkpointing import (
 #     data_parallel_cuda_manual_seed,

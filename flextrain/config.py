@@ -16,8 +16,7 @@ class FlexTrainConfig:
 
     world_size: int
     """
-    World size.
-    Must be set to the number of GPUs used for training.
+    World size used for distributed training.
     """
 
     batch_size: int
@@ -64,7 +63,6 @@ def _config_key_check(flex_config_dict):
 
     required_keys = [
         "dtype",
-        "world_size",
         "batch_size",
         "micro_batch_size",
         "micro_batch_per_block",

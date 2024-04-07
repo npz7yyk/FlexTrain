@@ -38,7 +38,7 @@ class MyModel(torch.nn.Module):
         super(MyModel, self).__init__()
 
         self.linear = torch.nn.Linear(hidden_size, 1)
-    
+
     def forward(self, x):
         x = self.linear(x)
         x = torch.sigmoid(x)
