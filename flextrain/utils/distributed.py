@@ -1,9 +1,9 @@
+import os
 import torch
-import torch.distributed as dist
 
 from torch.distributed import ReduceOp
+import torch.distributed
 
-from flextrain.config import get_flextrain_config
 from flextrain.defaults import (
     PROCESS_GROUP_TIMEOUT_DEFAULT,
     TORCH_DISTRIBUTED_BACKEND_DEFAULT,
@@ -22,19 +22,6 @@ _REDUCE_SCATTER_FUNCTION = None
 _INITIALIZED = False
 _LOCAL_RANK = 0
 _WORLD_SIZE = 1
-
-
-def _warn_not_initialized():
-    if not _INITIALIZED:
-        rank0_logger.warning_once(
-            "FlexTrain distributed is not explicitly initialized. "
-            "Defaulting to single-node training ..."
-            ""
-        )
-
-
-def _assert_torch_distributed_initialized():
-    assert dist.is_initialized(), "flextrain.distributed is not initialized"
 
 
 def init_distributed(
@@ -59,13 +46,22 @@ def init_distributed(
         world_size: Optional (int). Default is -1.
             Desired world_size for the TCP / Shared file-system initialization.
     """
-    if dist.is_initialized():
+    global _INITIALIZED
+
+    # If distributed is already initialized, skip initialization
+    if _INITIALIZED:
         return
 
-    global _INITIALIZED
     _INITIALIZED = True
 
-    if get_flextrain_config().world_size == 1:
+    if int(os.getenv("WORLD_SIZE", "0")) == 0:
+        rank0_logger.warning(
+            "Environment variable WORLD_SIZE is not set. "
+            "Defaulting to single-node training. (WORLD_SIZE=1)"
+        )
+        os.environ["WORLD_SIZE"] = "1"
+
+    if int(os.getenv("WORLD_SIZE", "0")) == 1:
         rank0_logger.info(
             "FlexTrain is running in single-node mode. "
             "Distributed backend initialization is skipped."
@@ -79,7 +75,7 @@ def init_distributed(
 
     rank0_logger.info(f"FlexTrain initializing backend {dist_backend}")
 
-    dist.init_process_group(
+    torch.distributed.init_process_group(
         dist_backend,
         timeout=timeout,
         init_method=init_method,
@@ -89,11 +85,20 @@ def init_distributed(
 
     # FlexTrain currently only supports single-node training
     global _LOCAL_RANK, _WORLD_SIZE
-    _LOCAL_RANK = dist.get_rank()
-    _WORLD_SIZE = dist.get_world_size()
+    _LOCAL_RANK = torch.distributed.get_rank()
+    _WORLD_SIZE = torch.distributed.get_world_size()
 
     # Set the device to the current rank
     torch.cuda.set_device(_LOCAL_RANK)
+
+
+def _warn_not_initialized():
+    if not _INITIALIZED:
+        rank0_logger.warning(
+            "FlexTrain distributed is not explicitly initialized. "
+            "Trying to initialize it automatically ..."
+        )
+        init_distributed()
 
 
 def get_rank():
@@ -106,33 +111,52 @@ def get_world_size():
     return _WORLD_SIZE
 
 
-def current_device():
+def is_single_process():
     _warn_not_initialized()
-    return _LOCAL_RANK
+    return _WORLD_SIZE == 1
+
+
+class DummyHandle:
+    """ Handle that imitates a torch.distributed handle but does nothing. """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def wait(self):
+        pass
+
+    def is_completed(self):
+        return True
 
 
 def barrier(group=None):
-    _assert_torch_distributed_initialized()
-    return dist.barrier(group)
+    _warn_not_initialized()
+    if is_single_process():
+        return DummyHandle()
+    return torch.distributed.barrier(group)
 
 
 def broadcast(tensor, src, group=None, async_op=False):
-    _assert_torch_distributed_initialized()
-    return dist.broadcast(tensor, src, group, async_op)
+    _warn_not_initialized()
+    if is_single_process():
+        return DummyHandle()
+    return torch.distributed.broadcast(tensor, src, group, async_op)
 
 
-def all_gather(tensor_list, tensor, group=None, async_op=False):
-    _assert_torch_distributed_initialized()
-    return _ALL_GATHER_FUNCTION(tensor_list, tensor, group, async_op)
+def all_gather(tensor_out, tensor_in, group=None, async_op=False):
+    _warn_not_initialized()
+    if is_single_process():
+        return DummyHandle()
+    return _ALL_GATHER_FUNCTION(tensor_out, tensor_in, group, async_op)
 
 
 def all_gather_coalesced(output_tensor_list, input_tensor, group=None, async_op=False):
-    _assert_torch_distributed_initialized()
+    # _assert_torch_distributed_initialized()
     return get_coalescing_manager().all_gather_coalesced(
         output_tensor_list, input_tensor, group, async_op
     )
 
 
 def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
-    _assert_torch_distributed_initialized()
-    return dist.all_reduce(tensor, op, group, async_op)
+    # _assert_torch_distributed_initialized()
+    return torch.distributed.all_reduce(tensor, op, group, async_op)

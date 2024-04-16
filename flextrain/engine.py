@@ -177,6 +177,7 @@ def hash_tensor(tensor):
     # Return the hexadecimal representation of the hash
     return sha256_hash.hexdigest()
 
+
 def test(model, data_iterator):
     model = model.cuda()
     model = model.to(dtype=torch.float16)

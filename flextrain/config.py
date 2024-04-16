@@ -1,6 +1,7 @@
 import torch
 
 from dataclasses import dataclass
+from typing import Tuple
 
 
 @dataclass
@@ -9,14 +10,14 @@ class FlexTrainConfig:
     Sets parameters for FlexTrain optimizations.
     """
 
-    dtype: torch.dtype
+    device_dtype: torch.dtype
     """
-    Data type used for forward and backward passes.
+    Mixed precision data type used for accelerator.
     """
 
-    world_size: int
+    master_dtype: torch.dtype
     """
-    World size used for distributed training.
+    Mixed precision data type used for master copy.
     """
 
     batch_size: int
@@ -45,34 +46,39 @@ class FlexTrainConfig:
     Checkpoint interval used for activation checkpointing.
     """
 
+    checkpoint_split_ratio: Tuple[float, float]
+    """
+    How to split the checkpointed activations among the memory hierarchy.
+    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
+    User can also provide numels of each level as:
+    Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
+    """
+
+    parameter_split_ratio: Tuple[float, float]
+    """
+    How to split the parameters among the memory hierarchy.
+    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
+    User can also provide numels of each level as:
+    Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
+    """
+
+    optimizer_split_ratio: Tuple[float, float]
+    """
+    How to split the optimizer states among the memory hierarchy.
+    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
+    User can also provide numels of each level as:
+    Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
+    Note: FP32 model parameters are also considered as optimizer states.
+    """
+
+    nvme_swap_dir: str
+    """
+    Directory for NVMe swap files.
+    Must be provided if NVMe swap is necessary for training.
+    """
+
 
 _CONFIG = None
-
-
-def _config_key_check(flex_config_dict):
-    """
-    Check for the required keys in FlexTrain configuration dictionary.
-    If any of the required keys are missing, raise a ValueError.
-
-    Args:
-        flex_config_dict (dict): FlexTrain configuration dictionary
-
-    Returns:
-        None
-    """
-
-    required_keys = [
-        "dtype",
-        "batch_size",
-        "micro_batch_size",
-        "micro_batch_per_block",
-        "num_layers",
-        "checkpoint_interval"
-    ]
-
-    for key in required_keys:
-        if key not in flex_config_dict:
-            raise ValueError(f"FlexTrain configuration missing key: {key}")
 
 
 def _config_set_dtype(flex_config_dict):
@@ -87,21 +93,37 @@ def _config_set_dtype(flex_config_dict):
         None
     """
 
-    assert "dtype" in flex_config_dict, \
-        "FlexTrain configuration missing key: dtype"
+    assert "device_dtype" in flex_config_dict, \
+        "FlexTrain configuration missing key: device_dtype"
+    assert "master_dtype" in flex_config_dict, \
+        "FlexTrain configuration missing key: master_dtype"
 
-    dtype = flex_config_dict["dtype"]
-    if isinstance(dtype, torch.dtype):
-        return
+    def convert_dtype(dtype):
+        if isinstance(dtype, torch.dtype):
+            return dtype
 
-    if dtype in ["fp16", "half", "float16", "torch.float16"]:
-        flex_config_dict["dtype"] = torch.float16
-    elif dtype in ["fp32", "float", "float32", "torch.float32"]:
-        flex_config_dict["dtype"] = torch.float32
-    elif dtype in ["bf16", "bfloat16", "torch.bfloat16"]:
-        flex_config_dict["dtype"] = torch.bfloat16
-    else:
-        raise ValueError(f"Dtype {dtype} not supported by FlexTrain")
+        # Assert dtype is a string.
+        assert isinstance(dtype, str), \
+            f"Dtype {dtype} must be a string if not a torch.dtype"
+
+        # Remove "torch." prefix if present.
+        if "torch." in dtype:
+            dtype = dtype.replace("torch.", "")
+
+        if dtype in ["fp16", "half", "float16"]:
+            return torch.float16
+        elif dtype in ["fp32", "float", "float32"]:
+            return torch.float32
+        elif dtype in ["bf16", "bfloat16"]:
+            return torch.bfloat16
+        else:
+            raise ValueError(f"Dtype {dtype} not supported by FlexTrain")
+
+    # Convert device_dtype and master_dtype.
+    device_dtype = flex_config_dict["device_dtype"]
+    flex_config_dict["device_dtype"] = convert_dtype(device_dtype)
+    master_dtype = flex_config_dict["master_dtype"]
+    flex_config_dict["master_dtype"] = convert_dtype(master_dtype)
 
 
 def init_flextrain_config(config_dict):
@@ -116,9 +138,6 @@ def init_flextrain_config(config_dict):
     Returns:
         None
     """
-
-    # Check for the required keys in configuration dictionary.
-    _config_key_check(config_dict)
 
     # Conduct type conversion.
     _config_set_dtype(config_dict)

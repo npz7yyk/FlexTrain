@@ -3,10 +3,7 @@ from argparse import ArgumentParser
 from .config import init_flextrain_config
 # from .model_initializer import Init
 from .utils import distributed
-from .utils.distributed import (
-    init_distributed,
-    is_distributed_initialized
-)
+from .utils.distributed import init_distributed
 # from .optimizer import LLMFuncPack
 
 # from checkpointing import (

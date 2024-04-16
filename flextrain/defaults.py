@@ -1,5 +1,15 @@
 import os
+import torch
+
 from datetime import timedelta
+
+
+# --- mixed precision defaults ---
+
+# Full precision data type
+FULL_PRECISION_DEFAULT = torch.float32
+
+# --- end of mixed precision defaults ---
 
 
 # --- distributed defaults ---
