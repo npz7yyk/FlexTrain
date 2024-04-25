@@ -1,10 +1,20 @@
+import torch
+
 from argparse import ArgumentParser
 
+import flextrain.checkpointing
+import flextrain.utils.distributed as distributed
+
 from .config import init_flextrain_config
-# from .model_initializer import Init
-from .utils import distributed
+from .defaults import (
+    TORCH_DISTRIBUTED_BACKEND_DEFAULT,
+    TORCH_DISTRIBUTED_INIT_METHOD_DEFAULT,
+    PROCESS_GROUP_TIMEOUT_DEFAULT
+)
+from .engine import FlexTrainEngine
+from .llm_func import LLMFuncPack
+from .memory.initializer import Init
 from .utils.distributed import init_distributed
-# from .optimizer import LLMFuncPack
 
 # from checkpointing import (
 #     data_parallel_cuda_manual_seed,
@@ -13,10 +23,6 @@ from .utils.distributed import init_distributed
 #     checkpointed_forward,
 #     checkpointed_backward
 # )
-
-
-# FlexTrain Enabled or Disabled
-flextrain_enabled = False
 
 
 def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
@@ -50,42 +56,33 @@ def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-# def is_configured():
-#     """ True if FlexTrain has been configured by calling
-#         FlexTrain.runtime.flex.is_configured, else returns false
+def initialize(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    llm_functions: LLMFuncPack,
+    config: dict = None,
+    dist_init_required=False,
+    dist_backend=TORCH_DISTRIBUTED_BACKEND_DEFAULT,
+    timeout=PROCESS_GROUP_TIMEOUT_DEFAULT,
+    init_method=TORCH_DISTRIBUTED_INIT_METHOD_DEFAULT,
+    rank=-1,
+    world_size=-1
+):
+    # Initialize FlexTrain configuration if provided
+    if config is not None:
+        init_flextrain_config(config)
 
-#     Arguments:
-#         None
+    # Initialize distributed if required
+    if dist_init_required:
+        distributed.init_distributed(
+            dist_backend=dist_backend,
+            timeout=timeout,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size
+        )
 
-#     Return:
-#         True of configured, else False
-#     """
-#     return flextrain_enabled
+    # Wrap the model with FlexTrainEngine
+    model = FlexTrainEngine(model, optimizer, llm_functions)
 
-
-# def initialize(args: Namespace):
-#     """ Initializes FlexTrain using the configuration dictionary
-
-#     Arguments:
-#         args: (Namespace) FlexTrain arguments to parse
-
-#     Return:
-#         None
-#     """
-
-#     assert hasattr(args, "FlexTrain_config_dict"), \
-#         "FlexTrain config dictionary not found in args"
-
-#     if "flex_optimization" in args.FlexTrain_config_dict:
-#         flextrain_config_dict = args.FlexTrain_config_dict["flex_optimization"]
-#     else:
-#         # FlexTrain is not configured, therefore return
-#         return
-
-#     # Set global flextrain_enabled
-#     global flextrain_enabled
-#     flextrain_enabled = flextrain_config_dict["enabled"]
-
-#     # If FlexTrain is not enabled, return
-#     if not flextrain_enabled:
-#         return
+    return model

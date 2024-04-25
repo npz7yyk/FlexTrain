@@ -9,9 +9,9 @@ from flextrain.config import get_flextrain_config
 from flextrain.utils.distributed import get_rank, get_world_size
 
 
-class FlexTrainDataTypes(Enum):
+class FlexTrainDataType(Enum):
     """
-    Enum for the data types used in FlexTrain.
+    Enum for the data type used in FlexTrain.
     """
     CKPT = 0
     PARA = 1
@@ -24,7 +24,7 @@ class FlexTrainDataID:
     def __init__(
         self,
         unit_index: int,
-        data_type: FlexTrainDataTypes
+        data_type: FlexTrainDataType
     ):
         self.unit_index = unit_index
         self.data_type = data_type
@@ -141,3 +141,34 @@ class ContiguousParaGroup:
     def detach_grad(self):
         for para in self.paras:
             free_tensor(para.grad, set_none=True)
+
+
+class Waitable:
+    def wait(self):
+        pass
+
+
+class DummyHandle(Waitable):
+    def wait(self):
+        pass
+
+
+class AsyncIOHandle:
+    def __init__(self, handle: Waitable):
+        self._handle = handle
+        self._finished = False
+
+    def wait(self):
+        if self._finished:
+            return
+        self._result = self._handle.wait()
+        self._finished = True
+
+
+class FusedHandle(Waitable):
+    def __init__(self, handles: Iterable[Waitable]):
+        self._handles = handles
+
+    def wait(self):
+        for handle in self._handles:
+            handle.wait()

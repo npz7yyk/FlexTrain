@@ -7,21 +7,20 @@ from typing import SupportsIndex, Iterable, Dict
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
-    FlexTrainDataTypes as Dtype,
+    FlexTrainDataType as Dtype,
     FlexTrainDataID,
     contiguous_allgathered_numel,
     contiguous_partitioned_numel,
     move_into_contiguous,
-    ContiguousParaGroup
+    ContiguousParaGroup,
+    Waitable,
+    DummyHandle,
+    AsyncIOHandle,
+    FusedHandle
 )
 from flextrain.memory.nvme_swapper import AsyncNVMeSwapper
 from flextrain.utils import dist
 from flextrain.utils.logging import rank0_logger
-
-
-# assert CUDA is available
-assert torch.cuda.is_available(), \
-    "FlexTrain requires CUDA to be available"
 
 
 class LoopIndexer:
@@ -62,17 +61,31 @@ def _allocate_memory_chunks(
     return torch.chunk(mem, chunks)
 
 
+def _filter_tensors(
+    data_ids: FlexTrainDataID | Iterable[FlexTrainDataID],
+    tensors: Tensor | Iterable[Tensor]
+):
+    if isinstance(data_ids, FlexTrainDataID):
+        data_ids = [data_ids]
+    if isinstance(tensors, Tensor):
+        tensors = [tensors]
+
+    non_empty_data_ids = []
+    non_empty_tensors = []
+    for data_id, tensor in zip(data_ids, tensors):
+        if tensor.numel() == 0:
+            continue
+        non_empty_data_ids.append(data_id)
+        non_empty_tensors.append(tensor)
+
+    return non_empty_data_ids, non_empty_tensors
+
+
 class FlexTrainMemoryCoordinator:
 
     def __init__(self):
-        # Lazy allocation of the memory.
-        self._memory_allocated = False
-
-        # Lazy initialization of NVMe swapper.
-        self._nvme_swapper = None
-
-        # Map of unit index to its parameters.
-        self._unit_parameters: Dict[int, ContiguousParaGroup] = {}
+        # Lazy initialization of memory coordinator.
+        self._initialized = False
 
     def _get_split_numels(self, total_numel: int, ratios: Iterable[float]):
         # Ensure the number of levels is 2.
@@ -92,14 +105,21 @@ class FlexTrainMemoryCoordinator:
         numels.append(total_numel - sum(numels))
         return tuple(numels)
 
-    def _init_memory(self, parameters: Iterable[Parameter]):
-        # If the memory is already allocated, return.
-        if self._memory_allocated:
+    def _init_coordinator(self, parameters: Iterable[Parameter]):
+        # If already initialized, return.
+        if self._initialized:
             return
-        self._memory_allocated = True
+        self._initialized = True
+
+        # assert CUDA is available
+        assert torch.cuda.is_available(), \
+            "FlexTrain requires CUDA to be available"
 
         # Init coordinator configurations.
         config = get_flextrain_config()
+
+        # Whether running in single GPU mode.
+        self._single_gpu = dist.get_world_size() == 1
 
         # Mixed precision dtype for accelerator.
         self._device_dtype = config.device_dtype
@@ -111,6 +131,12 @@ class FlexTrainMemoryCoordinator:
         layers = config.num_layers
         interval = config.checkpoint_interval
         self._num_units = (layers + interval - 1) // interval
+
+        # Lazy initialization of NVMe swapper.
+        self._nvme_swapper = None
+
+        # Map of unit index to its parameters.
+        self._unit_parameters: Dict[int, ContiguousParaGroup] = {}
 
         # How to split the training data.
         each_rank_numel = contiguous_partitioned_numel(parameters)
@@ -125,7 +151,7 @@ class FlexTrainMemoryCoordinator:
         # Log some useful information.
         unit_numel = sum(p.numel() for p in parameters)
         rank0_logger.info(
-            "\n\n"
+            "\n\n> "
             f"FlexTrain Memory coordinator initialized with configurations:\n"
             f"  - device dtype: {self._device_dtype}\n"
             f"  - master dtype: {self._master_dtype}\n"
@@ -155,14 +181,21 @@ class FlexTrainMemoryCoordinator:
             self._device_dtype, torch.device('cpu')
         )
 
-    def _sync_nvme_offload(
+        # Handle for async IO operations.
+        self._last_layer_index_handle = (-1, None)
+
+    def _nvme_offload(
         self,
-        data_id: FlexTrainDataID,
-        tensor: Tensor
+        data_ids: FlexTrainDataID | Iterable[FlexTrainDataID],
+        tensors: Tensor | Iterable[Tensor],
+        async_op: bool = False
     ):
-        # If the tensor is empty, return.
-        if tensor.numel() == 0:
-            return
+        # Filter out empty tensors.
+        data_ids, tensors = _filter_tensors(data_ids, tensors)
+
+        # If no tensors to offload, return.
+        if len(data_ids) == 0:
+            return DummyHandle() if async_op else None
 
         # Lazy initialization of the NVMe swapper.
         if self._nvme_swapper is None:
@@ -170,8 +203,32 @@ class FlexTrainMemoryCoordinator:
                 get_flextrain_config().nvme_swap_dir
             )
 
-        # Sync the offloaded tensor.
-        self._nvme_swapper.swap_out(data_id, tensor)
+        # Call the NVMe swapper.
+        return self._nvme_swapper.swap_out(
+            data_ids, tensors, async_op
+        )
+
+    def _nvme_reload(
+        self,
+        data_ids: FlexTrainDataID | Iterable[FlexTrainDataID],
+        tensors: Tensor | Iterable[Tensor],
+        async_op: bool = False
+    ):
+        # If swapper is not initialized, return.
+        if self._nvme_swapper is None:
+            return DummyHandle() if async_op else None
+
+        # Filter out empty tensors.
+        data_ids, tensors = _filter_tensors(data_ids, tensors)
+
+        # If no tensors to reload, return.
+        if len(data_ids) == 0:
+            return DummyHandle() if async_op else None
+
+        # Call the NVMe swapper.
+        return self._nvme_swapper.swap_in(
+            data_ids, tensors, async_op
+        )
 
     def init_unit_parameters(
         self,
@@ -180,6 +237,10 @@ class FlexTrainMemoryCoordinator:
     ):
         """
         Initialize the memory for the parameters in a unit.
+        Parameters are moved into contiguous memory and partitioned.
+        The contiguous memory is partitioned as:
+        [(GPU, CPU, NVMe), (GPU, CPU, NVMe), ... (GPU, CPU, NVMe)].
+        Each (GPU, CPU, NVMe) is owned by a rank.
 
         Args:
             unit_index (int): Index of the unit.
@@ -191,7 +252,7 @@ class FlexTrainMemoryCoordinator:
         """
 
         # Initialize memory allocation if not done.
-        self._init_memory(unit_paras)
+        self._init_coordinator(unit_paras)
 
         # Track the unit parameters.
         self._unit_parameters[unit_index] = ContiguousParaGroup(unit_paras)
@@ -218,7 +279,7 @@ class FlexTrainMemoryCoordinator:
         # Store the views.
         self._gpu_para_base[unit_index].copy_(gpu_view)
         self._cpu_para_base[unit_index].copy_(cpu_view)
-        self._sync_nvme_offload(
+        self._nvme_offload(
             FlexTrainDataID(unit_index, Dtype.PARA),
             nvme_view
         )
@@ -245,6 +306,52 @@ class FlexTrainMemoryCoordinator:
 
         # Link the parameters.
         unit_paras.link_para_to(buffer)
+
+    def pre_forward_layer(self, unit_index: int):
+        """
+        Prepare the layer for forward pass.
+
+        Functions:
+        1. Ensure the availability of the parameters and checkpoint.
+        2. Kick off relevant prefetching tasks.
+
+        Args:
+            unit_index (int): Index of the unit.
+        """
+        
+
+    def post_forward_layer(self, unit_index: int):
+        pass
+
+    def _single_gpu_forward_prepare_layer(self, unit_index: int):
+        """
+        Prepare the layer for forward pass in single GPU mode.
+        The parameters are linked to the buffer.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Get the buffer.
+        buffer = self._gpu_working_windows[0]
+
+        # Link the parameters.
+        self._link_unit_parameters(unit_index, buffer)
+
+    def _multi_gpu_forward_prepare_layer(self, unit_index: int):
+        """
+        Prepare the layer for forward pass in multi GPU mode.
+        The parameters are linked to the buffer.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        pass
 
 
 _MEMORY_COORDINATOR = FlexTrainMemoryCoordinator()

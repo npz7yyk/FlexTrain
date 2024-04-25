@@ -3,7 +3,11 @@ import torch
 
 from typing import Iterable
 
-from flextrain.memory import FlexTrainDataID
+from flextrain.memory import (
+    FlexTrainDataID,
+    Waitable,
+    AsyncIOHandle
+)
 from flextrain.ops.aio import AsyncIOBuilder
 from flextrain.defaults import (
     AIO_BLOCK_SIZE_DEFAULT,
@@ -32,11 +36,6 @@ def swap_out_tensors(swap_handle, tensor_buffers, swap_paths):
         assert (swap_handle.async_pwrite(buffer, path) == 0)
 
 
-class Waitable:
-    def wait(self):
-        pass
-
-
 class AsyncNVMeSwapper:
 
     def __init__(self, base_dir: str):
@@ -63,12 +62,14 @@ class AsyncNVMeSwapper:
         # If data_ids is not iterable, convert it to a list.
         if isinstance(data_ids, FlexTrainDataID):
             data_ids = [data_ids]
+        if isinstance(mem_srcs, torch.Tensor):
             mem_srcs = [mem_srcs]
 
         filenames = list(map(self._filename, data_ids))
         swap_out_tensors(self._aio_read_handle, mem_srcs, filenames)
         if async_op:
-            return self._aio_read_handle
+            return AsyncIOHandle(self._aio_read_handle) \
+                if async_op else None
         else:
             assert self._aio_read_handle.wait() == len(filenames)
 
@@ -86,6 +87,7 @@ class AsyncNVMeSwapper:
         filenames = list(map(self._filename, data_ids))
         swap_in_tensors(self._aio_write_handle, mem_dsts, filenames)
         if async_op:
-            return self._aio_write_handle
+            return AsyncIOHandle(self._aio_write_handle) \
+                if async_op else None
         else:
             assert self._aio_write_handle.wait() == len(filenames)
