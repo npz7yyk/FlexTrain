@@ -3,7 +3,7 @@ import torch
 from math import ceil
 from torch import Tensor
 from torch.nn import Parameter
-from typing import SupportsIndex, Iterable, Dict
+from typing import SupportsIndex, Iterable, Tuple, Dict
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
@@ -15,6 +15,7 @@ from flextrain.memory import (
     ContiguousParaGroup,
     Waitable,
     DummyHandle,
+    FunctionHandle,
     AsyncIOHandle,
     FusedHandle
 )
@@ -23,26 +24,16 @@ from flextrain.utils import dist
 from flextrain.utils.logging import rank0_logger
 
 
-class LoopIndexer:
-    """
-    LoopIndexer is a class that wraps a target that supports index.
-    It provides a way to loop through the target in a circular manner.
-    """
+class ItemPair:
+    def __init__(self, items: Tuple):
+        assert len(items) == 2
+        self.items = list(items)
 
-    def __init__(self, target: SupportsIndex):
-        self._target = target
-        self._total_items = len(target)
+    def __getitem__(self, index: SupportsIndex):
+        return self.items[index]
 
-        self._index_offset = 0
-
-    def step(self):
-        self._index_offset += 1
-        if self._index_offset >= self._total_items:
-            self._index_offset = 0
-
-    def __getitem__(self, index: int):
-        curr_index = (index + self._index_offset) % self._total_items
-        return self._target[curr_index]
+    def swap(self):
+        self.items.reverse()
 
 
 def _allocate_memory_chunks(
@@ -132,6 +123,9 @@ class FlexTrainMemoryCoordinator:
         interval = config.checkpoint_interval
         self._num_units = (layers + interval - 1) // interval
 
+        # CUDA streams for async IO operations.
+        self._data_stream = torch.cuda.Stream()
+
         # Lazy initialization of NVMe swapper.
         self._nvme_swapper = None
 
@@ -163,13 +157,11 @@ class FlexTrainMemoryCoordinator:
 
         # End of coordinator configurations.
 
-        # Allocate GPU working window.
-        self._gpu_working_windows = LoopIndexer(
-            _allocate_memory_chunks(
-                contiguous_allgathered_numel(parameters),
-                2, self._device_dtype, torch.cuda.current_device()
-            )
-        )
+        # Allocate GPU working memory for parameters.
+        self._gpu_full_paras = ItemPair(_allocate_memory_chunks(
+            contiguous_allgathered_numel(parameters), 2,
+            self._device_dtype, torch.cuda.current_device()
+        ))
 
         # Allocate parameter bases
         self._gpu_para_base = _allocate_memory_chunks(
@@ -181,8 +173,30 @@ class FlexTrainMemoryCoordinator:
             self._device_dtype, torch.device('cpu')
         )
 
+        # Allocate NVMe prefetch buffer in CPU memory.
+        self._nvme_prefetch_buffer = ItemPair(_allocate_memory_chunks(
+            self._para_numels[2], 2,
+            self._device_dtype, torch.device('cpu')
+        ))
+
         # Handle for async IO operations.
-        self._last_layer_index_handle = (-1, None)
+        self._inflight_layer_handle: Tuple[int, Waitable] = (-1, None)
+
+    @property
+    def _gpu_inflight_paras(self):
+        return self._gpu_full_paras[0]
+
+    @property
+    def _gpu_available_paras(self):
+        return self._gpu_full_paras[1]
+
+    @property
+    def _nvme_inflight_paras(self):
+        return self._nvme_prefetch_buffer[0]
+
+    @property
+    def _nvme_available_paras(self):
+        return self._nvme_prefetch_buffer[1]
 
     def _nvme_offload(
         self,
@@ -230,6 +244,24 @@ class FlexTrainMemoryCoordinator:
             data_ids, tensors, async_op
         )
 
+    def _detach_unit_parameters(self, unit_index: int):
+        """
+        Detach the parameters in a unit from the memory.
+        The parameters are no longer accessible.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+
+        # Get the unit parameters.
+        unit_paras = self._unit_parameters[unit_index]
+
+        # Detach the parameters.
+        unit_paras.detach_para()
+
     def init_unit_parameters(
         self,
         unit_index: int,
@@ -258,7 +290,7 @@ class FlexTrainMemoryCoordinator:
         self._unit_parameters[unit_index] = ContiguousParaGroup(unit_paras)
 
         # Using GPU working window to conduct the broadcast.
-        temp_gpu_buffer = self._gpu_working_windows[0]
+        temp_gpu_buffer = self._gpu_inflight_paras
 
         # Move parameters into contiguous memory.
         move_into_contiguous(unit_paras, temp_gpu_buffer)
@@ -284,6 +316,76 @@ class FlexTrainMemoryCoordinator:
             nvme_view
         )
 
+        # Detach the parameters from the memory.
+        self._detach_unit_parameters(unit_index)
+
+    def _async_prepare_cpu_paras(self, unit_index: int):
+        """
+        Move NVMe parameters to CPU for further processing.
+        The CPU parameters are prepared in _cpu_inflight_paras.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            Waitable: Handle for the async IO operation.
+        """
+        return self._nvme_reload(
+            FlexTrainDataID(unit_index, Dtype.PARA),
+            self._nvme_inflight_paras, async_op=True
+        )
+
+    def _async_prepare_gpu_paras(self, unit_index: int):
+        """
+        Prepare the GPU parameters for the unit.
+        The GPU parameters are prepared in _gpu_inflight_paras.
+        """
+        # 1. Locate the target memory.
+        mem_partition = torch.chunk(
+            self._gpu_inflight_paras, dist.get_world_size()
+        )[dist.get_rank()]
+
+        # 2. Copy parameters from three resources:
+        #    - GPU part from GPU base
+        #    - CPU part from CPU base
+        #    - NVMe part from CPU available buffer
+        # 3. Conduct all-gather into tensor if necessary.
+        gpu_view, cpu_view, nvme_view = torch.split(
+            mem_partition, self._para_numels
+        )
+        with torch.cuda.stream(self._data_stream):
+            if gpu_view.numel() > 0:
+                gpu_view.copy_(self._gpu_para_base[unit_index], True)
+            if cpu_view.numel() > 0:
+                cpu_view.copy_(self._cpu_para_base[unit_index], True)
+            if nvme_view.numel() > 0:
+                nvme_view.copy_(self._nvme_available_paras, True)
+            if not self._single_gpu:
+                dist.all_gather(self._gpu_inflight_paras, mem_partition)
+
+        return FunctionHandle(torch.cuda.synchronize)
+
+    def _submit_prepare_paras(self, unit_index: int):
+        """
+        Launch the async IO operation to prepare parameters for the unit.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Prepare the CPU parameters.
+        cpu_handle = self._async_prepare_cpu_paras(unit_index)
+
+        # Prepare the GPU parameters.
+        gpu_handle = self._async_prepare_gpu_paras(unit_index)
+
+        # Keep track of the inflight operation.
+        self._inflight_layer_handle = (
+            unit_index, FusedHandle([cpu_handle, gpu_handle])
+        )
+
     def _link_unit_parameters(
         self,
         unit_index: int,
@@ -307,26 +409,54 @@ class FlexTrainMemoryCoordinator:
         # Link the parameters.
         unit_paras.link_para_to(buffer)
 
-    def pre_forward_layer(self, unit_index: int):
+    def _synchronize_prepare_paras(self, unit_index: int):
+        """
+        Synchronize the preparation of parameters for given unit.
+        Ensure that parameters are ready in the _gpu_available_paras.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Wait for the async IO operation to finish.
+        inflight_unit, handle = self._inflight_layer_handle
+        assert inflight_unit == unit_index, \
+            "Async IO operation is not for this unit"
+        handle.wait()
+
+        # Just available buffer is now the prefetch buffer.
+        # Just inflight buffer is now available after handle.wait().
+        self._nvme_prefetch_buffer.swap()
+
+        # Just inflight GPU buffer is now available for unit forward.
+        # Just available GPU buffer is now free for prefetching.
+        self._gpu_full_paras.swap()
+
+        # Link the parameters to the available buffer.
+        self._link_unit_parameters(unit_index, self._gpu_available_paras)
+
+    def warmup_forward_pipeline(self):
+        """
+        Warm up the forward pipeline.
+        Recommendation: call before LLM pre_processing for further speedup.
+        """
+
+        # Load the first unit parameters to CPU.
+        self._async_prepare_cpu_paras(0).wait()
+        self._nvme_prefetch_buffer.swap()
+
+        # Launch the first unit forward.
+        self._submit_prepare_paras(0)
+
+    def pre_forward_unit(self, unit_index: int):
         """
         Prepare the layer for forward pass.
 
         Functions:
         1. Ensure the availability of the parameters and checkpoint.
-        2. Kick off relevant prefetching tasks.
-
-        Args:
-            unit_index (int): Index of the unit.
-        """
-        
-
-    def post_forward_layer(self, unit_index: int):
-        pass
-
-    def _single_gpu_forward_prepare_layer(self, unit_index: int):
-        """
-        Prepare the layer for forward pass in single GPU mode.
-        The parameters are linked to the buffer.
+        2. Kick off relevant prefetching tasks if needed.
 
         Args:
             unit_index (int): Index of the unit.
@@ -334,25 +464,13 @@ class FlexTrainMemoryCoordinator:
         Returns:
             None
         """
-        # Get the buffer.
-        buffer = self._gpu_working_windows[0]
+        self._synchronize_prepare_paras(unit_index)
+        # TODO: get back when backward is implemented
+        if unit_index + 1 < self._num_units:
+            self._submit_prepare_paras(unit_index + 1)
 
-        # Link the parameters.
-        self._link_unit_parameters(unit_index, buffer)
-
-    def _multi_gpu_forward_prepare_layer(self, unit_index: int):
-        """
-        Prepare the layer for forward pass in multi GPU mode.
-        The parameters are linked to the buffer.
-
-        Args:
-            unit_index (int): Index of the unit.
-
-        Returns:
-            None
-        """
-        pass
-
+    def post_forward_unit(self, unit_index: int):
+        self._detach_unit_parameters(unit_index)
 
 _MEMORY_COORDINATOR = FlexTrainMemoryCoordinator()
 

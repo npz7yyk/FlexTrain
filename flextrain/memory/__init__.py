@@ -144,31 +144,53 @@ class ContiguousParaGroup:
 
 
 class Waitable:
-    def wait(self):
-        pass
-
-
-class DummyHandle(Waitable):
-    def wait(self):
-        pass
-
-
-class AsyncIOHandle:
-    def __init__(self, handle: Waitable):
-        self._handle = handle
+    def __init__(self):
         self._finished = False
+
+    def is_completed(self):
+        return self._finished
 
     def wait(self):
         if self._finished:
             return
-        self._result = self._handle.wait()
+        self._wait_task()
         self._finished = True
+
+    def _wait_task(self):
+        # Implement this method in the subclass.
+        ...
+
+
+class DummyHandle(Waitable):
+    def _wait_task(self):
+        pass
+
+
+class FunctionHandle(Waitable):
+    def __init__(self, function, *args, **kwargs):
+        super().__init__()
+        self._function = function
+        self._args = args
+        self._kwargs = kwargs
+
+    def _wait_task(self):
+        self._function(*self._args, **self._kwargs)
+
+
+class AsyncIOHandle(Waitable):
+    def __init__(self, handle: Waitable):
+        super().__init__()
+        self._handle = handle
+
+    def _wait_task(self):
+        self._handle.wait()
 
 
 class FusedHandle(Waitable):
     def __init__(self, handles: Iterable[Waitable]):
-        self._handles = handles
+        super().__init__()
+        self._handles = list(handles)
 
-    def wait(self):
+    def _wait_task(self):
         for handle in self._handles:
             handle.wait()

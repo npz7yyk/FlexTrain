@@ -3,7 +3,6 @@ import torch
 from torch.nn import Module
 
 from flextrain import distributed as dist
-from flextrain.llm_func import LLMFuncPack
 from flextrain.checkpointing import (
     detach_variable,
     checkpointed_forward,
@@ -11,6 +10,8 @@ from flextrain.checkpointing import (
     retrieve_tensor_grads
 )
 from flextrain.config import get_flextrain_config
+from flextrain.llm_func import LLMFuncPack
+from flextrain.memory.coordinator import get_memory_coordinator
 from flextrain.scheduler import GreedySnakeBatchScheduler
 
 
@@ -32,11 +33,14 @@ class FlexTrainEngine(object):
         config = get_flextrain_config()
 
         # Link to the model and optimizer
-        self.module = module
+        self.module = module.cuda().to(dtype=config.device_dtype)
         self.init_optimizer = init_optimizer
 
         # Link to LLM function pack
         self.llm_funcs: LLMFuncPack = llm_functions
+
+        # Link to the memory coordinator
+        self.memory_coordinator = get_memory_coordinator()
 
         # Create the GreedySnakeBatchScheduler
         self.scheduler = GreedySnakeBatchScheduler(
@@ -54,8 +58,39 @@ class FlexTrainEngine(object):
     def eval(self):
         self.module.eval()
 
+    @torch.no_grad()
     def forward_backward(self):
-        ...
+        llm_funcs = self.llm_funcs
+
+        for i in range(3):
+            pre_input, post_input, loss_input = llm_funcs.get_batch()
+
+            self.memory_coordinator.warmup_forward_pipeline()
+            passed_down, each_layer = llm_funcs.pre_process(pre_input)
+
+            ctxs = []
+            for j in range(24):
+                passed_down = detach_variable(passed_down)
+                self.memory_coordinator.pre_forward_unit(j)
+                passed_down, ctx = checkpointed_forward(
+                    llm_funcs.layer_forward(j, j + 1),
+                    passed_down, each_layer
+                )
+                self.memory_coordinator.post_forward_unit(j)
+                ctxs.append(ctx)
+
+            passed_down = detach_variable(passed_down)
+            llm_output = llm_funcs.post_process(passed_down, post_input)
+            loss, loss_store = llm_funcs.loss(llm_output, loss_input)
+
+            for w in range(dist.get_world_size()):
+                dist.barrier()
+                if dist.get_rank() == w:
+                    print(loss)
+                    if w == dist.get_world_size() - 1:
+                        print()
+                dist.barrier()
+        assert False
 
 
 def hash_tensor(tensor):

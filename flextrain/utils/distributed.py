@@ -155,13 +155,6 @@ def all_gather(tensor_out, tensor_in, group=None, async_op=False):
     return _ALL_GATHER_FUNCTION(tensor_out, tensor_in, group, async_op)
 
 
-def all_gather_coalesced(output_tensor_list, input_tensor, group=None, async_op=False):
-    # _assert_torch_distributed_initialized()
-    return get_coalescing_manager().all_gather_coalesced(
-        output_tensor_list, input_tensor, group, async_op
-    )
-
-
 def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
     # _assert_torch_distributed_initialized()
     return torch.distributed.all_reduce(tensor, op, group, async_op)
