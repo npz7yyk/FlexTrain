@@ -56,7 +56,7 @@ class GreedySnakeBlockScheduler:
 
             # reverse direction
             top_down = not top_down
-            
+
             # move to next checkpoint
             curr_layer = tail_layer
 

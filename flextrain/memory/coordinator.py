@@ -376,7 +376,11 @@ class FlexTrainMemoryCoordinator:
             None
         """
         # Prepare the CPU parameters.
-        cpu_handle = self._async_prepare_cpu_paras(unit_index)
+        # TODO: get back when backward is implemented
+        if unit_index + 1 < self._num_units:
+            cpu_handle = self._async_prepare_cpu_paras(unit_index + 1)
+        else:
+            cpu_handle = DummyHandle()
 
         # Prepare the GPU parameters.
         gpu_handle = self._async_prepare_gpu_paras(unit_index)
@@ -471,6 +475,7 @@ class FlexTrainMemoryCoordinator:
 
     def post_forward_unit(self, unit_index: int):
         self._detach_unit_parameters(unit_index)
+
 
 _MEMORY_COORDINATOR = FlexTrainMemoryCoordinator()
 
