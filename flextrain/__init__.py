@@ -12,7 +12,7 @@ from .defaults import (
     PROCESS_GROUP_TIMEOUT_DEFAULT
 )
 from .engine import FlexTrainEngine
-from .llm_func import LLMFuncPack
+from .llm_func import set_llm_func, LLMFunc
 from .memory.initializer import Init
 from .utils.distributed import init_distributed
 
@@ -59,7 +59,6 @@ def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
 def initialize(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    llm_functions: LLMFuncPack,
     config: dict = None,
     dist_init_required=False,
     dist_backend=TORCH_DISTRIBUTED_BACKEND_DEFAULT,
@@ -83,6 +82,6 @@ def initialize(
         )
 
     # Wrap the model with FlexTrainEngine
-    model = FlexTrainEngine(model, optimizer, llm_functions)
+    model = FlexTrainEngine(model, optimizer)
 
     return model

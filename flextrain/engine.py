@@ -1,18 +1,20 @@
 import torch
 
 from torch.nn import Module
+from typing import Tuple, Dict
 
 from flextrain import distributed as dist
 from flextrain.checkpointing import (
+    FWDContext,
     detach_variable,
     checkpointed_forward,
     checkpointed_backward,
     retrieve_tensor_grads
 )
 from flextrain.config import get_flextrain_config
-from flextrain.llm_func import LLMFuncPack
+from flextrain.llm_func import LLMFunc
 from flextrain.memory.coordinator import get_memory_coordinator
-from flextrain.scheduler import GreedySnakeBatchScheduler
+from flextrain.scheduler import LLMTask, GreedySnakeBlockScheduler
 
 
 class FlexTrainEngine(object):
@@ -24,8 +26,7 @@ class FlexTrainEngine(object):
     def __init__(
         self,
         module: Module,
-        init_optimizer: torch.optim.Optimizer,
-        llm_functions: LLMFuncPack
+        init_optimizer: torch.optim.Optimizer
     ):
         super().__init__()
 
@@ -36,21 +37,45 @@ class FlexTrainEngine(object):
         self.module = module.cuda().to(dtype=config.device_dtype)
         self.init_optimizer = init_optimizer
 
-        # Link to LLM function pack
-        self.llm_funcs: LLMFuncPack = llm_functions
-
         # Link to the memory coordinator
         self.memory_coordinator = get_memory_coordinator()
 
-        # Create the GreedySnakeBatchScheduler
-        self.scheduler = GreedySnakeBatchScheduler(
-            dist.get_world_size(),
-            config.batch_size,
-            config.micro_batch_size,
-            config.micro_batch_per_block,
-            config.num_layers,
-            config.checkpoint_interval
+        # LLM training information
+        self.micro_batch_per_block = self._compute_micro_batch_per_block()
+        self.num_units = self.memory_coordinator.num_units
+
+        # Create the scheduler
+        self.scheduler = GreedySnakeBlockScheduler(
+            self.micro_batch_per_block,
+            self.num_units
         )
+
+        # Create context containers
+        self._reset_context()
+
+    def _compute_micro_batch_per_block(self):
+        config = get_flextrain_config()
+        batch_size = config.batch_size
+        micro_batch_size = config.micro_batch_size
+        world_size = dist.get_world_size()
+        assert batch_size % (micro_batch_size * world_size) == 0, \
+            "Batch size must be divisible by world size x micro_batch_size"
+        return batch_size // (micro_batch_size * world_size)
+
+    def _reset_context(self):
+        # Recent passed down tensor
+        self.micro_batch_passed_down: Dict[int, Tuple] = {}
+
+        # Inputs container
+        self.micro_batch_post_inputs: Dict[int, Tuple] = {}
+        self.micro_batch_loss_inputs: Dict[int, Tuple] = {}
+        self.micro_batch_every_layer: Dict[int, Tuple] = {}
+
+        # Context container
+        self.micro_batch_unit_ctx: Tuple[Tuple[FWDContext]] = [
+            [None] * self.num_units
+            for _ in range(self.micro_batch_per_block)
+        ]
 
     def train(self):
         self.module.train()
@@ -58,40 +83,188 @@ class FlexTrainEngine(object):
     def eval(self):
         self.module.eval()
 
+    def train_iteration(self):
+        # 1. Conduct all tasks assigned by the scheduler
+        for task in self.scheduler:
+            if task.is_forwarding:
+                self._conduct_forward(task)
+            else:
+                self._conduct_backward_step(task)
+        # 2. Conduct reset
+        self._reset_context()
+
+    def _batch_pre_process(self):
+        for i in range(self.micro_batch_per_block):
+            pre_inputs, post_inputs, loss_inputs = LLMFunc.get_batch()
+            # Store the inputs, no need to offload from GPU
+            self.micro_batch_post_inputs[i] = post_inputs
+            self.micro_batch_loss_inputs[i] = loss_inputs
+            # Generate the passed down tensor and each layer tensor
+            passed_down, each_layer = LLMFunc.pre_process(pre_inputs)
+            # Store the passed down and each layer tensor
+            self.micro_batch_passed_down[i] = passed_down
+            self.micro_batch_every_layer[i] = each_layer
+
     @torch.no_grad()
-    def forward_backward(self):
-        llm_funcs = self.llm_funcs
+    def _conduct_forward(self, task: LLMTask):
+        config = get_flextrain_config()
+        scheduler = self.scheduler
 
-        for i in range(3):
-            pre_input, post_input, loss_input = llm_funcs.get_batch()
+        # Need to fetch new unit parameters
+        if scheduler.new_unit_entered:
+            # Conduct pre-process
+            if scheduler.first_unit_entered:
+                # Warm up the forward pipeline here for better overlapping
+                self.memory_coordinator.warmup_forward_pipeline()
+                # Conduct the batch pre-process
+                self._batch_pre_process()
+            # End of first_unit_entered
 
-            self.memory_coordinator.warmup_forward_pipeline()
-            passed_down, each_layer = llm_funcs.pre_process(pre_input)
+            # Fetch the new unit parameters
+            self.memory_coordinator.pre_forward_unit(task.unit)
+        # End of new_unit_entered
 
-            ctxs = []
-            for j in range(24):
+        # Load recent passed down and each layer tensor
+        passed_down = self.micro_batch_passed_down[task.micro_batch]
+        each_layer = self.micro_batch_every_layer[task.micro_batch]
+
+        # Conduct forward
+        passed_down = detach_variable(passed_down)
+        start = task.unit * config.checkpoint_interval
+        end = min(start + config.checkpoint_interval, config.num_layers)
+        passed_down, ctx = checkpointed_forward(
+            LLMFunc.layer_forward(start, end),
+            passed_down, each_layer
+        )
+
+        # Save recent passed down tensor and context
+        self.micro_batch_passed_down[task.micro_batch] = passed_down
+        self.micro_batch_unit_ctx[task.micro_batch][task.unit] = ctx
+
+    def _conduct_backward_step(self, task: LLMTask):
+        config = get_flextrain_config()
+        scheduler = self.scheduler
+
+        # Need to fetch new unit parameters
+        if scheduler.new_unit_entered:
+            # Conduct pre-process
+            if scheduler.first_unit_entered:
+                # Warm up the forward pipeline here for better overlapping
+                self.memory_coordinator.warmup_forward_pipeline()
+                # Conduct the batch pre-process
+                self._batch_pre_process()
+            # End of first_unit_entered
+
+            # Fetch the new unit parameters
+            self.memory_coordinator.pre_forward_unit(task.unit)
+        # End of new_unit_entered
+
+        # Need to fetch new unit parameters
+        if scheduler.new_unit_entered:
+            # Last unit is special:
+            # 1. No need to prefetch the 2nd last unit
+            # 2. Need to conduct post-process and compute loss
+            if scheduler.last_unit_entered:
+                # Load recent passed down and each layer tensor
+                passed_down = self.micro_batch_passed_down[task.micro_batch]
+                each_layer = self.micro_batch_every_layer[task.micro_batch]
+
+                # Conduct post-process
                 passed_down = detach_variable(passed_down)
-                self.memory_coordinator.pre_forward_unit(j)
-                passed_down, ctx = checkpointed_forward(
-                    llm_funcs.layer_forward(j, j + 1),
-                    passed_down, each_layer
+                llm_outputs = LLMFunc.post_process(
+                    passed_down,
+                    self.micro_batch_post_inputs[task.micro_batch]
                 )
-                self.memory_coordinator.post_forward_unit(j)
-                ctxs.append(ctx)
 
-            passed_down = detach_variable(passed_down)
-            llm_output = llm_funcs.post_process(passed_down, post_input)
-            loss, loss_store = llm_funcs.loss(llm_output, loss_input)
+                # Compute loss
+                loss, loss_store = LLMFunc.loss(
+                    llm_outputs,
+                    self.micro_batch_loss_inputs[task.micro_batch]
+                )
 
-            for w in range(dist.get_world_size()):
-                dist.barrier()
-                if dist.get_rank() == w:
-                    print(loss)
-                    if w == dist.get_world_size() - 1:
-                        print()
-                dist.barrier()
-        assert False
+                # Backward from loss to pre-post_process
+                torch.autograd.backward(loss)
 
+                # Get the gradients
+                passed_back = retrieve_tensor_grads(passed_down)
+                passed_back += [None] * len(each_layer)
+
+                # Conduct backward
+                for ctx in reversed(self.micro_batch_unit_ctxs[task.micro_batch]):
+                    passed_back = checkpointed_backward(ctx, *passed_back)
+
+                # Attention!!! function return
+                return
+            # Normal backward step
+            # Fetch the new unit parameters
+            else:
+                ...
+                
+        # End of new_unit_entered
+
+        # Currently, just compute the loss
+        # Must be the last unit
+        self.memory_coordinator.post_forward_unit(scheduler.last_unit)
+        self.memory_coordinator.pre_forward_unit(task.unit)
+
+        # Load recent passed down and each layer tensor
+        passed_down = self.micro_batch_passed_down[task.micro_batch]
+        each_layer = self.micro_batch_every_layer[task.micro_batch]
+
+        # Conduct forward
+        passed_down = detach_variable(passed_down)
+        start = task.unit * config.checkpoint_interval
+        end = min(start + config.checkpoint_interval, config.num_layers)
+        passed_down, ctx = checkpointed_forward(
+            llm_funcs.layer_forward(start, end),
+            passed_down, each_layer
+        )
+
+        passed_down = detach_variable(passed_down)
+        post_input = self.micro_batch_post_input[task.micro_batch]
+        loss_input = self.micro_batch_loss_input[task.micro_batch]
+        llm_output = llm_funcs.post_process(passed_down, post_input)
+        loss, loss_store = llm_funcs.loss(llm_output, loss_input)
+        for w in range(dist.get_world_size()):
+            dist.barrier()
+            if dist.get_rank() == w:
+                print(loss)
+                if w == dist.get_world_size() - 1:
+                    print()
+            dist.barrier()
+
+        if scheduler.last_unit_entered and task.unit == 0:
+            assert False
+
+        # # Need to conduct post-process and compute loss
+        # if scheduler.new_unit_entered:
+        #     # Detach last unit from GPU working memory
+        #     self.memory_coordinator.post_backward_unit(scheduler.last_unit)
+
+        #     # Load recent passed down and each layer tensor
+        #     passed_down = self.micro_batch_passed_down[task.micro_batch]
+        #     each_layer = self.micro_batch_every_layer[task.micro_batch]
+
+        #     # Conduct post-process
+        #     passed_down = detach_variable(passed_down)
+        #     llm_output = llm_funcs.post_process(passed_down, self.micro_batch_post_input[task.micro_batch])
+
+        #     # Compute loss
+        #     loss, loss_store = llm_funcs.loss(llm_output, self.micro_batch_loss_input[task.micro_batch])
+
+        #     # Backward from loss to pre-post_process
+        #     torch.autograd.backward(loss)
+
+        #     # Get the gradients
+        #     passed_back = retrieve_tensor_grads(passed_down)
+        #     passed_back += [None] * len(each_layer)
+
+        #     # Conduct backward
+        #     for ctx in reversed(self.micro_batch_unit_ctxs[task.micro_batch]):
+        #         passed_back = checkpointed_backward(ctx, *passed_back)
+
+    def step(self):
+        return
 
 def hash_tensor(tensor):
     import torch
@@ -114,6 +287,55 @@ def hash_tensor(tensor):
     # Return the hexadecimal representation of the hash
     return sha256_hash.hexdigest()
 
+
+# for i in range(3):
+        #     pre_input, post_input, loss_input = llm_funcs.get_batch()
+
+        #     self.memory_coordinator.warmup_forward_pipeline()
+        #     passed_down, each_layer = llm_funcs.pre_process(pre_input)
+
+        #     ctxs = []
+        #     for j in range(24):
+        #         passed_down = detach_variable(passed_down)
+        #         self.memory_coordinator.pre_forward_unit(j)
+        #         passed_down, ctx = checkpointed_forward(
+        #             llm_funcs.layer_forward(j, j + 1),
+        #             passed_down, each_layer
+        #         )
+        #         self.memory_coordinator.post_forward_unit(j)
+        #         ctxs.append(ctx)
+
+        #     passed_down = detach_variable(passed_down)
+        #     llm_output = llm_funcs.post_process(passed_down, post_input)
+        #     loss, loss_store = llm_funcs.loss(llm_output, loss_input)
+
+        #     for w in range(dist.get_world_size()):
+        #         dist.barrier()
+        #         if dist.get_rank() == w:
+        #             print(loss)
+        #             if w == dist.get_world_size() - 1:
+        #                 print()
+        #         dist.barrier()
+        # assert False
+
+
+# passed_down = detach_variable(passed_down)
+            # llm_output = llm_funcs.post_process(passed_down, post_input)
+            # loss, loss_store = llm_funcs.loss(llm_output, loss_input)
+
+            # # backward from loss to pre-post_process
+            # torch.autograd.backward(loss)
+
+            # # get the gradients
+            # passed_back = retrieve_tensor_grads(passed_down)
+            # passed_back += [None] * len(each_layer)
+
+            # ctxs.reverse()
+            # for ctx in ctxs:
+            #     passed_back = checkpointed_backward(ctx, *passed_back)
+
+            # # do the backward of the pre-process
+            # torch.autograd.backward(pre_out[0], passed_back[0])
 
 def test(model):
     model = model.to(dtype=torch.float16)

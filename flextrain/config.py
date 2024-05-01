@@ -31,11 +31,6 @@ class FlexTrainConfig:
     Batch size must be divisible by world size x micro_batch_size.
     """
 
-    micro_batch_per_block: int
-    """
-    Micro batch per block.
-    """
-
     num_layers: int
     """
     Number of layers in the given LLM.

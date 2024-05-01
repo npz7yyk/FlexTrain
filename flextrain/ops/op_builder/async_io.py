@@ -103,7 +103,7 @@ class AsyncIOBuilder(OpBuilder):
         if verbose and not aio_compatible:
             self.warning(
                 f"{self.NAME} requires the dev libaio .so object and "
-                "headers but these were not found."
+                f"headers but these were not found."
             )
 
             # Check for the libaio package via known package managers

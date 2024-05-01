@@ -32,7 +32,7 @@ try:
 except ImportError:
     print(
         f"{WARNING} unable to import torch, please install it "
-        "if you want to pre-compile any flextrain ops."
+        f"if you want to pre-compile any flextrain ops."
     )
 else:
     TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -90,7 +90,7 @@ cuda_minor_mismatch_ok = {
 
 
 def assert_no_cuda_mismatch(name=""):
-    cuda_major, cuda_minor = installed_cuda_version(name)
+    cuda_major, cuda_minor = installed_cuda_version()
     sys_cuda_version = f'{cuda_major}.{cuda_minor}'
     torch_cuda_version = ".".join(torch.version.cuda.split('.')[:2])
     # This is a show-stopping error, should probably not proceed past this
@@ -101,24 +101,25 @@ def assert_no_cuda_mismatch(name=""):
             print(
                 f"Installed CUDA version {sys_cuda_version} does not match "
                 f"the version torch was compiled with {torch.version.cuda} "
-                "but since the APIs are compatible, accepting this combination"
+                f"but since APIs are compatible, accepting this combination."
             )
             return True
         elif os.getenv("DS_SKIP_CUDA_CHECK", "0") == "1":
             print(
                 f"{WARNING} FlexTrain Op Builder: Installed CUDA version "
                 f"{sys_cuda_version} does not match the "
-                f"version torch was compiled with {torch.version.cuda}."
-                "Detected `DS_SKIP_CUDA_CHECK=1`: "
-                "Allowing this combination of CUDA, "
-                "but it may result in unexpected behavior."
+                f"version torch was compiled with {torch.version.cuda}. "
+                f"Detected `DS_SKIP_CUDA_CHECK=1`: "
+                f"Allowing this combination of CUDA, "
+                f"but it may result in unexpected behavior."
             )
             return True
         raise CUDAMismatchException(
             f">- FlexTrain Op Builder: "
             f"Installed CUDA version {sys_cuda_version} does not match the "
             f"version torch was compiled with {torch.version.cuda}, unable to "
-            "compile cuda/cpp extensions without a matching cuda version.")
+            f"compile cuda/cpp extensions without a matching cuda version."
+        )
     return True
 
 
@@ -163,9 +164,9 @@ class OpBuilder(ABC):
         current_torch_version = ".".join(torch.__version__.split('.')[:2])
         if install_torch_version != current_torch_version:
             raise RuntimeError(
-                "PyTorch version mismatch! "
-                "FlexTrain ops were compiled and installed with "
-                "a different version than what is being used at runtime. "
+                f"PyTorch version mismatch! "
+                f"FlexTrain ops were compiled and installed with "
+                f"a different version than what is being used at runtime. "
                 f"Please re-install FlexTrain or switch torch versions. "
                 f"Install torch version={install_torch_version}, "
                 f"Runtime torch version={current_torch_version}"
@@ -178,9 +179,9 @@ class OpBuilder(ABC):
             install_cuda_version = torch_info['cuda_version']
             if install_cuda_version != current_cuda_version:
                 raise RuntimeError(
-                    "CUDA version mismatch! "
-                    "FlexTrain ops were compiled and installed with "
-                    "a different version than what is being used at runtime. "
+                    f"CUDA version mismatch! "
+                    f"FlexTrain ops were compiled and installed with "
+                    f"a different version than what is being used at runtime. "
                     f"Please re-install FlexTrain or switch torch versions. "
                     f"Install CUDA version={install_cuda_version}, "
                     f"Runtime CUDA version={current_cuda_version}"
@@ -190,9 +191,9 @@ class OpBuilder(ABC):
             install_hip_version = torch_info['hip_version']
             if install_hip_version != current_hip_version:
                 raise RuntimeError(
-                    "HIP version mismatch! "
-                    "FlexTrain ops were compiled and installed with "
-                    "a different version than what is being used at runtime. "
+                    f"HIP version mismatch! "
+                    f"FlexTrain ops were compiled and installed with "
+                    f"a different version than what is being used at runtime. "
                     f"Please re-install FlexTrain or switch torch versions. "
                     f"Install HIP version={install_hip_version}, "
                     f"Runtime HIP version={current_hip_version}"
@@ -398,7 +399,7 @@ class OpBuilder(ABC):
             self.warning(
                 f"{self.name} attempted to use `py-cpuinfo` "
                 f"but failed (exception type: {type(e)}, {e}), "
-                "falling back to `lscpu` to get this information."
+                f"falling back to `lscpu` to get this information."
             )
             cpu_info = self._backup_cpuinfo()
             if cpu_info is None:
@@ -416,8 +417,8 @@ class OpBuilder(ABC):
         except MissingCUDAException:
             print(
                 f"{WARNING} {self.name} cuda is missing or "
-                "is incompatible with installed torch, "
-                "only cpu ops can be compiled!"
+                f"is incompatible with installed torch, "
+                f"only cpu ops can be compiled!"
             )
             return '-D__DISABLE_CUDA__'
 
@@ -427,9 +428,9 @@ class OpBuilder(ABC):
         if not self.command_exists('lscpu'):
             self.warning(
                 f"{self.name} attempted to query 'lscpu' after "
-                "failing to use py-cpuinfo to detect the CPU architecture. "
-                "'lscpu' does not appear to exist on your system, will fall "
-                "back to use -march=native and non-vectorized execution."
+                f"failing to use py-cpuinfo to detect the CPU architecture. "
+                f"'lscpu' does not appear to exist on your system, will fall "
+                f"back to use -march=native and non-vectorized execution."
             )
             return None
         result = subprocess.check_output('lscpu', shell=True)
@@ -465,7 +466,7 @@ class OpBuilder(ABC):
             self.warning(
                 f"{self.name} attempted to use `py-cpuinfo` "
                 f"but failed (exception type: {type(e)}, {e}), "
-                "falling back to `lscpu` to get this information."
+                f"falling back to `lscpu` to get this information."
             )
             cpu_info = self._backup_cpuinfo()
             if cpu_info is None:
@@ -496,7 +497,7 @@ class OpBuilder(ABC):
         elif not valid and len(cmds) == 1:
             print(
                 f"{WARNING} {self.name} requires the '{cmd}' command, "
-                "but it does not exist!"
+                f"but it does not exist!"
             )
         return valid
 
@@ -540,7 +541,7 @@ class OpBuilder(ABC):
         if not self.is_compatible(verbose):
             raise RuntimeError(
                 f"Unable to JIT load the {self.name} op due to "
-                "it not being compatible due to hardware/software issue. "
+                f"it not being compatible due to hardware/software issue. "
                 f"{self.error_log}"
             )
         try:
@@ -548,7 +549,7 @@ class OpBuilder(ABC):
         except ImportError:
             raise RuntimeError(
                 f"Unable to JIT load the {self.name} op due to "
-                "ninja not being installed."
+                f"ninja not being installed."
             )
 
         if isinstance(self, CUDAOpBuilder) and not self.is_rocm_pytorch():
@@ -670,7 +671,7 @@ class CUDAOpBuilder(OpBuilder):
         if len(ccs) == 0:
             raise RuntimeError(
                 f"Unable to load {self.name} op due to "
-                "no compute capabilities remaining after filtering"
+                f"no compute capabilities remaining after filtering"
             )
 
         args = []
@@ -832,44 +833,47 @@ class CUDAOpBuilder(OpBuilder):
             return []
 
 
-# class TorchCPUOpBuilder(CUDAOpBuilder):
+class TorchCPUOpBuilder(CUDAOpBuilder):
 
-#     def extra_ldflags(self):
-#         if self.build_for_cpu:
-#             return ['-fopenmp']
+    def extra_ldflags(self):
+        if self.build_for_cpu:
+            return ['-fopenmp']
 
-#         if not self.is_rocm_pytorch():
-#             return ['-lcurand']
+        if not self.is_rocm_pytorch():
+            return ['-lcurand']
 
-#         return []
+        return []
 
-#     def cxx_args(self):
-#         import torch
-#         args = []
-#         if not self.build_for_cpu:
-#             if not self.is_rocm_pytorch():
-#                 CUDA_LIB64 = os.path.join(torch.utils.cpp_extension.CUDA_HOME, "lib64")
-#                 if not os.path.exists(CUDA_LIB64):
-#                     CUDA_LIB64 = os.path.join(torch.utils.cpp_extension.CUDA_HOME, "lib")
-#             else:
-#                 CUDA_LIB64 = os.path.join(torch.utils.cpp_extension.ROCM_HOME, "lib")
+    def cxx_args(self):
+        import torch
+        args = []
+        if not self.build_for_cpu:
+            if not self.is_rocm_pytorch():
+                CUDA_LIB64 = os.path.join(
+                    torch.utils.cpp_extension.CUDA_HOME, "lib64")
+                if not os.path.exists(CUDA_LIB64):
+                    CUDA_LIB64 = os.path.join(
+                        torch.utils.cpp_extension.CUDA_HOME, "lib")
+            else:
+                CUDA_LIB64 = os.path.join(
+                    torch.utils.cpp_extension.ROCM_HOME, "lib")
 
-#             args += super().cxx_args()
-#             args += [
-#                 f'-L{CUDA_LIB64}',
-#                 '-lcudart',
-#                 '-lcublas',
-#                 '-g',
-#             ]
+            args += super().cxx_args()
+            args += [
+                f'-L{CUDA_LIB64}',
+                '-lcudart',
+                '-lcublas',
+                '-g',
+            ]
 
-#         CPU_ARCH = self.cpu_arch()
-#         SIMD_WIDTH = self.simd_width()
-#         CUDA_ENABLE = self.is_cuda_enable()
-#         args += [
-#             CPU_ARCH,
-#             '-fopenmp',
-#             SIMD_WIDTH,
-#             CUDA_ENABLE,
-#         ]
+        CPU_ARCH = self.cpu_arch()
+        SIMD_WIDTH = self.simd_width()
+        CUDA_ENABLE = self.is_cuda_enable()
+        args += [
+            CPU_ARCH,
+            '-fopenmp',
+            SIMD_WIDTH,
+            CUDA_ENABLE,
+        ]
 
-#         return args
+        return args

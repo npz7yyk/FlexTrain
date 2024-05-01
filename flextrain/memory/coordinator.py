@@ -121,7 +121,7 @@ class FlexTrainMemoryCoordinator:
         # Number of units in the model.
         layers = config.num_layers
         interval = config.checkpoint_interval
-        self._num_units = (layers + interval - 1) // interval
+        self.num_units = (layers + interval - 1) // interval
 
         # CUDA streams for async IO operations.
         self._data_stream = torch.cuda.Stream()
@@ -149,7 +149,7 @@ class FlexTrainMemoryCoordinator:
             f"FlexTrain Memory coordinator initialized with configurations:\n"
             f"  - device dtype: {self._device_dtype}\n"
             f"  - master dtype: {self._master_dtype}\n"
-            f"  - number of units: {self._num_units}\n"
+            f"  - number of units: {self.num_units}\n"
             f"  - unit parameter numel: {unit_numel}\n"
             f"  - each rank numel: {each_rank_numel}\n"
             f"  - parameter split numels: {self._para_numels}\n"
@@ -165,11 +165,11 @@ class FlexTrainMemoryCoordinator:
 
         # Allocate parameter bases
         self._gpu_para_base = _allocate_memory_chunks(
-            self._para_numels[0], self._num_units,
+            self._para_numels[0], self.num_units,
             self._device_dtype, torch.cuda.current_device()
         )
         self._cpu_para_base = _allocate_memory_chunks(
-            self._para_numels[1], self._num_units,
+            self._para_numels[1], self.num_units,
             self._device_dtype, torch.device('cpu')
         )
 
@@ -244,6 +244,35 @@ class FlexTrainMemoryCoordinator:
             data_ids, tensors, async_op
         )
 
+    def _is_invalid_unit(self, unit_index: int):
+        return unit_index < 0 or unit_index >= self.num_units
+
+    def _link_unit_parameters(
+        self,
+        unit_index: int,
+        buffer: Tensor
+    ):
+        """
+        Link the parameters in the unit to the buffer.
+        We assume that data is reconstructed (or being) in the buffer.
+
+        Args:
+            unit_index (int): Index of the unit.
+            buffer (Tensor): Buffer to link the parameters.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        # Get the unit parameters.
+        unit_paras = self._unit_parameters[unit_index]
+
+        # Link the parameters.
+        unit_paras.link_para_to(buffer)
+
     def _detach_unit_parameters(self, unit_index: int):
         """
         Detach the parameters in a unit from the memory.
@@ -255,6 +284,9 @@ class FlexTrainMemoryCoordinator:
         Returns:
             None
         """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
 
         # Get the unit parameters.
         unit_paras = self._unit_parameters[unit_index]
@@ -330,6 +362,9 @@ class FlexTrainMemoryCoordinator:
         Returns:
             Waitable: Handle for the async IO operation.
         """
+        if self._is_invalid_unit(unit_index):
+            return DummyHandle()
+
         return self._nvme_reload(
             FlexTrainDataID(unit_index, Dtype.PARA),
             self._nvme_inflight_paras, async_op=True
@@ -340,10 +375,14 @@ class FlexTrainMemoryCoordinator:
         Prepare the GPU parameters for the unit.
         The GPU parameters are prepared in _gpu_inflight_paras.
         """
+        # 0. Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return DummyHandle()
+
         # 1. Locate the target memory.
-        mem_partition = torch.chunk(
-            self._gpu_inflight_paras, dist.get_world_size()
-        )[dist.get_rank()]
+        tar_full_paras = self._gpu_inflight_paras
+        mem_partitions = torch.chunk(tar_full_paras, dist.get_world_size())
+        mem_partition = mem_partitions[dist.get_rank()]
 
         # 2. Copy parameters from three resources:
         #    - GPU part from GPU base
@@ -354,14 +393,10 @@ class FlexTrainMemoryCoordinator:
             mem_partition, self._para_numels
         )
         with torch.cuda.stream(self._data_stream):
-            if gpu_view.numel() > 0:
-                gpu_view.copy_(self._gpu_para_base[unit_index], True)
-            if cpu_view.numel() > 0:
-                cpu_view.copy_(self._cpu_para_base[unit_index], True)
-            if nvme_view.numel() > 0:
-                nvme_view.copy_(self._nvme_available_paras, True)
-            if not self._single_gpu:
-                dist.all_gather(self._gpu_inflight_paras, mem_partition)
+            gpu_view.copy_(self._gpu_para_base[unit_index], True)
+            cpu_view.copy_(self._cpu_para_base[unit_index], True)
+            nvme_view.copy_(self._nvme_available_paras, True)
+            dist.all_gather(tar_full_paras, mem_partition, async_op=True)
 
         return FunctionHandle(torch.cuda.synchronize)
 
@@ -375,12 +410,12 @@ class FlexTrainMemoryCoordinator:
         Returns:
             None
         """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
         # Prepare the CPU parameters.
-        # TODO: get back when backward is implemented
-        if unit_index + 1 < self._num_units:
-            cpu_handle = self._async_prepare_cpu_paras(unit_index + 1)
-        else:
-            cpu_handle = DummyHandle()
+        cpu_handle = self._async_prepare_cpu_paras(unit_index + 1)
 
         # Prepare the GPU parameters.
         gpu_handle = self._async_prepare_gpu_paras(unit_index)
@@ -389,29 +424,6 @@ class FlexTrainMemoryCoordinator:
         self._inflight_layer_handle = (
             unit_index, FusedHandle([cpu_handle, gpu_handle])
         )
-
-    def _link_unit_parameters(
-        self,
-        unit_index: int,
-        buffer: Tensor
-    ):
-        """
-        Link the parameters in the unit to the buffer.
-        We assume that data is reconstructed (or being) in the buffer.
-
-        Args:
-            unit_index (int): Index of the unit.
-            buffer (Tensor): Buffer to link the parameters.
-
-        Returns:
-            None
-        """
-
-        # Get the unit parameters.
-        unit_paras = self._unit_parameters[unit_index]
-
-        # Link the parameters.
-        unit_paras.link_para_to(buffer)
 
     def _synchronize_prepare_paras(self, unit_index: int):
         """
@@ -424,10 +436,16 @@ class FlexTrainMemoryCoordinator:
         Returns:
             None
         """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
         # Wait for the async IO operation to finish.
         inflight_unit, handle = self._inflight_layer_handle
-        assert inflight_unit == unit_index, \
-            "Async IO operation is not for this unit"
+        assert inflight_unit == unit_index, (
+            f"Async IO operation is not for this unit: "
+            f"unit_index={unit_index} != inflight_unit={inflight_unit}"
+        )
         handle.wait()
 
         # Just available buffer is now the prefetch buffer.
@@ -456,7 +474,7 @@ class FlexTrainMemoryCoordinator:
 
     def pre_forward_unit(self, unit_index: int):
         """
-        Prepare the layer for forward pass.
+        Prepare the unit for forward pass.
 
         Functions:
         1. Ensure the availability of the parameters and checkpoint.
@@ -468,13 +486,35 @@ class FlexTrainMemoryCoordinator:
         Returns:
             None
         """
-        self._synchronize_prepare_paras(unit_index)
-        # TODO: get back when backward is implemented
-        if unit_index + 1 < self._num_units:
-            self._submit_prepare_paras(unit_index + 1)
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
 
-    def post_forward_unit(self, unit_index: int):
-        self._detach_unit_parameters(unit_index)
+        self._detach_unit_parameters(unit_index - 1)
+        self._synchronize_prepare_paras(unit_index)
+        self._submit_prepare_paras(unit_index + 1)
+
+    def pre_backward_unit(self, unit_index: int):
+        """
+        Prepare the unit for backward pass.
+
+        Functions:
+        1. Ensure the availability of the parameters and checkpoint.
+        2. Kick off relevant prefetching tasks if needed.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        self._detach_unit_parameters(unit_index + 1)
+        self._synchronize_prepare_paras(unit_index)
+        self._submit_prepare_paras(unit_index - 1)
 
 
 _MEMORY_COORDINATOR = FlexTrainMemoryCoordinator()
