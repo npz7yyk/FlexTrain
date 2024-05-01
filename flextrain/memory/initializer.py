@@ -4,7 +4,7 @@ from torch.nn import Parameter, Module
 from typing import List
 
 from flextrain.config import get_flextrain_config
-from flextrain.memory.coordinator import get_memory_coordinator
+from flextrain.memory.coordinator import get_model_coordinator
 
 
 _SHUTDOWN_INIT = False
@@ -70,6 +70,9 @@ class Init(object):
 
         self._restore_layer_init()
 
+        # Log the model coordinator configuration after Init
+        get_model_coordinator().log_configuration()
+
         # Mark the exit status
         self._exited = True
 
@@ -89,8 +92,8 @@ class Init(object):
         for layer in self._unit_layers:
             unit_paras.extend(list(layer.parameters()))
 
-        # Manage the unit memory by the memory coordinator
-        get_memory_coordinator().init_unit_parameters(
+        # Manage the unit memory by the model coordinator
+        get_model_coordinator().init_unit_parameters(
             self._unit_count, unit_paras
         )
 

@@ -13,7 +13,7 @@ from flextrain.checkpointing import (
 )
 from flextrain.config import get_flextrain_config
 from flextrain.llm_func import LLMFunc
-from flextrain.memory.coordinator import get_memory_coordinator
+from flextrain.memory.coordinator import get_model_coordinator
 from flextrain.scheduler import LLMTask, GreedySnakeBlockScheduler
 
 
@@ -37,12 +37,12 @@ class FlexTrainEngine(object):
         self.module = module.cuda().to(dtype=config.device_dtype)
         self.init_optimizer = init_optimizer
 
-        # Link to the memory coordinator
-        self.memory_coordinator = get_memory_coordinator()
+        # Link to the model coordinator
+        self.model_coordinator = get_model_coordinator()
 
         # LLM training information
         self.micro_batch_per_block = self._compute_micro_batch_per_block()
-        self.num_units = self.memory_coordinator.num_units
+        self.num_units = self.model_coordinator.num_units
 
         # Create the scheduler
         self.scheduler = GreedySnakeBlockScheduler(
@@ -115,13 +115,13 @@ class FlexTrainEngine(object):
             # Conduct pre-process
             if scheduler.first_unit_entered:
                 # Warm up the forward pipeline here for better overlapping
-                self.memory_coordinator.warmup_forward_pipeline()
+                self.model_coordinator.warmup_forward_pipeline()
                 # Conduct the batch pre-process
                 self._batch_pre_process()
             # End of first_unit_entered
 
             # Fetch the new unit parameters
-            self.memory_coordinator.pre_forward_unit(task.unit)
+            self.model_coordinator.pre_forward_unit(task.unit)
         # End of new_unit_entered
 
         # Load recent passed down and each layer tensor
@@ -150,13 +150,13 @@ class FlexTrainEngine(object):
             # Conduct pre-process
             if scheduler.first_unit_entered:
                 # Warm up the forward pipeline here for better overlapping
-                self.memory_coordinator.warmup_forward_pipeline()
+                self.model_coordinator.warmup_forward_pipeline()
                 # Conduct the batch pre-process
                 self._batch_pre_process()
             # End of first_unit_entered
 
             # Fetch the new unit parameters
-            self.memory_coordinator.pre_forward_unit(task.unit)
+            self.model_coordinator.pre_forward_unit(task.unit)
         # End of new_unit_entered
 
         # Need to fetch new unit parameters
@@ -199,13 +199,12 @@ class FlexTrainEngine(object):
             # Fetch the new unit parameters
             else:
                 ...
-                
+
         # End of new_unit_entered
 
         # Currently, just compute the loss
         # Must be the last unit
-        self.memory_coordinator.post_forward_unit(scheduler.last_unit)
-        self.memory_coordinator.pre_forward_unit(task.unit)
+        self.model_coordinator.pre_forward_unit(task.unit)
 
         # Load recent passed down and each layer tensor
         passed_down = self.micro_batch_passed_down[task.micro_batch]
@@ -239,7 +238,7 @@ class FlexTrainEngine(object):
         # # Need to conduct post-process and compute loss
         # if scheduler.new_unit_entered:
         #     # Detach last unit from GPU working memory
-        #     self.memory_coordinator.post_backward_unit(scheduler.last_unit)
+        #     self.model_coordinator.post_backward_unit(scheduler.last_unit)
 
         #     # Load recent passed down and each layer tensor
         #     passed_down = self.micro_batch_passed_down[task.micro_batch]
@@ -291,18 +290,18 @@ def hash_tensor(tensor):
 # for i in range(3):
         #     pre_input, post_input, loss_input = llm_funcs.get_batch()
 
-        #     self.memory_coordinator.warmup_forward_pipeline()
+        #     self.model_coordinator.warmup_forward_pipeline()
         #     passed_down, each_layer = llm_funcs.pre_process(pre_input)
 
         #     ctxs = []
         #     for j in range(24):
         #         passed_down = detach_variable(passed_down)
-        #         self.memory_coordinator.pre_forward_unit(j)
+        #         self.model_coordinator.pre_forward_unit(j)
         #         passed_down, ctx = checkpointed_forward(
         #             llm_funcs.layer_forward(j, j + 1),
         #             passed_down, each_layer
         #         )
-        #         self.memory_coordinator.post_forward_unit(j)
+        #         self.model_coordinator.post_forward_unit(j)
         #         ctxs.append(ctx)
 
         #     passed_down = detach_variable(passed_down)
