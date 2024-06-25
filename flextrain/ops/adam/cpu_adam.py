@@ -7,15 +7,27 @@
 
 import torch
 from cpuinfo import get_cpu_info
+from dataclasses import dataclass
+from typing import Dict
+
+from flextrain.config import get_flextrain_config
 from flextrain.utils import rank0_logger
 from flextrain.ops.op_builder import CPUAdamBuilder
+from flextrain.optimizer import OptTar, FlexTrainCPUOptimizer
 
 
-class FlexTrainCPUAdam(torch.optim.Optimizer):
+@dataclass
+class AdamOptTar(OptTar):
+    exp_avg: torch.Tensor
+    exp_avg_sq: torch.Tensor
+
+
+class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
     optimizer_id = 0
 
     def __init__(
         self,
+        unit_group_map: Dict[int, Dict],
         model_params,
         lr=1e-3,
         bias_correction=True,
@@ -78,22 +90,18 @@ class FlexTrainCPUAdam(torch.optim.Optimizer):
             bias_correction=bias_correction,
             amsgrad=amsgrad
         )
-        super(FlexTrainCPUAdam, self).__init__(model_params, default_args)
+        # Initialize the optimizer
+        # model_params, default_args for torch.optim.Optimizer
+        # unit_group_map for FlexTrainCPUOptimizer
+        torch.optim.Optimizer.__init__(self, model_params, default_args)
+        FlexTrainCPUOptimizer.__init__(self, unit_group_map)
 
         cpu_info = get_cpu_info()
         self.cpu_vendor = cpu_info["vendor_id_raw"].lower() \
             if "vendor_id_raw" in cpu_info else "unknown"
-        if "amd" in self.cpu_vendor:
-            for group_id, group in enumerate(self.param_groups):
-                for param_id, p in enumerate(group['params']):
-                    if p.dtype == torch.half:
-                        rank0_logger.warning(
-                            "FP16 params for CPUAdam may not work on AMD CPUs"
-                        )
-                        break
-                else:
-                    continue
-                break
+        if "amd" in self.cpu_vendor and \
+                get_flextrain_config().master_dtype == "fp16":
+            rank0_logger.warning("FP16 for CPUAdam may not work on AMD CPUs")
 
         self.opt_id = FlexTrainCPUAdam.optimizer_id
         FlexTrainCPUAdam.optimizer_id += 1
@@ -118,57 +126,12 @@ class FlexTrainCPUAdam(torch.optim.Optimizer):
             group.setdefault('amsgrad', False)
 
     @torch.no_grad()
-    def step(self, closure=None):
-        """ Update the model parameters.
-
-        Args:
-            closure (callable, optional): closure to compute the loss.
-                Defaults to ``None``.
-
-        Returns:
-            loss: if ``closure`` is provided. Otherwise ``None``.
-        """
-
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        # intended device for step
-        device = torch.device('cpu')
-
-        for group_id, group in enumerate(self.param_groups):
-            for param_id, p in enumerate(group['params']):
-
-                if p.grad is None:
-                    continue
-
-                assert p.device == device
-
-                state = self.state[p]
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # use full precision by default
-                    # unless self.fp32_optimizer_states is off
-                    state_dtype = torch.float \
-                        if self.fp32_optimizer_states else p.dtype
-                    # gradient momentums
-                    state['exp_avg'] = torch.zeros_like(
-                        p.data, dtype=state_dtype, device=device)
-                    # gradient variances
-                    state['exp_avg_sq'] = torch.zeros_like(
-                        p.data, dtype=state_dtype, device=device)
-
-                state['step'] += 1
-                beta1, beta2 = group['betas']
-
-                self.ft_opt_adam.adam_update(
-                    self.opt_id, state['step'], group['lr'],
-                    beta1, beta2, group['eps'],
-                    group['weight_decay'], group['bias_correction'],
-                    p.data, p.grad.data,
-                    state['exp_avg'], state['exp_avg_sq']
-                )
-
-        return loss
+    def unit_step(self, step: int, args: Dict, opt_tar: AdamOptTar):
+        beta1, beta2 = args['betas']
+        self.ft_opt_adam.adam_update(
+            self.opt_id, step, args['lr'],
+            beta1, beta2, args['eps'],
+            args['weight_decay'], args['bias_correction'],
+            opt_tar.para.data, opt_tar.grad.data,
+            opt_tar.exp_avg.data, opt_tar.exp_avg_sq.data
+        )

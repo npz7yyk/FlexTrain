@@ -3,7 +3,7 @@ FlexTrain checkpointing utils.
 
 @NOTE:
 FlexTrain checkpointing is not responsible for memory management.
-It is the user's responsibility to ensure that:
+Caller should take care of memory management and make sure that:
 1. Checkpointed activations are available for recomputation.
 2. Offload activations to CPU or disk if necessary.
 3. Input variables are detached by `detach_variable` between checkpoints.
@@ -311,7 +311,7 @@ def retrieve_tensor_grads(
         else:
             rst.append(None)
 
-    return tuple(rst) if not unwrap_tensors else rst[0]
+    return rst if not unwrap_tensors else rst[0]
 
 
 def checkpointed_backward(fwd_ctx: FWDContext, *grads):
@@ -339,8 +339,10 @@ def checkpointed_backward(fwd_ctx: FWDContext, *grads):
     # Recover the RNG states.
     bwd_rng_state.recover_states()
 
+    unwrap_outputs = False
     if isinstance(outputs, torch.Tensor):
         outputs = (outputs, )
+        unwrap_outputs = True
 
     # Filter out non tensor outputs
     outputs = [out for out in outputs if torch.is_tensor(out)]
@@ -362,9 +364,9 @@ def checkpointed_backward(fwd_ctx: FWDContext, *grads):
     # Return the gradients for the inputs
     grad_list = []
     for x in inputs:
-        if torch.is_tensor(x):
+        if isinstance(x, torch.Tensor) and x.requires_grad:
             grad_list.append(x.grad)
         else:
             grad_list.append(None)
 
-    return tuple(grad_list) if len(grad_list) > 1 else grad_list[0]
+    return tuple(grad_list) if not unwrap_outputs else grad_list[0]

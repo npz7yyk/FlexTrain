@@ -6,6 +6,8 @@
 # License: Apache-2.0
 
 import torch
+from torch import Tensor
+from typing import Tuple, List
 
 from flextrain.ops.op_builder import FusedAdamBuilder
 
@@ -85,6 +87,14 @@ class FusedAdam(torch.optim.Optimizer):
             [0], dtype=torch.int, device=torch.cuda.current_device()
         )
         self.multi_tensor_adam = fused_adam_cuda.multi_tensor_adam
+
+    def link_layerwise_parameters(self, param_states: List[Tuple[Tensor]]):
+        # Link optimizer buffers to related parameters
+        for p, m, v in param_states:
+            state = self.state[p]
+            state['step'] = 0
+            state['exp_avg'] = m
+            state['exp_avg_sq'] = v
 
     def zero_grad(self):
         if self.set_grad_none:

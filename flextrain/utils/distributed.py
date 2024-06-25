@@ -156,5 +156,4 @@ def all_gather(tensor_out, tensor_in, group=None, async_op=False):
 
 
 def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
-    # _assert_torch_distributed_initialized()
     return torch.distributed.all_reduce(tensor, op, group, async_op)

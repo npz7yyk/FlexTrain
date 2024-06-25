@@ -617,6 +617,33 @@ class OpBuilder(ABC):
         return op_module
 
 
+class CPUOpBuilder(OpBuilder):
+
+    def builder(self):
+        from torch.utils.cpp_extension import CppExtension as ExtensionBuilder
+        include_dirs = [
+            os.path.abspath(x)
+            for x in self.strip_empty_entries(self.include_paths())
+        ]
+        compile_args = {'cxx': self.strip_empty_entries(self.cxx_args())}
+
+        cpp_ext = ExtensionBuilder(
+            name=self.absolute_name(),
+            sources=self.strip_empty_entries(self.sources()),
+            include_dirs=include_dirs,
+            libraries=self.strip_empty_entries(self.libraries_args()),
+            extra_compile_args=compile_args
+        )
+
+        return cpp_ext
+
+    def cxx_args(self):
+        return ['-O3', '-g', '-Wno-reorder']
+
+    def libraries_args(self):
+        return []
+
+
 class CUDAOpBuilder(OpBuilder):
 
     def compute_capability_args(self, cross_compile_archs=None):
@@ -831,49 +858,3 @@ class CUDAOpBuilder(OpBuilder):
             return ['cublas', 'curand']
         else:
             return []
-
-
-class TorchCPUOpBuilder(CUDAOpBuilder):
-
-    def extra_ldflags(self):
-        if self.build_for_cpu:
-            return ['-fopenmp']
-
-        if not self.is_rocm_pytorch():
-            return ['-lcurand']
-
-        return []
-
-    def cxx_args(self):
-        import torch
-        args = []
-        if not self.build_for_cpu:
-            if not self.is_rocm_pytorch():
-                CUDA_LIB64 = os.path.join(
-                    torch.utils.cpp_extension.CUDA_HOME, "lib64")
-                if not os.path.exists(CUDA_LIB64):
-                    CUDA_LIB64 = os.path.join(
-                        torch.utils.cpp_extension.CUDA_HOME, "lib")
-            else:
-                CUDA_LIB64 = os.path.join(
-                    torch.utils.cpp_extension.ROCM_HOME, "lib")
-
-            args += super().cxx_args()
-            args += [
-                f'-L{CUDA_LIB64}',
-                '-lcudart',
-                '-lcublas',
-                '-g',
-            ]
-
-        CPU_ARCH = self.cpu_arch()
-        SIMD_WIDTH = self.simd_width()
-        CUDA_ENABLE = self.is_cuda_enable()
-        args += [
-            CPU_ARCH,
-            '-fopenmp',
-            SIMD_WIDTH,
-            CUDA_ENABLE,
-        ]
-
-        return args

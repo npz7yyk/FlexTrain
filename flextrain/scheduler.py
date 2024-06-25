@@ -87,9 +87,9 @@ class GreedySnakeBlockScheduler:
         return curr_unit != last_unit
 
     @property
-    def first_unit_entered(self):
+    def in_first_unit(self):
         return self.curr_task.unit == 0
 
     @property
-    def last_unit_entered(self):
+    def in_last_unit(self):
         return self.curr_task.unit == self.num_units - 1

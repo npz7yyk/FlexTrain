@@ -6,10 +6,10 @@
 # License: Apache-2.0
 
 import os
-from .builder import TorchCPUOpBuilder
+from .builder import CPUOpBuilder
 
 
-class CPUAdamBuilder(TorchCPUOpBuilder):
+class CPUAdamBuilder(CPUOpBuilder):
     BUILD_VAR = "FT_BUILD_CPU_ADAM"
     NAME = "cpu_adam"
 
@@ -20,31 +20,11 @@ class CPUAdamBuilder(TorchCPUOpBuilder):
         return f'flextrain.ops.adam.{self.NAME}_op'
 
     def sources(self):
-        if self.build_for_cpu:
-            return ['csrc/adam/cpu_adam.cpp', 'csrc/adam/cpu_adam_impl.cpp']
-        else:
-            return [
-                'csrc/adam/cpu_adam.cpp', 'csrc/adam/cpu_adam_impl.cpp',
-                'csrc/common/custom_cuda_kernel.cu'
-            ]
+        return ['csrc/adam/cpu_adam.cpp', 'csrc/adam/cpu_adam_impl.cpp']
 
     def libraries_args(self):
         args = super().libraries_args()
-        if self.build_for_cpu:
-            return args
-
-        if not self.is_rocm_pytorch():
-            args += ['curand']
-
         return args
 
     def include_paths(self):
-        import torch
-        if self.build_for_cpu:
-            CUDA_INCLUDE = []
-        elif not self.is_rocm_pytorch():
-            CUDA_INCLUDE = [
-                os.path.join(torch.utils.cpp_extension.CUDA_HOME, "include")]
-        else:
-            CUDA_INCLUDE = []
-        return ['csrc/includes'] + CUDA_INCLUDE
+        return ['csrc/includes']
