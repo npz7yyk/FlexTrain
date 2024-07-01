@@ -110,7 +110,15 @@ def _nvme_offload(
     # Lazy initialization of the NVMe swapper.
     global _NVME_SWAPPER
     if _NVME_SWAPPER is None:
-        _NVME_SWAPPER = AsyncNVMeSwapper(get_flextrain_config().nvme_swap_dir)
+        nvme_swap_config = get_flextrain_config().nvme_swap
+        _NVME_SWAPPER = AsyncNVMeSwapper(
+            swap_dir=nvme_swap_config.swap_dir,
+            aio_block_size=nvme_swap_config.aio_block_size,
+            aio_queue_depth=nvme_swap_config.aio_queue_depth,
+            aio_thread_count=nvme_swap_config.aio_thread_count,
+            aio_single_submit=nvme_swap_config.aio_single_submit,
+            aio_overlap_events=nvme_swap_config.aio_overlap_events
+        )
 
     # Call the NVMe swapper.
     return _NVME_SWAPPER.swap_out(data_ids, tensors, async_op)
@@ -159,10 +167,10 @@ class FlexTrainModelCoordinator:
         self._single_gpu = dist.get_world_size() == 1
 
         # Mixed precision dtype for accelerator.
-        self._device_dtype = config.device_dtype
+        self._device_dtype = config.mixed_precision.device_dtype
 
         # Mixed precision dtype for master.
-        self._master_dtype = config.master_dtype
+        self._master_dtype = config.mixed_precision.master_dtype
 
         # Number of units in the model.
         self._num_units = 0
@@ -179,7 +187,7 @@ class FlexTrainModelCoordinator:
         # How to split the training data.
         numel_per_rank = contiguous_partitioned_numel(parameters)
         self._para_numels = _get_split_numels(
-            numel_per_rank, config.parameter_split_ratio
+            numel_per_rank, config.split_ratio.parameter
         )
         self._grad_numels = self._para_numels
         self._numel_per_rank = numel_per_rank
@@ -214,6 +222,10 @@ class FlexTrainModelCoordinator:
     @property
     def num_units(self):
         return self._num_units
+
+    @property
+    def unit_numel(self):
+        return self._original_unit_numel
 
     @property
     def unit_parameter_map(self):
@@ -708,15 +720,16 @@ class FlexTrainOptCoordinator:
         self._train_units = sorted(train_units)
 
         # 1. Set the configuration for the optimizer.
-        self._device_dtype = get_flextrain_config().device_dtype
-        self._master_dtype = get_flextrain_config().master_dtype
+        config = get_flextrain_config()
+        self._device_dtype = config.mixed_precision.device_dtype
+        self._master_dtype = config.mixed_precision.master_dtype
 
         self._num_units = len(self._train_units)
 
         numel_per_rank = get_model_coordinator().numel_per_rank
         self._model_numels = get_model_coordinator().model_split_numels
         self._opt_numels = _get_split_numels(
-            numel_per_rank, get_flextrain_config().optimizer_split_ratio
+            numel_per_rank, config.split_ratio.optimizer
         )
         assert self._model_numels[0] >= self._opt_numels[0], \
             "GPU parameter ratio should be larger than GPU optimizer ratio."

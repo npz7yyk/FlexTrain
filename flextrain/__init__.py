@@ -2,7 +2,6 @@ import torch
 
 from argparse import ArgumentParser
 
-import flextrain.checkpointing
 import flextrain.utils.distributed as distributed
 
 from .config import init_flextrain_config
@@ -12,17 +11,10 @@ from .defaults import (
     PROCESS_GROUP_TIMEOUT_DEFAULT
 )
 from .engine import FlexTrainEngine
-from .llm_func import set_llm_func, LLMFunc
-from .memory.initializer import Init
-from .utils.distributed import init_distributed
-
-# from checkpointing import (
-#     data_parallel_cuda_manual_seed,
-#     FWDContext,
-#     detach_variable,
-#     checkpointed_forward,
-#     checkpointed_backward
-# )
+from .llm_func import set_llm_func, LLMFunc         # noqa: F401
+from .memory.initializer import Init                # noqa: F401
+from .optimizer import FlexTrainOptimizer
+from .utils.distributed import init_distributed     # noqa: F401
 
 
 def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
@@ -58,7 +50,7 @@ def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
 
 def initialize(
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: FlexTrainOptimizer,
     config: dict = None,
     dist_init_required=False,
     dist_backend=TORCH_DISTRIBUTED_BACKEND_DEFAULT,

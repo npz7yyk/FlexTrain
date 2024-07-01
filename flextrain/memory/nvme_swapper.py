@@ -9,21 +9,6 @@ from flextrain.memory import (
     AsyncIOHandle
 )
 from flextrain.ops.aio import AsyncIOBuilder
-from flextrain.defaults import (
-    AIO_BLOCK_SIZE_DEFAULT,
-    AIO_QUEUE_DEPTH_DEFAULT,
-    AIO_THREAD_COUNT_DEFAULT,
-    AIO_SINGLE_SUBMIT_DEFAULT,
-    AIO_OVERLAP_EVENTS_DEFAULT
-)
-
-_AIO_DEFAULT_ARGS = [
-    AIO_BLOCK_SIZE_DEFAULT,
-    AIO_QUEUE_DEPTH_DEFAULT,
-    AIO_SINGLE_SUBMIT_DEFAULT,
-    AIO_OVERLAP_EVENTS_DEFAULT,
-    AIO_THREAD_COUNT_DEFAULT
-]
 
 
 def swap_in_tensors(swap_handle, tensor_buffers, swap_paths):
@@ -38,20 +23,40 @@ def swap_out_tensors(swap_handle, tensor_buffers, swap_paths):
 
 class AsyncNVMeSwapper:
 
-    def __init__(self, base_dir: str):
+    def __init__(
+        self,
+        swap_dir: str,
+        aio_block_size: int,
+        aio_queue_depth: int,
+        aio_thread_count: int,
+        aio_single_submit: bool,
+        aio_overlap_events: bool
+    ):
         # Directory to store the swapped tensors
-        self.base_dir = base_dir
-        os.makedirs(self.base_dir, exist_ok=True)
+        self.swap_dir = swap_dir
+        os.makedirs(self.swap_dir, exist_ok=True)
         # Ensure the directory is empty
-        os.system(f"rm -rf {self.base_dir}/*")
+        os.system(f"rm -rf {self.swap_dir}/*")
 
         # Create the aio read and write handles
         aio_handle = AsyncIOBuilder().load().aio_handle
-        self._aio_read_handle: Waitable = aio_handle(*_AIO_DEFAULT_ARGS)
-        self._aio_write_handle: Waitable = aio_handle(*_AIO_DEFAULT_ARGS)
+        self._aio_read_handle: Waitable = aio_handle(
+            aio_block_size,
+            aio_queue_depth,
+            aio_thread_count,
+            aio_single_submit,
+            aio_overlap_events
+        )
+        self._aio_write_handle: Waitable = aio_handle(
+            aio_block_size,
+            aio_queue_depth,
+            aio_thread_count,
+            aio_single_submit,
+            aio_overlap_events
+        )
 
     def _filename(self, data_id: FlexTrainDataID):
-        return os.path.join(self.base_dir, str(data_id))
+        return os.path.join(self.swap_dir, str(data_id))
 
     def swap_out(
         self,

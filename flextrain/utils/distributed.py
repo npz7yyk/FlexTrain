@@ -12,7 +12,6 @@ from flextrain.defaults import (
 from flextrain.utils.logging import rank0_logger
 from flextrain.utils.torch import (
     get_all_gather_function,
-    get_coalescing_manager,
     get_reduce_scatter_function
 )
 

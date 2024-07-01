@@ -97,7 +97,7 @@ class FlexTrainOptimizer:
         )
 
     def is_cpu_optimizer_needed(self):
-        return get_flextrain_config().optimizer_split_ratio[0] < 1
+        return get_flextrain_config().split_ratio.optimizer[0] < 1
 
     @property
     def gpu_layerwise_states(self):

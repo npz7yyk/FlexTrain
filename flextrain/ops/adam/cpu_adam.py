@@ -99,8 +99,8 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
         cpu_info = get_cpu_info()
         self.cpu_vendor = cpu_info["vendor_id_raw"].lower() \
             if "vendor_id_raw" in cpu_info else "unknown"
-        if "amd" in self.cpu_vendor and \
-                get_flextrain_config().master_dtype == "fp16":
+        master_dtype = get_flextrain_config().mixed_precision.master_dtype
+        if "amd" in self.cpu_vendor and master_dtype == torch.float16:
             rank0_logger.warning("FP16 for CPUAdam may not work on AMD CPUs")
 
         self.opt_id = FlexTrainCPUAdam.optimizer_id

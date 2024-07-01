@@ -3,6 +3,10 @@ import logging
 import os
 
 
+LEFT_BRACE = """{"""
+RIGHT_BRACE = """}"""
+
+
 class _DummyLogger:
     """ A dummy logger that does nothing when its methods are called. """
     def __getattribute__(self, __name: str):
