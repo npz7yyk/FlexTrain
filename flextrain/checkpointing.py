@@ -339,20 +339,21 @@ def checkpointed_backward(fwd_ctx: FWDContext, *grads):
     # Recover the RNG states.
     bwd_rng_state.recover_states()
 
-    unwrap_outputs = False
-    if isinstance(outputs, torch.Tensor):
-        outputs = (outputs, )
-        unwrap_outputs = True
-
-    # Filter out non tensor outputs
-    outputs = [out for out in outputs if torch.is_tensor(out)]
+    # If tensors is a single tensor, convert it to a list.
+    if torch.is_tensor(outputs):
+        outputs = [outputs]
+        grads = [grads]
 
     # Construct arguments to autograd.backward()
+    assert len(outputs) == len(grads), (
+        f"{len(outputs)} tensors are provided. "
+        f"However, {len(grads)} gradients are provided."
+    )
     output_tensors = []
     grad_tensors = []
-    for out, grad in zip(outputs, grads):
-        if out.requires_grad:
-            output_tensors.append(out)
+    for output, grad in zip(outputs, grads):
+        if torch.is_tensor(output):
+            output_tensors.append(output)
             grad_tensors.append(grad)
 
     # Run the backward pass.
@@ -364,9 +365,14 @@ def checkpointed_backward(fwd_ctx: FWDContext, *grads):
     # Return the gradients for the inputs
     grad_list = []
     for x in inputs:
-        if isinstance(x, torch.Tensor) and x.requires_grad:
+        if isinstance(x, torch.Tensor):
             grad_list.append(x.grad)
         else:
             grad_list.append(None)
 
-    return tuple(grad_list) if not unwrap_outputs else grad_list[0]
+    if len(grad_list) == 0:
+        return tuple()
+    elif len(grad_list) == 1:
+        return grad_list[0]
+    else:
+        return tuple(grad_list)

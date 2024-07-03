@@ -50,34 +50,20 @@ class FlexTrainEngine(object):
         self.model_coordinator = get_model_coordinator()
 
         # LLM training information
-        self.micro_batch_per_block = self._compute_micro_batch_per_block()
+        self.micro_batch_per_batch = self._compute_micro_batch_per_batch()
         self.num_units = self.model_coordinator.num_units
 
         # Create computation scheduler
         self.scheduler = GreedySnakeBlockScheduler(
-            self.micro_batch_per_block,
+            self.micro_batch_per_batch,
             self.num_units
         )
 
         # Link / Create loss scaler
         self.custom_loss_scaler = False
-        loss_scale_config = config.mixed_precision
-        init_loss_scale = 2 ** loss_scale_config.initial_scale_power
-        self.loss_scaler = create_loss_scaler(
-            dtype=config.mixed_precision.device_dtype,
-            static_loss_scale=init_loss_scale,
-            dynamic_loss_scale_enabled=loss_scale_config.dynamic_loss_scaling,
-            dynamic_loss_args={
-                "init_scale": init_loss_scale,
-                "scale_window": loss_scale_config.loss_scale_window,
-                "min_scale": loss_scale_config.min_loss_scale,
-                "delayed_shift": loss_scale_config.hysteresis,
-                "consecutive_hysteresis":
-                    loss_scale_config.consecutive_hysteresis
-            }
-        )
+        self.loss_scaler = create_loss_scaler()
 
-    def _compute_micro_batch_per_block(self):
+    def _compute_micro_batch_per_batch(self):
         config = get_flextrain_config()
         batch_size = config.batch_size
         micro_batch_size = config.micro_batch_size
@@ -104,27 +90,16 @@ class FlexTrainEngine(object):
         # Context container
         self.micro_batch_unit_ctx: List[List[FWDContext]] = [
             [None] * self.num_units
-            for _ in range(self.micro_batch_per_block)
+            for _ in range(self.micro_batch_per_batch)
         ]
 
         # Loss result container
         self.micro_batch_loss_rsts: Dict[int, Sequence[Any]] = {}
 
-    def _batch_pre_process(self):
-        for i in range(self.micro_batch_per_block):
-            pre_inputs, post_inputs, loss_inputs = LLMFunc.get_batch()
-            # Store the inputs, no need to offload from GPU
-            self.micro_batch_post_inputs[i] = post_inputs
-            self.micro_batch_loss_inputs[i] = loss_inputs
-            # Generate the passed down tensor and each layer tensor
-            passed_down, every_layer = LLMFunc.pre_process(pre_inputs)
-            # Store the passed down and each layer tensor
-            self.micro_batch_passed_down[i] = passed_down
-            self.micro_batch_every_layer[i] = every_layer
-        self.every_layer_len = len(every_layer)
-
     @torch.no_grad()
-    def _conduct_preprocess_forward(self, task: LLMTask):
+    def _conduct_first_unit(self, task: LLMTask):
+        config = get_flextrain_config()
+
         # Unpack a micro batch
         pre_inputs, post_inputs, loss_inputs = LLMFunc.get_batch()
         # Store the inputs
@@ -132,12 +107,28 @@ class FlexTrainEngine(object):
         self.micro_batch_post_inputs[task.micro_batch] = post_inputs
         self.micro_batch_loss_inputs[task.micro_batch] = loss_inputs
 
-        # Generate the passed down tensor and each layer tensor
-        passed_down, every_layer = LLMFunc.pre_process(pre_inputs)
+        def forward_func():
+            # Generate the passed down tensor and each layer tensor
+            passed_down, every_layer = LLMFunc.pre_process(pre_inputs)
 
-        # Store the passed down and each layer tensor
+            # Store the passed down and each layer tensor
+            self.micro_batch_passed_down[task.micro_batch] = passed_down
+            self.micro_batch_every_layer[task.micro_batch] = every_layer
+            self.every_layer_len = len(every_layer)
+
+            # Conduct forward
+            start = task.unit * config.checkpoint_interval
+            end = min(start + config.checkpoint_interval, config.num_layers)
+            return LLMFunc.layer_forward(start, end)(
+                *passed_down, *every_layer
+            )
+
+        # Conduct checkpointed forward
+        passed_down, ctx = checkpointed_forward(forward_func)
+
+        # Save recent passed down tensor and context
         self.micro_batch_passed_down[task.micro_batch] = passed_down
-        self.micro_batch_every_layer[task.micro_batch] = every_layer
+        self.micro_batch_unit_ctx[task.micro_batch][task.unit] = ctx
 
     @torch.no_grad()
     def _conduct_forward(self, task: LLMTask):
@@ -158,7 +149,7 @@ class FlexTrainEngine(object):
 
         # Conduct pre-process if in the first unit
         if scheduler.in_first_unit:
-            self._conduct_preprocess_forward(task)
+            return self._conduct_first_unit(task)
 
         # Load recent passed down and each layer tensor
         passed_down = self.micro_batch_passed_down[task.micro_batch]
@@ -206,31 +197,14 @@ class FlexTrainEngine(object):
 
         # 4. Scale the loss
         loss = retrieve_llm_loss(llm_loss_rst)
-
-        for w in range(dist.get_world_size()):
-            dist.barrier()
-            if dist.get_rank() == w:
-                print(loss)
-                if w == dist.get_world_size() - 1:
-                    print()
-            dist.barrier()
-
-        loss = loss * self.loss_scale
+        loss = loss.float() * self.loss_scale / self.micro_batch_per_batch
 
         # 5. Conduct backward from loss to pre-post_process
         torch.autograd.backward(loss)
 
         # 6. Get the gradients
         passed_back = retrieve_tensor_grads(passed_down)
-        passed_back += [None] * self.every_layer_len
         self.micro_batch_passed_back[task.micro_batch] = passed_back
-
-    @torch.enable_grad()
-    def _conduct_preprocess_backward(self, task: LLMTask):
-        pre_inputs = self.micro_batch_pre_inputs[task.micro_batch]
-        _, ctx = checkpointed_forward(LLMFunc.pre_process, pre_inputs)
-        passed_back = self.micro_batch_passed_back[task.micro_batch]
-        checkpointed_backward(ctx, *passed_back)
 
     def _conduct_backward(self, task: LLMTask):
         scheduler = self.scheduler
@@ -249,12 +223,9 @@ class FlexTrainEngine(object):
         ctx = self.micro_batch_unit_ctx[task.micro_batch][task.unit]
         passed_back = self.micro_batch_passed_back[task.micro_batch]
         passed_back = checkpointed_backward(ctx, *passed_back)
+        # Exclude every layer tensor in the passed back
+        passed_back = passed_back[:-self.every_layer_len]
         self.micro_batch_passed_back[task.micro_batch] = passed_back
-
-        # Need to conduct pre-process if in the first unit
-        if scheduler.in_first_unit:
-            self._conduct_preprocess_backward(task)
-        # End of in_first_unit
 
     def override_loss_scale(self, loss_scale: float):
         self.custom_loss_scaler = True
@@ -272,7 +243,7 @@ class FlexTrainEngine(object):
     loss_scale = property(_get_loss_scale, _set_loss_scale)
 
     @property
-    def dynamic_loss_scale(self):
+    def dynamic_loss_scaling(self):
         return self.loss_scaler.dynamic
 
     def step(self):
@@ -297,6 +268,6 @@ class FlexTrainEngine(object):
 
         # 3. Return the loss results
         loss_rsts = []
-        for i in range(self.micro_batch_per_block):
+        for i in range(self.micro_batch_per_batch):
             loss_rsts.append(self.micro_batch_loss_rsts[i])
         return loss_rsts

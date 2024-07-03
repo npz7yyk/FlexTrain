@@ -9,6 +9,7 @@ Commit: 93ab4bea59dc5cbf97c079d313741866af4deac9
 import torch
 from abc import ABC
 
+from flextrain.config import get_flextrain_config
 from flextrain.utils import rank0_logger
 
 INITIAL_LOSS_SCALE = 'init_scale'
@@ -180,12 +181,20 @@ class DynamicLossScaler(LossScalerBase):
 
 # Although loss scaling is defined for fp16, yet for backwards compatibility
 # we still create a scaler for other dtypes which does not perform any scaling.
-def create_loss_scaler(
-    dtype: torch.dtype,
-    static_loss_scale: float,
-    dynamic_loss_scale_enabled: bool,
-    dynamic_loss_args: dict = None
-):
+def create_loss_scaler():
+    loss_scale_config = get_flextrain_config().mixed_precision
+    init_loss_scale = 2 ** loss_scale_config.initial_scale_power
+    dtype = loss_scale_config.device_dtype
+    static_loss_scale = init_loss_scale,
+    dynamic_loss_scale_enabled = loss_scale_config.dynamic_loss_scaling,
+    dynamic_loss_args = {
+        INITIAL_LOSS_SCALE: init_loss_scale,
+        SCALE_WINDOW: loss_scale_config.loss_scale_window,
+        MIN_LOSS_SCALE: loss_scale_config.min_loss_scale,
+        DELAYED_SHIFT: loss_scale_config.hysteresis,
+        CONSECUTIVE_HYSTERESIS:
+            loss_scale_config.consecutive_hysteresis
+    }
     if dtype == torch.half and dynamic_loss_scale_enabled:
         if dynamic_loss_args is None:
             return DynamicLossScaler(dtype=dtype)
