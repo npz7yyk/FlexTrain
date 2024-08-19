@@ -14,7 +14,10 @@ from flextrain.checkpointing import (
 from flextrain.config import get_flextrain_config
 from flextrain.llm_func import LLMFunc, retrieve_llm_loss
 from flextrain.loss_scaler import create_loss_scaler
-from flextrain.memory.coordinator import get_model_coordinator
+from flextrain.memory.coordinator import (
+    get_para_coordinator,
+    get_opt_coordinator
+)
 from flextrain.optimizer import FlexTrainOptimizer
 from flextrain.scheduler import LLMTask, GreedySnakeBlockScheduler
 
@@ -46,12 +49,13 @@ class FlexTrainEngine(object):
         )
         self.optimizer = optimizer
 
-        # Link to model coordinator
-        self.model_coordinator = get_model_coordinator()
+        # Link to parameter & optimizer coordinators
+        self.para_coordinator = get_para_coordinator()
+        self.opt_coordinator = get_opt_coordinator()
 
         # LLM training information
         self.micro_batch_per_batch = self._compute_micro_batch_per_batch()
-        self.num_units = self.model_coordinator.num_units
+        self.num_units = self.para_coordinator.num_units
 
         # Create computation scheduler
         self.scheduler = GreedySnakeBlockScheduler(
@@ -140,11 +144,11 @@ class FlexTrainEngine(object):
             # Conduct pre-process
             if scheduler.in_first_unit:
                 # Warm up the forward pipeline here for better overlapping
-                self.model_coordinator.warmup_forward_pipeline()
+                self.para_coordinator.warmup_forward_pipeline()
             # End of in_first_unit
 
             # Fetch the new unit parameters
-            self.model_coordinator.pre_forward_unit(task.unit)
+            self.para_coordinator.pre_forward_unit(task.unit)
         # End of new_unit_entered
 
         # Conduct pre-process if in the first unit
@@ -210,22 +214,28 @@ class FlexTrainEngine(object):
         scheduler = self.scheduler
 
         # Need to fetch new unit parameters
+        # Need to prepare buffer for gradient accumulation
         if scheduler.new_unit_entered:
-            self.model_coordinator.pre_backward_unit(task.unit)
+            self.para_coordinator.pre_backward_unit(task.unit)
+            self.opt_coordinator.pre_backward_unit(task.unit)
         # End of new_unit_entered
 
         # Last unit needs special treatment
         if scheduler.in_last_unit:
-            return self._conduct_last_unit(task)
-        # End of in_last_unit
+            self._conduct_last_unit(task)
+        else:
+            # Conduct backward
+            ctx = self.micro_batch_unit_ctx[task.micro_batch][task.unit]
+            passed_back = self.micro_batch_passed_back[task.micro_batch]
+            passed_back = checkpointed_backward(ctx, *passed_back)
+            # Exclude every layer tensor in the passed back
+            passed_back = passed_back[:-self.every_layer_len]
+            self.micro_batch_passed_back[task.micro_batch] = passed_back
+        # End of conduct backward
 
-        # Conduct backward
-        ctx = self.micro_batch_unit_ctx[task.micro_batch][task.unit]
-        passed_back = self.micro_batch_passed_back[task.micro_batch]
-        passed_back = checkpointed_backward(ctx, *passed_back)
-        # Exclude every layer tensor in the passed back
-        passed_back = passed_back[:-self.every_layer_len]
-        self.micro_batch_passed_back[task.micro_batch] = passed_back
+        # Need to transfer the gradients to optimizer working buffer
+        if scheduler.in_last_micro_batch:
+            self.opt_coordinator.post_backward_unit(task.unit)
 
     def override_loss_scale(self, loss_scale: float):
         self.custom_loss_scaler = True
@@ -266,8 +276,30 @@ class FlexTrainEngine(object):
             else:
                 self._conduct_backward(task)
 
-        # 3. Return the loss results
+        self.opt_coordinator._synchronize_transfer_grads(0)
+        self.grad_norm = self.opt_coordinator._grad_norm
+
+        # 3. Conduct optimizer step
+        self.optimizer.step()
+
+        # TEMP: check gradient global norm
+        self.grad_norm = torch.tensor([self.grad_norm], device='cuda')
+        dist.all_reduce(self.grad_norm)
+        for p in self.optimizer.non_layerwise_params:
+            self.grad_norm += p.grad.data.float().norm().item() ** 2
+
+        self.grad_norm = self.grad_norm.item()
+        dist.rank0_logger.info("Gradient global norm: {}".format(self.grad_norm))
+
+        # 4. Return the loss results
         loss_rsts = []
         for i in range(self.micro_batch_per_batch):
             loss_rsts.append(self.micro_batch_loss_rsts[i])
+
+        if not hasattr(self, 'count'):
+            self.count = 0
+        self.count += 1
+        if self.count % 30 == 0:
+            exit()
+
         return loss_rsts

@@ -140,6 +140,13 @@ def barrier(group=None):
     return torch.distributed.barrier(group)
 
 
+def print_rank_by_rank(*args, **kwargs):
+    for i in range(get_world_size()):
+        barrier()
+        if i == get_rank():
+            print(*args, **kwargs)
+
+
 def broadcast(tensor, src, group=None, async_op=False):
     _info_not_initialized()
     if is_single_process():
@@ -155,4 +162,17 @@ def all_gather(tensor_out, tensor_in, group=None, async_op=False):
 
 
 def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
+    _info_not_initialized()
+    if is_single_process():
+        return DummyHandle()
     return torch.distributed.all_reduce(tensor, op, group, async_op)
+
+
+def reduce_scatter(
+    tensor_out, tensor_in,
+    op=ReduceOp.SUM, group=None, async_op=False
+):
+    _info_not_initialized()
+    if is_single_process():
+        return DummyHandle()
+    return _REDUCE_SCATTER_FUNCTION(tensor_out, tensor_in, op, group, async_op)

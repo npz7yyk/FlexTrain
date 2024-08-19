@@ -42,7 +42,7 @@ class FlexTrainAdam(FlexTrainOptimizer):
             amsgrad=amsgrad,
             set_grad_none=set_grad_none
         )
-        # self.gpu_optimizer.link_layerwise_parameters(self.gpu_layerwise_states)
+        self.gpu_optimizer.link_layerwise_parameters(self.gpu_layerwise_states)
 
         # 3. Initialize CPU Adam optimizer.
         self.cpu_optimizer = FlexTrainCPUAdam(

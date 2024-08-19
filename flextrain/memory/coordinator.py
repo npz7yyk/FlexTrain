@@ -5,6 +5,9 @@ from torch import Tensor
 from torch.nn import Parameter
 from typing import SupportsIndex, Iterable, Tuple, List, Dict
 
+# from torch.cuda import _sanitizer
+# _sanitizer.enable_cuda_sanitizer()
+
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
     FlexTrainDataType as Dtype,
@@ -144,10 +147,10 @@ def _nvme_reload(
     return _NVME_SWAPPER.swap_in(data_ids, tensors, async_op)
 
 
-class FlexTrainModelCoordinator:
+class FlexTrainParaCoordinator:
 
     def __init__(self):
-        # Lazy initialization of model coordinator.
+        # Lazy initialization of parameter coordinator.
         self._initialized = False
 
     def _init_coordinator(self, parameters: Iterable[Parameter]):
@@ -189,7 +192,6 @@ class FlexTrainModelCoordinator:
         self._para_numels = _get_split_numels(
             numel_per_rank, config.split_ratio.parameter
         )
-        self._grad_numels = self._para_numels
         self._numel_per_rank = numel_per_rank
         self._original_unit_numel = sum(p.numel() for p in parameters)
         # Memory for optimizer states needed to be lazy allocated.
@@ -213,7 +215,7 @@ class FlexTrainModelCoordinator:
         ))
 
         # Handle for async IO operations.
-        self._inflight_layer_handle: Tuple[int, Waitable] = (-1, None)
+        self._inflight_para_handle: Tuple[int, Waitable] = (-1, None)
 
     @property
     def is_initialized(self):
@@ -379,11 +381,11 @@ class FlexTrainModelCoordinator:
 
     def log_configuration(self):
         """
-        Log the model coordinator configurations after initialization.
+        Log the parameter coordinator configurations after initialization.
         """
         rank0_logger.info(
             "\n\n> "
-            f"FlexTrain model coordinator initialized with configurations:\n"
+            f"FlexTrain parameter coordinator initialized with configurations:\n"
             f"  - device dtype: {self._device_dtype}\n"
             f"  - master dtype: {self._master_dtype}\n"
             f"  - number of units: {self._num_units}\n"
@@ -421,19 +423,18 @@ class FlexTrainModelCoordinator:
             return DummyHandle()
 
         # 1. Locate the target memory.
-        tar_full_paras = self._gpu_inflight_paras
-        mem_partitions = torch.chunk(tar_full_paras, dist.get_world_size())
-        mem_partition = mem_partitions[dist.get_rank()]
-
         # 2. Copy parameters from three resources:
         #    - GPU part from GPU base
         #    - CPU part from CPU base
         #    - NVMe part from CPU available buffer
         # 3. Conduct all-gather into tensor if necessary.
-        gpu_view, cpu_view, nvme_view = torch.split(
-            mem_partition, self._para_numels
-        )
         with torch.cuda.stream(self._data_stream):
+            tar_full_paras = self._gpu_inflight_paras
+            mem_partitions = torch.chunk(tar_full_paras, dist.get_world_size())
+            mem_partition = mem_partitions[dist.get_rank()]
+            gpu_view, cpu_view, nvme_view = torch.split(
+                mem_partition, self._para_numels
+            )
             gpu_view.copy_(self._gpu_para_base[unit_index], True)
             cpu_view.copy_(self._cpu_para_base[unit_index], True)
             nvme_view.copy_(self._nvme_available_paras, True)
@@ -462,7 +463,7 @@ class FlexTrainModelCoordinator:
         gpu_handle = self._async_prepare_gpu_paras(unit_index)
 
         # Keep track of the inflight operation.
-        self._inflight_layer_handle = (
+        self._inflight_para_handle = (
             unit_index, FusedHandle([cpu_handle, gpu_handle])
         )
 
@@ -482,7 +483,7 @@ class FlexTrainModelCoordinator:
             return
 
         # Wait for the async IO operation to finish.
-        inflight_unit, handle = self._inflight_layer_handle
+        inflight_unit, handle = self._inflight_para_handle
         assert inflight_unit == unit_index, (
             f"Async IO operation is not for this unit: "
             f"unit_index={unit_index} != inflight_unit={inflight_unit}"
@@ -531,7 +532,6 @@ class FlexTrainModelCoordinator:
         if self._is_invalid_unit(unit_index):
             return
 
-        self._detach_unit_parameters(unit_index - 1)
         self._synchronize_prepare_paras(unit_index)
         self._submit_prepare_paras(unit_index + 1)
 
@@ -554,22 +554,21 @@ class FlexTrainModelCoordinator:
         if self._is_invalid_unit(unit_index):
             return
 
-        self._detach_unit_parameters(unit_index + 1)
         self._synchronize_prepare_paras(unit_index)
         self._submit_prepare_paras(unit_index - 1)
 
 
-_MODEL_COORDINATOR = FlexTrainModelCoordinator()
+_PARA_COORDINATOR = FlexTrainParaCoordinator()
 
 
-def get_model_coordinator():
+def get_para_coordinator():
     """
-    Get the model coordinator.
+    Get the parameter coordinator.
 
     Returns:
-        FlexTrainModelCoordinator: The model coordinator.
+        FlexTrainParaCoordinator: The parameter coordinator.
     """
-    return _MODEL_COORDINATOR
+    return _PARA_COORDINATOR
 
 
 class FlexTrainOptCoordinator:
@@ -595,10 +594,26 @@ class FlexTrainOptCoordinator:
         return self._cpu_opts_buffer[2]
 
     @property
+    def _gpu_bwd_receive_grads(self):
+        return self._gpu_bwd_grads_buffer[0]
+
+    @property
+    def _gpu_bwd_transfer_grads(self):
+        return self._gpu_bwd_grads_buffer[1]
+
+    @property
+    def _gpu_opt_receive_grads(self):
+        return self._gpu_opt_grads_buffer[0]
+
+    @property
+    def _gpu_opt_work_grads(self):
+        return self._gpu_opt_grads_buffer[1]
+
+    @property
     def each_numel_num_states(self):
         return self._each_numel_num_states - 1
 
-    def get_gpu_unit_states(self, unit_index: int):
+    def get_unit_gpu_states(self, unit_index: int):
         mem_index = self._train_units.index(unit_index)
         return torch.chunk(
             self._gpu_master_opts[mem_index],
@@ -630,7 +645,7 @@ class FlexTrainOptCoordinator:
         # Note that it is each_numel_num_states + 1 times larger.
         temp_cpu_buffer: Tensor = self._cpu_work_opt_states
 
-        model_coordinator = get_model_coordinator()
+        para_coordinator = get_para_coordinator()
 
         # Copy the master parameters from the device dtype parameters.
         for i, unit in enumerate(self._train_units):
@@ -638,7 +653,7 @@ class FlexTrainOptCoordinator:
             # Note: GPU master parameters ratio <= GPU model parameters ratio,
             #       i.e. gpu_opt_numel <= gpu_mdl_numel.
             _get_para_in_opt(self._gpu_master_opts[i]).copy_(
-                model_coordinator._gpu_para_base[unit][:gpu_opt_numel]
+                para_coordinator._gpu_para_base[unit][:gpu_opt_numel]
             )
 
             # 2. Copy CPU + NVMe device dtype parameters.
@@ -649,18 +664,18 @@ class FlexTrainOptCoordinator:
             # Set to zero for fast optimizer initialization.
             temp_cpu_buffer.zero_()
             temp_cpu_buffer[:part1].copy_(
-                model_coordinator._gpu_para_base[unit][gpu_opt_numel:]
+                para_coordinator._gpu_para_base[unit][gpu_opt_numel:]
             )
             temp_cpu_buffer[part1:part2].copy_(
-                model_coordinator._cpu_para_base[unit]
+                para_coordinator._cpu_para_base[unit]
             )
             # We need to use device_dtype buffer for reloading.
             _nvme_reload(
                 FlexTrainDataID(unit, Dtype.PARA),
-                model_coordinator._nvme_available_paras
+                para_coordinator._nvme_available_paras
             )
             temp_cpu_buffer[part2:part3].copy_(
-                model_coordinator._nvme_available_paras
+                para_coordinator._nvme_available_paras
             )
 
             # 3. Store CPU + NVMe master parameters.
@@ -686,6 +701,9 @@ class FlexTrainOptCoordinator:
             f"  - optimizer split numels: {self._opt_numels}\n"
         )
 
+    def _is_invalid_unit(self, unit_index: int):
+        return unit_index < 0 or unit_index >= self._num_units
+
     def initialize(
         self,
         train_units: List[int],
@@ -693,7 +711,7 @@ class FlexTrainOptCoordinator:
     ):
         """
         Initialize FlexTrain optimizer from assigned parameter groups.
-        Must be called after the model coordinator is initialized.
+        Must be called after the parameter coordinator is initialized.
 
         Args:
             train_units (List[int]): List of unit indices under training.
@@ -708,9 +726,10 @@ class FlexTrainOptCoordinator:
         """
 
         # 0. Before initialization:
-        # Check if the model coordinator is initialized.
-        assert get_model_coordinator().is_initialized, (
-            "Model coordinator must be initialized before init_optimizer."
+        # Check if the parameter coordinator is initialized.
+        para_coordinator = get_para_coordinator()
+        assert para_coordinator.is_initialized, (
+            "Parameter coordinator must be initialized before init_optimizer."
         )
         # Check if the optimizer coordinator is not initialized.
         assert not self._initialized, (
@@ -718,18 +737,26 @@ class FlexTrainOptCoordinator:
         )
         # Link to units under training.
         self._train_units = sorted(train_units)
+        self._num_units = len(self._train_units)
+        self._unit_parameters = para_coordinator.unit_parameter_map
+
+        # CUDA streams for async IO operations.
+        self._data_stream = torch.cuda.Stream()
 
         # 1. Set the configuration for the optimizer.
         config = get_flextrain_config()
         self._device_dtype = config.mixed_precision.device_dtype
         self._master_dtype = config.mixed_precision.master_dtype
 
-        self._num_units = len(self._train_units)
-
-        numel_per_rank = get_model_coordinator().numel_per_rank
-        self._model_numels = get_model_coordinator().model_split_numels
+        numel_per_rank = para_coordinator.numel_per_rank
+        self._unit_numel = para_coordinator.unit_numel
+        self._model_numels = para_coordinator.model_split_numels
         self._opt_numels = _get_split_numels(
             numel_per_rank, config.split_ratio.optimizer
+        )
+        self._grad_numels = (
+            self._opt_numels[0],  # GPU optimizer
+            self._opt_numels[1] + self._opt_numels[2]  # CPU optimizer
         )
         assert self._model_numels[0] >= self._opt_numels[0], \
             "GPU parameter ratio should be larger than GPU optimizer ratio."
@@ -752,16 +779,163 @@ class FlexTrainOptCoordinator:
         # 2. Log the optimizer coordinator configurations.
         self.log_configuration()
 
-        # 3. Allocate prefetch buffer for optimizer states.
-        # We need 3 buffers for CPU optimizer states:
-        # prefetch buffer, work buffer, commit buffer.
+        # 3. Allocate working memory.
+        # a. We need 3 buffers for CPU optimizer states:
+        #    prefetch buffer, working buffer, commit buffer.
         self._cpu_opts_buffer = RotateContainer(_allocate_memory_chunks(
             cpu_numel * each_numel_num_states, 3,
             self._master_dtype, torch.device('cpu')
         ))
+        # b. GPU gradients buffer for backwarding, working at device precision.
+        #    receiving buffer, transferring buffer.
+        self._gpu_bwd_grads_buffer = RotateContainer(_allocate_memory_chunks(
+            self._unit_numel, 2,
+            self._device_dtype, torch.cuda.current_device()
+        ))
+        # c. GPU gradients buffer for optimizer, working at master precision.
+        #    receiving buffer, working buffer.
+        self._gpu_opt_grads_buffer = RotateContainer(_allocate_memory_chunks(
+            self._grad_numels[0], 2,
+            self._master_dtype, torch.cuda.current_device()
+        ))
 
         # 4. Copy the master parameters.
         self._copy_master_parameters()
+
+    def pre_forward_unit(self, unit_index: int):
+        assert NotImplementedError
+
+    def post_forward_unit(self, unit_index: int):
+        assert NotImplementedError
+
+    def _prepare_unit_grads(self, unit_index: int):
+        """
+        Prepare the gradients for the unit.
+        The gradients are prepared in _gpu_available_grads.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        # Get the unit parameters.
+        unit_paras = self._unit_parameters[unit_index]
+
+        # Get the gradients.
+        grad_buffer = self._gpu_bwd_receive_grads
+        torch.zero_(grad_buffer)
+
+        # Link the gradients.
+        unit_paras.link_grad_to(grad_buffer)
+
+    def _submit_transfer_grads(self, unit_index: int):
+        """ Launch the async IO operation to transfer gradients for the unit.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        # Gradients are ready for transfer.
+        self._gpu_bwd_grads_buffer.rotate()
+
+        # 1. Locate the target memory.
+        # 2. Conduct all-reduce into tensor if necessary.
+        # 3. Copy parameters from three resources:
+        #    - GPU part to GPU optimizer working buffer
+        #    - CPU part to CPU optimizer working buffer
+        default_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(self._data_stream):
+            # Locate the target memory.
+            src_full_grads = self._gpu_bwd_transfer_grads
+            mem_partitions = torch.chunk(src_full_grads, dist.get_world_size())
+            mem_partition = mem_partitions[dist.get_rank()]
+            # gpu_view, cpu_view = torch.split(
+            #     mem_partition, self._grad_numels
+            # )
+
+            default_stream.synchronize()
+
+            dist.reduce_scatter(
+                mem_partition, src_full_grads,
+                dist.ReduceOp.AVG, async_op=True
+            )
+
+            if not hasattr(self, "_grad_norm"):
+                self._grad_norm = 0.0
+            self._grad_norm += torch.norm(mem_partition.float()).item() ** 2
+
+        self._inflight_grad_handle = (
+            unit_index, FunctionHandle(torch.cuda.synchronize)
+        )
+
+    def _synchronize_transfer_grads(self, unit_index: int):
+        """ Synchronize the transfer of gradients for the unit.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        # Wait for the async IO operation to finish.
+        inflight_unit, handle = self._inflight_grad_handle
+        assert inflight_unit == unit_index, (
+            f"Async IO operation is not for this unit: "
+            f"unit_index={unit_index} != inflight_unit={inflight_unit}"
+        )
+        handle.wait()
+
+    def pre_backward_unit(self, unit_index: int):
+        """ Prepare the unit for backward pass.
+
+        Functions:
+        1. Ensure the availability of the gradients buffer.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        self._prepare_unit_grads(unit_index)
+
+    def post_backward_unit(self, unit_index: int):
+        """ Post-process the unit after backward pass.
+
+        Functions:
+        1. Transfer gradients to the optimizer working buffer.
+
+        Args:
+            unit_index (int): Index of the unit.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        self._synchronize_transfer_grads(unit_index + 1)
+        return self._submit_transfer_grads(unit_index)
 
 
 _OPT_COORDINATOR = FlexTrainOptCoordinator()

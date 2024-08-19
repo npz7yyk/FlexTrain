@@ -131,7 +131,11 @@ class ContiguousParaGroup:
     def link_grad_to(self, contiguous_mem: Tensor):
         offset = 0
         for p, n, s in zip(self.paras, self.numels, self.shapes):
-            p.grad.data = contiguous_mem[offset: offset + n].view(s)
+            # If p.grad is None, create a new tensor.
+            if p.grad is None:
+                p.grad = contiguous_mem[offset: offset + n].view(s)
+            else:
+                p.grad.data = contiguous_mem[offset: offset + n].view(s)
             offset += n
 
     def detach_para(self):

@@ -87,6 +87,13 @@ class GreedySnakeBlockScheduler:
         return curr_unit != last_unit
 
     @property
+    def in_last_micro_batch(self):
+        if self.top_down:
+            return self.curr_task.micro_batch == self.micro_batch_per_block - 1
+        else:
+            return self.curr_task.micro_batch == 0
+
+    @property
     def in_first_unit(self):
         return self.curr_task.unit == 0
 

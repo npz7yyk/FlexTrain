@@ -1,3 +1,5 @@
+import torch
+
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -7,9 +9,10 @@ from typing import List, Dict
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory.coordinator import (
-    get_model_coordinator,
+    get_para_coordinator,
     get_opt_coordinator
 )
+from flextrain.utils import dist
 
 
 PARAMS_KEY = "params"
@@ -39,6 +42,14 @@ class FlexTrainOptimizer:
     """
 
     def __init__(self, param_groups: List[Dict], each_numel_num_states):
+        # Ensure that the param_groups is a list of dictionaries.
+        # So that the parameters keep the same order across processes.
+        assert isinstance(param_groups, list)
+
+        # 0. Sub-optimizers should be:
+        self.cpu_optimizer: FlexTrainCPUOptimizer = None
+        self.gpu_optimizer: torch.optim.Optimizer = None
+
         # 1. Get the arguments for each parameter.
         assert all(isinstance(group, dict) for group in param_groups), (
             "FlexTrain optimizer needs parameter groups "
@@ -46,15 +57,19 @@ class FlexTrainOptimizer:
         )
         self.param_groups = param_groups
 
-        self.param_group_map = {}
+        self.param_group_map: Dict[Tensor, Dict] = {}
+        param_orders = {}
         for group in param_groups:
+            # Ensure parameters are stored in a list.
+            assert isinstance(group[PARAMS_KEY], list)
             # Store the group for each parameter
             for param in group[PARAMS_KEY]:
                 self.param_group_map[param] = group
+                param_orders[param] = len(param_orders)
 
         # 2. Try to group the parameters by their unit index.
         #    Find non-layerwise parameters and group them.
-        unit_parameter_map = get_model_coordinator().unit_parameter_map
+        unit_parameter_map = get_para_coordinator().unit_parameter_map
         self.unit_group_map: Dict[int, Dict] = {}
         self.non_layerwise_params = set(self.param_group_map.keys())
 
@@ -87,9 +102,46 @@ class FlexTrainOptimizer:
             # Link the unit index to the group.
             self.unit_group_map[i] = group
 
+        # Convert the non-layerwise parameters to a list.
+        self.non_layerwise_params = list(self.non_layerwise_params)
+        self.non_layerwise_params.sort(key=lambda p: param_orders[p])
+
         # End of grouping parameters.
 
-        # 3. Initialize the optimizer coordinator.
+        # 3. Allocate GPU memory for:
+        #    Gradient buffers of non-layerwise parameters for optimizer steps.
+        config = get_flextrain_config()
+        device_dtype = config.mixed_precision.device_dtype
+        master_dtype = config.mixed_precision.master_dtype
+
+        # Allocate gradient buffers & create / link the master parameters.
+        total_numel = sum(p.numel() for p in self.non_layerwise_params)
+        self._device_grads = torch.zeros(
+            total_numel, dtype=device_dtype, device=torch.cuda.current_device()
+        )
+        self._master_grads = torch.zeros(
+            total_numel, dtype=master_dtype, device=torch.cuda.current_device()
+        )
+
+        # Create / link the master parameters.
+        offset = 0
+        self._master_non_layerwise_params: List[Tensor] = []
+        for param in self.non_layerwise_params:
+            param.data = param.data.to(
+                device=torch.cuda.current_device(), dtype=device_dtype
+            )
+            master_param = torch.nn.Parameter(param.to(master_dtype))
+            end = offset + param.numel()
+            param.grad = self._device_grads[offset:end].view_as(param)
+            master_param.grad = self._master_grads[offset:end].view_as(param)
+            offset = offset + param.numel()
+
+            # Link to the master parameters.
+            self._master_non_layerwise_params.append(master_param)
+
+        # End of allocating GPU memory for non-layerwise gradients.
+
+        # 4. Initialize the optimizer coordinator.
         self.coordinator = get_opt_coordinator()
         self.coordinator.initialize(
             self.unit_group_map.keys(),
@@ -103,9 +155,19 @@ class FlexTrainOptimizer:
     def gpu_layerwise_states(self):
         # Note: it is not necessary to keep the unit order.
         return [
-            self.coordinator.get_gpu_unit_states(unit)
+            self.coordinator.get_unit_gpu_states(unit)
             for unit in self.unit_group_map.keys()
         ]
+
+    def step(self, closure=None):
+        """ TODO """
+        # Perform the optimization step of non-layerwise parameters.
+
+        # 1. Conduct all-reduce for the gradients of non-layerwise parameters.
+        dist.all_reduce(self._device_grads, op=dist.ReduceOp.AVG)
+        return
+
+        self.gpu_optimizer.step(closure)
 
 
 @dataclass

@@ -107,16 +107,16 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
         FlexTrainCPUAdam.optimizer_id += 1
         self.adam_w_mode = adamw_mode
         self.fp32_optimizer_states = fp32_optimizer_states
-        self.ft_opt_adam = CPUAdamBuilder().load()
+        self.ft_cpu_adam = CPUAdamBuilder().load()
 
-        self.ft_opt_adam.create_adam(
+        self.ft_cpu_adam.create_adam(
             self.opt_id, lr, betas[0], betas[1],
             eps, weight_decay, adamw_mode, True
         )
 
     def __del__(self):
         try:
-            self.ft_opt_adam.destroy_adam(self.opt_id)
+            self.ft_cpu_adam.destroy_adam(self.opt_id)
         except BaseException:
             pass
 
@@ -128,7 +128,7 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
     @torch.no_grad()
     def unit_step(self, step: int, args: Dict, opt_tar: AdamOptTar):
         beta1, beta2 = args['betas']
-        self.ft_opt_adam.adam_update(
+        self.ft_cpu_adam.adam_update(
             self.opt_id, step, args['lr'],
             beta1, beta2, args['eps'],
             args['weight_decay'], args['bias_correction'],

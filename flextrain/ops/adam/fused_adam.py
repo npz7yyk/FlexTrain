@@ -102,7 +102,7 @@ class FusedAdam(torch.optim.Optimizer):
                 for p in group['params']:
                     p.grad = None
         else:
-            super(FusedAdam, self).zero_grad()
+            super(FusedAdam, self).zero_grad(set_to_none=False)
 
     @torch.no_grad()
     def step(self, closure=None):

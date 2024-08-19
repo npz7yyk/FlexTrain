@@ -12,9 +12,6 @@ class _DummyLogger:
     def __getattribute__(self, __name: str):
         return lambda *args, **kwargs: None
 
-    def warning_once(self, *args, **kwargs):
-        pass
-
 
 def _create_logger(name, level=logging.INFO):
     logger = logging.getLogger(name)
