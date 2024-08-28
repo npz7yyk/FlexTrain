@@ -725,6 +725,8 @@ class FlexTrainOptCoordinator:
             None
         """
 
+        self._grad_norm = 0.0
+
         # 0. Before initialization:
         # Check if the parameter coordinator is initialized.
         para_coordinator = get_para_coordinator()
@@ -868,7 +870,7 @@ class FlexTrainOptCoordinator:
 
             dist.reduce_scatter(
                 mem_partition, src_full_grads,
-                dist.ReduceOp.AVG, async_op=True
+                dist.ReduceOp.AVG
             )
 
             if not hasattr(self, "_grad_norm"):

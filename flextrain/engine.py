@@ -290,6 +290,7 @@ class FlexTrainEngine(object):
 
         self.grad_norm = self.grad_norm.item()
         dist.rank0_logger.info("Gradient global norm: {}".format(self.grad_norm))
+        exit()
 
         # 4. Return the loss results
         loss_rsts = []
