@@ -79,13 +79,14 @@ def init_distributed(
         f"\n> FlexTrain initializing backend {dist_backend}"
     )
 
-    torch.distributed.init_process_group(
-        dist_backend,
-        timeout=timeout,
-        init_method=init_method,
-        rank=rank,
-        world_size=world_size
-    )
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            dist_backend,
+            timeout=timeout,
+            init_method=init_method,
+            rank=rank,
+            world_size=world_size
+        )
 
     # FlexTrain currently only supports single-node training
     global _LOCAL_RANK, _WORLD_SIZE
