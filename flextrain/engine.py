@@ -141,15 +141,7 @@ class FlexTrainEngine(object):
 
         # Need to fetch new unit parameters
         if scheduler.new_unit_entered:
-            # Conduct pre-process
-            if scheduler.in_first_unit:
-                # Warm up the forward pipeline here for better overlapping
-                self.para_coordinator.warmup_forward_pipeline()
-            # End of in_first_unit
-
-            # Fetch the new unit parameters
             self.para_coordinator.pre_forward_unit(task.unit)
-        # End of new_unit_entered
 
         # Conduct pre-process if in the first unit
         if scheduler.in_first_unit:
@@ -233,10 +225,6 @@ class FlexTrainEngine(object):
             self.micro_batch_passed_back[task.micro_batch] = passed_back
         # End of conduct backward
 
-        # Need to transfer the gradients to optimizer working buffer
-        if scheduler.in_last_micro_batch:
-            self.opt_coordinator.post_backward_unit(task.unit)
-
     def override_loss_scale(self, loss_scale: float):
         self.custom_loss_scaler = True
         self.external_loss_scale = loss_scale
@@ -270,27 +258,22 @@ class FlexTrainEngine(object):
         self._reset_context()
 
         # 2. Conduct all tasks assigned by the scheduler
+        self.para_coordinator.warmup_forward_pipeline()
         for task in self.scheduler:
             if task.is_forwarding:
+                torch.cuda.nvtx.range_push(f"Forward unit {task.unit}")
                 self._conduct_forward(task)
+                torch.cuda.nvtx.range_pop()
             else:
+                torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
                 self._conduct_backward(task)
+                torch.cuda.nvtx.range_pop()
+        self.opt_coordinator.clear_backward_pipeline()
 
-        self.opt_coordinator._synchronize_transfer_grads(0)
-        self.grad_norm = self.opt_coordinator._grad_norm
+        self.grad_norm = 0.0
 
         # 3. Conduct optimizer step
         self.optimizer.step()
-
-        # TEMP: check gradient global norm
-        self.grad_norm = torch.tensor([self.grad_norm], device='cuda')
-        dist.all_reduce(self.grad_norm)
-        for p in self.optimizer.non_layerwise_params:
-            self.grad_norm += p.grad.data.float().norm().item() ** 2
-
-        self.grad_norm = self.grad_norm.item()
-        dist.rank0_logger.info("Gradient global norm: {}".format(self.grad_norm))
-        exit()
 
         # 4. Return the loss results
         loss_rsts = []
@@ -300,7 +283,7 @@ class FlexTrainEngine(object):
         if not hasattr(self, 'count'):
             self.count = 0
         self.count += 1
-        if self.count % 30 == 0:
+        if self.count % 10 == 0:
             exit()
 
         return loss_rsts

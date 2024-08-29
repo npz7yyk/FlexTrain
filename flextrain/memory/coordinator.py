@@ -725,8 +725,6 @@ class FlexTrainOptCoordinator:
             None
         """
 
-        self._grad_norm = 0.0
-
         # 0. Before initialization:
         # Check if the parameter coordinator is initialized.
         para_coordinator = get_para_coordinator()
@@ -804,12 +802,6 @@ class FlexTrainOptCoordinator:
         # 4. Copy the master parameters.
         self._copy_master_parameters()
 
-    def pre_forward_unit(self, unit_index: int):
-        assert NotImplementedError
-
-    def post_forward_unit(self, unit_index: int):
-        assert NotImplementedError
-
     def _prepare_unit_grads(self, unit_index: int):
         """
         Prepare the gradients for the unit.
@@ -859,7 +851,7 @@ class FlexTrainOptCoordinator:
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self._data_stream):
             # Locate the target memory.
-            src_full_grads = self._gpu_bwd_transfer_grads
+            src_full_grads: torch.Tensor = self._gpu_bwd_transfer_grads
             mem_partitions = torch.chunk(src_full_grads, dist.get_world_size())
             mem_partition = mem_partitions[dist.get_rank()]
             # gpu_view, cpu_view = torch.split(
@@ -870,15 +862,11 @@ class FlexTrainOptCoordinator:
 
             dist.reduce_scatter(
                 mem_partition, src_full_grads,
-                dist.ReduceOp.AVG
+                dist.ReduceOp.AVG, async_op=True
             )
 
-            if not hasattr(self, "_grad_norm"):
-                self._grad_norm = 0.0
-            self._grad_norm += torch.norm(mem_partition.float()).item() ** 2
-
         self._inflight_grad_handle = (
-            unit_index, FunctionHandle(torch.cuda.synchronize)
+            unit_index, DummyHandle()
         )
 
     def _synchronize_transfer_grads(self, unit_index: int):
@@ -918,26 +906,17 @@ class FlexTrainOptCoordinator:
         if self._is_invalid_unit(unit_index):
             return
 
+        self._synchronize_transfer_grads(unit_index + 2)
+        self._submit_transfer_grads(unit_index + 1)
         self._prepare_unit_grads(unit_index)
 
-    def post_backward_unit(self, unit_index: int):
-        """ Post-process the unit after backward pass.
-
-        Functions:
-        1. Transfer gradients to the optimizer working buffer.
-
-        Args:
-            unit_index (int): Index of the unit.
-
-        Returns:
-            None
+    def clear_backward_pipeline(self):
         """
-        # Check if the unit is valid.
-        if self._is_invalid_unit(unit_index):
-            return
-
-        self._synchronize_transfer_grads(unit_index + 1)
-        return self._submit_transfer_grads(unit_index)
+        Cleanup the backward pipeline.
+        """
+        self._synchronize_transfer_grads(1)
+        self._submit_transfer_grads(0)
+        torch.cuda.synchronize()
 
 
 _OPT_COORDINATOR = FlexTrainOptCoordinator()
