@@ -16,7 +16,10 @@ from flextrain.llm_func import LLMFunc, retrieve_llm_loss
 from flextrain.loss_scaler import create_loss_scaler
 from flextrain.memory.coordinator import (
     get_para_coordinator,
-    get_opt_coordinator
+    get_opt_coordinator,
+    get_interlayer_coordinator,
+    InterLayerTask,
+    retrieve_tensor
 )
 from flextrain.optimizer import FlexTrainOptimizer
 from flextrain.scheduler import LLMTask, GreedySnakeBlockScheduler
@@ -52,6 +55,7 @@ class FlexTrainEngine(object):
         # Link to parameter & optimizer coordinators
         self.para_coordinator = get_para_coordinator()
         self.opt_coordinator = get_opt_coordinator()
+        self.interlayer_coordinator = get_interlayer_coordinator()
 
         # LLM training information
         self.micro_batch_per_batch = self._compute_micro_batch_per_batch()
@@ -78,7 +82,7 @@ class FlexTrainEngine(object):
 
     def _reset_context(self):
         # Micro batch pre-inputs
-        self.micro_batch_pre_inputs: Dict[int, Tuple] = {}
+        # self.micro_batch_pre_inputs: Dict[int, Tuple] = {}
 
         # Recent passed down container
         self.micro_batch_passed_down: Dict[int, Tuple] = {}
@@ -100,6 +104,9 @@ class FlexTrainEngine(object):
         # Loss result container
         self.micro_batch_loss_rsts: Dict[int, Sequence[Any]] = {}
 
+        # DEV
+        self.offload_task: InterLayerTask = None
+
     @torch.no_grad()
     def _conduct_first_unit(self, task: LLMTask):
         config = get_flextrain_config()
@@ -107,7 +114,7 @@ class FlexTrainEngine(object):
         # Unpack a micro batch
         pre_inputs, post_inputs, loss_inputs = LLMFunc.get_batch()
         # Store the inputs
-        self.micro_batch_pre_inputs[task.micro_batch] = pre_inputs
+        # self.micro_batch_pre_inputs[task.micro_batch] = pre_inputs
         self.micro_batch_post_inputs[task.micro_batch] = post_inputs
         self.micro_batch_loss_inputs[task.micro_batch] = loss_inputs
 
@@ -127,17 +134,24 @@ class FlexTrainEngine(object):
                 *passed_down, *every_layer
             )
 
-        # Conduct checkpointed forward
-        passed_down, ctx = checkpointed_forward(forward_func)
-
-        # Save recent passed down tensor and context
-        self.micro_batch_passed_down[task.micro_batch] = passed_down
-        self.micro_batch_unit_ctx[task.micro_batch][task.unit] = ctx
+        # Conduct checkpointed forward and return passed_down & ctx
+        return checkpointed_forward(forward_func)
 
     @torch.no_grad()
     def _conduct_forward(self, task: LLMTask):
         config = get_flextrain_config()
         scheduler = self.scheduler
+
+        # Prefetch the next passed_down and offload the last passed_down
+        next_task = self.scheduler.next_task
+        # If the next task is in the same micro batch, prefetch is not needed
+        prefetch_task = None if next_task.micro_batch == task.micro_batch \
+            else InterLayerTask(next_task.unit - 1, next_task.micro_batch)
+        self.interlayer_coordinator.pre_forward_micro_batch(
+            prefetch_task,
+            self.offload_task
+        )
+        # End of prefetch and offload
 
         # Need to fetch new unit parameters
         if scheduler.new_unit_entered:
@@ -145,32 +159,58 @@ class FlexTrainEngine(object):
 
         # Conduct pre-process if in the first unit
         if scheduler.in_first_unit:
-            return self._conduct_first_unit(task)
+            passed_down, ctx = self._conduct_first_unit(task)
+        else:
+            # Load recent passed down and each layer tensor
+            passed_down = self.micro_batch_passed_down[task.micro_batch]
+            every_layer = self.micro_batch_every_layer[task.micro_batch]
+            passed_down_tensor = retrieve_tensor(passed_down)
+            # If passed_down is empty, use the available layer checkpoint
+            if passed_down_tensor.numel() == 0:
+                passed_down_tensor.data = \
+                    self.interlayer_coordinator.available_layer_ckpt
 
-        # Load recent passed down and each layer tensor
-        passed_down = self.micro_batch_passed_down[task.micro_batch]
-        every_layer = self.micro_batch_every_layer[task.micro_batch]
-
-        # Conduct forward
-        passed_down = detach_variable(passed_down)
-        start = task.unit * config.checkpoint_interval
-        end = min(start + config.checkpoint_interval, config.num_layers)
-        passed_down, ctx = checkpointed_forward(
-            LLMFunc.layer_forward(start, end),
-            *passed_down, *every_layer
-        )
+            # Conduct forward
+            passed_down = detach_variable(passed_down)
+            start = task.unit * config.checkpoint_interval
+            end = min(start + config.checkpoint_interval, config.num_layers)
+            passed_down, ctx = checkpointed_forward(
+                LLMFunc.layer_forward(start, end),
+                *passed_down, *every_layer
+            )
 
         # Save recent passed down tensor and context
         self.micro_batch_passed_down[task.micro_batch] = passed_down
         self.micro_batch_unit_ctx[task.micro_batch][task.unit] = ctx
+        # Record the offload task
+        self.offload_task = InterLayerTask(
+            task.unit, task.micro_batch, retrieve_tensor(passed_down)
+        )
 
     @torch.enable_grad()
     def _conduct_last_unit(self, task: LLMTask):
         config = get_flextrain_config()
 
+        # Prefetch the next passed_down and offload the last passed_down
+        next_task = self.scheduler.next_task
+        # If the next task is in the same micro batch, prefetch is not needed
+        prefetch_task = None if next_task.micro_batch == task.micro_batch \
+            else InterLayerTask(next_task.unit - 1, next_task.micro_batch)
+        self.interlayer_coordinator.pre_forward_micro_batch(
+            prefetch_task,
+            None  # DEV
+        )
+        # End of prefetch and offload
+
         # 1. Conduct forward of the last unit
         passed_down = self.micro_batch_passed_down[task.micro_batch]
         every_layer = self.micro_batch_every_layer[task.micro_batch]
+        passed_down_tensor = retrieve_tensor(passed_down)
+        # If passed_down is empty, use the available layer checkpoint
+        if passed_down_tensor.numel() == 0:
+            passed_down_tensor.data = \
+                self.interlayer_coordinator.available_layer_ckpt
+
         start = task.unit * config.checkpoint_interval
         end = min(start + config.checkpoint_interval, config.num_layers)
         passed_down = detach_variable(passed_down)
@@ -190,6 +230,8 @@ class FlexTrainEngine(object):
             self.micro_batch_loss_inputs[task.micro_batch]
         )
         self.micro_batch_loss_rsts[task.micro_batch] = llm_loss_rst
+
+        dist.print_rank_by_rank(f"Loss: {llm_loss_rst}")
 
         # 4. Scale the loss
         loss = retrieve_llm_loss(llm_loss_rst)
@@ -270,7 +312,7 @@ class FlexTrainEngine(object):
                 torch.cuda.nvtx.range_pop()
         self.opt_coordinator.clear_backward_pipeline()
 
-        self.grad_norm = 0.0
+        exit()
 
         # 3. Conduct optimizer step
         self.optimizer.step()

@@ -29,74 +29,65 @@ class GreedySnakeBlockScheduler:
         micro_batch_per_block,
         num_units
     ):
-        self.micro_batch_per_block = micro_batch_per_block
-        self.num_units = num_units
+        self._micro_batch_per_block = micro_batch_per_block
+        self._num_units = num_units
+        self._ntasks = micro_batch_per_block * (2 * num_units - 1)
 
     def __iter__(self):
-        curr_unit = 0
-        self.top_down = True
-
-        # Keep track of the last task and just yield task
-        self.last_task = LLMTask(True, -1, -1)
-        self.curr_task = None
-
-        # forwarding
+        self.cur_task_num = 0
         while True:
-            # working window reaches the end, convert to backwarding
-            if curr_unit == self.num_units - 1:
+            yield self.curr_task
+            self.cur_task_num += 1
+            if self.cur_task_num == self._ntasks:
                 break
 
-            for micro_step in range(self.micro_batch_per_block):
-                curr_micro_batch = micro_step if self.top_down \
-                    else self.micro_batch_per_block - 1 - micro_step
-                curr_task = LLMTask(True, curr_micro_batch, curr_unit)
-                self.curr_task = curr_task
-                yield curr_task
-                self.last_task = curr_task
+    def _generate_task(self, cur_task_num):
+        # Calculate the current unit
+        cur_unit = cur_task_num // self._micro_batch_per_block
+        is_forwarding = cur_unit < self._num_units - 1
+        if not is_forwarding:
+            cur_unit = 2 * self._num_units - 2 - cur_unit
 
-            # reverse direction
-            self.top_down = not self.top_down
-
-            # move to next checkpoint
-            curr_unit += 1
-
-        # backwarding
-        while True:
-            # working window reaches the start, end the loop
-            if curr_unit < 0:
-                break
-
-            for micro_step in range(self.micro_batch_per_block):
-                curr_micro_batch = micro_step if self.top_down \
-                    else self.micro_batch_per_block - 1 - micro_step
-                curr_task = LLMTask(False, curr_micro_batch, curr_unit)
-                self.curr_task = curr_task
-                yield curr_task
-                self.last_task = curr_task
-
-            # reverse direction
-            self.top_down = not self.top_down
-
-            # move to next checkpoint
-            curr_unit -= 1
+        # Calculate the current micro batch
+        cur_micro_batch = cur_task_num % self._micro_batch_per_block
+        if cur_unit & 1:
+            cur_micro_batch = self._micro_batch_per_block - 1 - cur_micro_batch
+        else:
+            cur_micro_batch = cur_micro_batch
+        return LLMTask(is_forwarding, cur_micro_batch, cur_unit)
 
     @property
     def new_unit_entered(self):
-        curr_unit = self.curr_task.unit
-        last_unit = self.last_task.unit
-        return curr_unit != last_unit
+        return self.cur_task_num % self._micro_batch_per_block == 0
 
     @property
     def in_last_micro_batch(self):
-        if self.top_down:
-            return self.curr_task.micro_batch == self.micro_batch_per_block - 1
-        else:
-            return self.curr_task.micro_batch == 0
+        return (self.cur_task_num + 1) % self._micro_batch_per_block == 0
 
     @property
     def in_first_unit(self):
-        return self.curr_task.unit == 0
+        cur_unit = self.cur_task_num // self._micro_batch_per_block
+        return cur_unit == 0 or cur_unit == 2 * self._num_units - 2
 
     @property
     def in_last_unit(self):
-        return self.curr_task.unit == self.num_units - 1
+        cur_unit = self.cur_task_num // self._micro_batch_per_block
+        return cur_unit == self._num_units - 1
+
+    @property
+    def last_task(self):
+        if self.cur_task_num == 0:
+            return self._generate_task(self._ntasks - 1)
+        else:
+            return self._generate_task(self.cur_task_num - 1)
+
+    @property
+    def curr_task(self):
+        return self._generate_task(self.cur_task_num)
+
+    @property
+    def next_task(self):
+        if self.cur_task_num == self._ntasks - 1:
+            return self._generate_task(0)
+        else:
+            return self._generate_task(self.cur_task_num + 1)

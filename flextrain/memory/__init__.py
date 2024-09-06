@@ -72,18 +72,15 @@ def contiguous_partitioned_numel(paras: Iterable[Parameter]):
     return total_numel // world_size
 
 
-def free_tensor(tensor: Tensor, set_none=False):
+def free_tensor(tensor: Tensor, record_stream=False):
     # Record the current stream if the tensor is on CUDA.
-    if tensor.is_cuda:
+    if tensor.is_cuda and record_stream:
         tensor.record_stream(torch.cuda.current_stream())
 
     # Reserve the device and dtype of the tensor.
     device = tensor.device
     dtype = tensor.dtype
-    if set_none:
-        tensor.data = None
-    else:
-        tensor.data = torch.empty(0, device=device, dtype=dtype)
+    tensor.data = torch.empty(0, device=device, dtype=dtype)
 
 
 def move_into_contiguous(srcs: Iterable[Tensor], dst: Tensor):
@@ -144,7 +141,7 @@ class ContiguousParaGroup:
 
     def detach_grad(self):
         for para in self.paras:
-            free_tensor(para.grad, set_none=True)
+            free_tensor(para.grad)
 
 
 class Waitable:

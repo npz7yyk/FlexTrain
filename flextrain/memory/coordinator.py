@@ -1,18 +1,16 @@
 import torch
 
+from dataclasses import dataclass
 from math import ceil
 from torch import Tensor
 from torch.nn import Parameter
 from typing import SupportsIndex, Iterable, Tuple, List, Dict
 
-# from torch.cuda import _sanitizer
-# _sanitizer.enable_cuda_sanitizer()
-
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
+    free_tensor,
     FlexTrainDataType as Dtype,
     FlexTrainDataID,
-    contiguous_allgathered_numel,
     contiguous_partitioned_numel,
     move_into_contiguous,
     ContiguousParaGroup,
@@ -204,7 +202,7 @@ class FlexTrainParaCoordinator:
 
         # Allocate GPU working memory for parameters.
         self._gpu_full_paras = RotateContainer(_allocate_memory_chunks(
-            contiguous_allgathered_numel(parameters), 2,
+            numel_per_rank * dist.get_world_size(), 2,
             self._device_dtype, torch.cuda.current_device()
         ))
 
@@ -438,9 +436,9 @@ class FlexTrainParaCoordinator:
             gpu_view.copy_(self._gpu_para_base[unit_index], True)
             cpu_view.copy_(self._cpu_para_base[unit_index], True)
             nvme_view.copy_(self._nvme_available_paras, True)
-            dist.all_gather(tar_full_paras, mem_partition, async_op=True)
+            dist.all_gather(tar_full_paras, mem_partition)
 
-        return FunctionHandle(torch.cuda.synchronize)
+        return FunctionHandle(self._data_stream.synchronize)
 
     def _submit_prepare_paras(self, unit_index: int):
         """
@@ -749,7 +747,7 @@ class FlexTrainOptCoordinator:
         self._master_dtype = config.mixed_precision.master_dtype
 
         numel_per_rank = para_coordinator.numel_per_rank
-        self._unit_numel = para_coordinator.unit_numel
+        self._unit_numel = numel_per_rank * dist.get_world_size()
         self._model_numels = para_coordinator.model_split_numels
         self._opt_numels = _get_split_numels(
             numel_per_rank, config.split_ratio.optimizer
@@ -930,3 +928,169 @@ def get_opt_coordinator():
         FlexTrainOptCoordinator: The optimizer coordinator.
     """
     return _OPT_COORDINATOR
+
+
+@dataclass
+class InterLayerTask:
+    unit: int
+    micro_batch: int
+    tensor: Tensor = None
+    is_dvtn: bool = False
+
+
+def retrieve_tensor(interlayer: Tensor | Tuple[Tensor, ...]) -> Tensor:
+    # If interlayer is a single tensor, return it.
+    if isinstance(interlayer, Tensor):
+        return interlayer
+
+    # Unpack the tuple.
+    # Currently, only one tensor is supported.
+    tar = None
+    for tensor in interlayer:
+        if isinstance(tensor, Tensor):
+            assert tar is None, (
+                "Currently, only one tensor is supported for FlexTrain "
+                "checkpointing. You may consider manually place all "
+                "inter-layer results into a single tensor."
+            )
+            tar = tensor
+
+    assert tar is not None, "No tensor can be found in inter-layer results."
+    return tar
+
+
+class FlexTrainInterLayerCoordinator:
+
+    def __init__(self):
+        # Lazy initialization of checkpoint coordinator.
+        self._initialized = False
+
+    def _init_coordinator(self):
+        # If already initialized, return.
+        if self._initialized:
+            return
+        self._initialized = True
+
+        # Memory lazy allocation.
+        self._mem_allocated = False
+
+        # CUDA streams for async IO operations.
+        self._data_stream = torch.cuda.Stream()
+
+        # TEMP: pure CPU offloading for now.
+        config = get_flextrain_config()
+        batch_per_rank = config.batch_size // dist.get_world_size()
+        self._num_micro_batches = batch_per_rank // config.micro_batch_size
+        self._num_units = get_para_coordinator().num_units
+
+        # Last task handle.
+        self._inflight_handle: Waitable = DummyHandle()
+
+    def _allocate_memory(self, tensor: Tensor):
+        # If memory is already allocated, return.
+        if self._mem_allocated:
+            return
+        self._mem_allocated = True
+
+        # Record the tensor shape.
+        self._tensor_shape = tensor.shape
+
+        # Allocate memory for CPU checkpoint buffer.
+        self.cpu_ckpt_base = [_allocate_memory_chunks(
+            tensor.numel(),
+            self._num_micro_batches,
+            torch.float16,
+            torch.device('cpu')
+        ) for _ in range(self._num_units - 1)]
+
+        # Allocate memory for GPU checkpoint buffer.
+        self._gpu_full_ckpts = RotateContainer(
+            _allocate_memory_chunks(
+                tensor.numel(), 2,
+                torch.float16,
+                torch.cuda.current_device()
+            )
+        )
+
+    def _mask_invalid_task(self, task: InterLayerTask):
+        if task is None:
+            return None
+        unit = task.unit
+        micro_batch = task.micro_batch
+        if unit < 0 or unit >= self._num_units:
+            return None
+        elif micro_batch < 0 or micro_batch >= self._num_micro_batches:
+            return None
+        else:
+            return task
+
+    @property
+    def inflight_layer_ckpt(self):
+        return self._gpu_full_ckpts[0]
+
+    @property
+    def available_layer_ckpt(self):
+        ckpt_mem: Tensor = self._gpu_full_ckpts[1]
+        return ckpt_mem.view(self._tensor_shape)
+
+    def _sync_pre_forward_micro_batch(self):
+        if not self._mem_allocated:
+            return
+
+        self._inflight_handle.wait()
+        self._gpu_full_ckpts.rotate()
+
+    def _submit_pre_forward_micro_batch(
+        self,
+        ckpt_prefetch: InterLayerTask = None,
+        ckpt_offload: InterLayerTask = None
+    ):
+        with torch.cuda.stream(self._data_stream):
+            if ckpt_prefetch is not None:
+                prefetch_tar: Tensor = self.inflight_layer_ckpt
+                prefetch_src = self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch]
+                prefetch_tar.copy_(prefetch_src, non_blocking=True)
+            if ckpt_offload is not None:
+                offload_tar = self.cpu_ckpt_base[ckpt_offload.unit][ckpt_offload.micro_batch]
+                offload_tar.copy_(ckpt_offload.tensor.flatten(), non_blocking=True)
+
+        def synchronize_free():
+            torch.cuda.current_stream().synchronize()
+            if ckpt_offload is not None and ckpt_offload.tensor is not None:
+                free_tensor(ckpt_offload.tensor)
+
+        self._inflight_handle = FunctionHandle(synchronize_free)
+
+    def pre_forward_micro_batch(
+        self,
+        ckpt_prefetch: InterLayerTask = None,
+        ckpt_offload: InterLayerTask = None
+    ):
+        # Initialize coordinator if not done.
+        self._init_coordinator()
+
+        # Check if the task is valid.
+        ckpt_prefetch = self._mask_invalid_task(ckpt_prefetch)
+        ckpt_offload = self._mask_invalid_task(ckpt_offload)
+
+        # Initialize memory allocation if not done.
+        # Assume that the first task is always about offloading.
+        if not self._mem_allocated and ckpt_offload is not None:
+            assert ckpt_offload.tensor is not None
+            self._allocate_memory(ckpt_offload.tensor)
+
+        self._sync_pre_forward_micro_batch()
+        self._submit_pre_forward_micro_batch(ckpt_prefetch, ckpt_offload)
+
+
+_INTERLAYER_COORDINATOR = FlexTrainInterLayerCoordinator()
+
+
+def get_interlayer_coordinator():
+    """
+    Get the inter-layer coordinator.
+
+    Returns:
+        FlexTrainInterLayerCoordinator: The inter-layer coordinator.
+    """
+    return _INTERLAYER_COORDINATOR
