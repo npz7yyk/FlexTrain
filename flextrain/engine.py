@@ -15,6 +15,7 @@ from flextrain.config import get_flextrain_config
 from flextrain.llm_func import LLMFunc, retrieve_llm_loss
 from flextrain.loss_scaler import create_loss_scaler
 from flextrain.memory.coordinator import (
+    get_data_stream,
     get_para_coordinator,
     get_opt_coordinator,
     get_interlayer_coordinator,
@@ -53,6 +54,7 @@ class FlexTrainEngine(object):
         self.optimizer = optimizer
 
         # Link to parameter & optimizer coordinators
+        self.data_stream = get_data_stream()
         self.para_coordinator = get_para_coordinator()
         self.opt_coordinator = get_opt_coordinator()
         self.interlayer_coordinator = get_interlayer_coordinator()
@@ -142,20 +144,28 @@ class FlexTrainEngine(object):
         config = get_flextrain_config()
         scheduler = self.scheduler
 
-        # Prefetch the next passed_down and offload the last passed_down
+        # Submit prefetching and offloading tasks
+        # 1. Prefetch the next passed_down and offload the last passed_down
         next_task = self.scheduler.next_task
         # If the next task is in the same micro batch, prefetch is not needed
         prefetch_task = None if next_task.micro_batch == task.micro_batch \
             else InterLayerTask(next_task.unit - 1, next_task.micro_batch)
         self.interlayer_coordinator.pre_forward_micro_batch(
-            prefetch_task,
-            self.offload_task
+            prefetch_task, self.offload_task
         )
-        # End of prefetch and offload
-
-        # Need to fetch new unit parameters
+        # 2. Prefetch the parameter of the next unit
+        self.para_coordinator.pre_forward_micro_batch(
+            task.unit, task.micro_batch
+        )
+        # Link parameters to memory (prefetch NVMe parameters if needed)
         if scheduler.new_unit_entered:
             self.para_coordinator.pre_forward_unit(task.unit)
+        # End of submit prefetching and offloading tasks
+
+        # Wait for all in-flight operations
+        self.data_stream.synchronize()
+        # Execute just submitted operations
+        self.data_stream.execute()
 
         # Conduct pre-process if in the first unit
         if scheduler.in_first_unit:
@@ -191,16 +201,20 @@ class FlexTrainEngine(object):
     def _conduct_last_unit(self, task: LLMTask):
         config = get_flextrain_config()
 
-        # Prefetch the next passed_down and offload the last passed_down
+        # Submit prefetching the next passed_down
         next_task = self.scheduler.next_task
         # If the next task is in the same micro batch, prefetch is not needed
         prefetch_task = None if next_task.micro_batch == task.micro_batch \
             else InterLayerTask(next_task.unit - 1, next_task.micro_batch)
         self.interlayer_coordinator.pre_forward_micro_batch(
-            prefetch_task,
-            None  # DEV
+            prefetch_task, None  # DEV
         )
-        # End of prefetch and offload
+        # End of submit prefetching the next passed_down
+
+        # Wait for all in-flight operations
+        self.data_stream.synchronize()
+        # Execute just submitted operations
+        self.data_stream.execute()
 
         # 1. Conduct forward of the last unit
         passed_down = self.micro_batch_passed_down[task.micro_batch]
@@ -251,7 +265,7 @@ class FlexTrainEngine(object):
         # Need to prepare buffer for gradient accumulation
         if scheduler.new_unit_entered:
             self.para_coordinator.pre_backward_unit(task.unit)
-            self.opt_coordinator.pre_backward_unit(task.unit)
+            # self.opt_coordinator.pre_backward_unit(task.unit)
         # End of new_unit_entered
 
         # Last unit needs special treatment
@@ -299,20 +313,29 @@ class FlexTrainEngine(object):
         # 1. Conduct reset
         self._reset_context()
 
+        import time
+        times = []
+
         # 2. Conduct all tasks assigned by the scheduler
         self.para_coordinator.warmup_forward_pipeline()
         for task in self.scheduler:
             if task.is_forwarding:
                 torch.cuda.nvtx.range_push(f"Forward unit {task.unit}")
+                t_start = time.time()
                 self._conduct_forward(task)
+                t_end = time.time()
+                times.append(t_end - t_start)
                 torch.cuda.nvtx.range_pop()
             else:
                 torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
                 self._conduct_backward(task)
                 torch.cuda.nvtx.range_pop()
-        self.opt_coordinator.clear_backward_pipeline()
+        # self.opt_coordinator.clear_backward_pipeline()
 
-        exit()
+        times = sorted(times, reverse=True)
+        times = times[5:]
+        avg_time = sum(times) / len(times)
+        dist.print_rank_by_rank(avg_time * 1000)
 
         # 3. Conduct optimizer step
         self.optimizer.step()

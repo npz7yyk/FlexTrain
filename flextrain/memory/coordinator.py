@@ -4,20 +4,19 @@ from dataclasses import dataclass
 from math import ceil
 from torch import Tensor
 from torch.nn import Parameter
-from typing import SupportsIndex, Iterable, Tuple, List, Dict
+from typing import SupportsIndex, Iterable, Callable, Tuple, List, Dict
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
     free_tensor,
     FlexTrainDataType as Dtype,
     FlexTrainDataID,
-    contiguous_partitioned_numel,
+    align_numel,
     move_into_contiguous,
     ContiguousParaGroup,
     Waitable,
     DummyHandle,
-    FunctionHandle,
-    FusedHandle
+    FunctionHandle
 )
 from flextrain.memory.nvme_swapper import AsyncNVMeSwapper
 from flextrain.utils import dist
@@ -145,6 +144,42 @@ def _nvme_reload(
     return _NVME_SWAPPER.swap_in(data_ids, tensors, async_op)
 
 
+class FlexTrainDataStream:
+
+    def __init__(self):
+        self._stream = torch.cuda.Stream()
+        self._tasks: List[Callable] = []
+
+    def submit(self, task):
+        self._tasks.append(task)
+
+    def execute(self):
+        with torch.cuda.stream(self._stream):
+            for task in self._tasks:
+                task()
+        self._tasks.clear()
+
+    def synchronize(self):
+        torch.cuda.synchronize()
+
+
+_DATA_STREAM: FlexTrainDataStream = None
+
+
+def get_data_stream():
+    """
+    Get the data stream for async IO operations.
+
+    Returns:
+        FlexTrainDataStream: The data stream.
+    """
+    # Lazy initialization of the data stream
+    global _DATA_STREAM
+    if _DATA_STREAM is None:
+        _DATA_STREAM = FlexTrainDataStream()
+    return _DATA_STREAM
+
+
 class FlexTrainParaCoordinator:
 
     def __init__(self):
@@ -164,56 +199,64 @@ class FlexTrainParaCoordinator:
         # Init coordinator configurations.
         config = get_flextrain_config()
 
-        # Whether running in single GPU mode.
-        self._single_gpu = dist.get_world_size() == 1
-
         # Mixed precision dtype for accelerator.
         self._device_dtype = config.mixed_precision.device_dtype
-
         # Mixed precision dtype for master.
         self._master_dtype = config.mixed_precision.master_dtype
 
-        # Number of units in the model.
-        self._num_units = 0
-
-        # CUDA streams for async IO operations.
-        self._data_stream = torch.cuda.Stream()
-
         # Lazy initialization of NVMe swapper.
         self._nvme_swapper = None
+        # Async IO operation cuda stream.
+        self._data_stream = get_data_stream()
 
+        # Configuration for parameter partition.
+        self._config_para_partition(parameters)
+
+        # Number of units in the model.
+        self._num_units = 0
         # Map of unit index to its parameters.
         self._unit_parameters: Dict[int, ContiguousParaGroup] = {}
 
-        # How to split the training data.
-        numel_per_rank = contiguous_partitioned_numel(parameters)
-        self._para_numels = _get_split_numels(
-            numel_per_rank, config.split_ratio.parameter
-        )
-        self._numel_per_rank = numel_per_rank
-        self._original_unit_numel = sum(p.numel() for p in parameters)
-        # Memory for optimizer states needed to be lazy allocated.
-
-        # End of coordinator configurations.
-
         # Allocate parameter base containers.
-        self._gpu_para_base: List[Tensor] = []
-        self._cpu_para_base: List[Tensor] = []
-
+        # list[layer][micro_batch] -> Tensor
+        self._gpu_para_base: List[List[Tensor]] = []
+        self._cpu_para_base: List[List[Tensor]] = []
         # Allocate GPU working memory for parameters.
         self._gpu_full_paras = RotateContainer(_allocate_memory_chunks(
-            numel_per_rank * dist.get_world_size(), 2,
+            self._aligned_unit_numel, 2,
             self._device_dtype, torch.cuda.current_device()
         ))
-
         # Allocate NVMe prefetch buffer in CPU memory.
         self._nvme_prefetch_buffer = RotateContainer(_allocate_memory_chunks(
-            self._para_numels[2], 2,
+            self._micro_batch_para_numels[2] * self._micro_batch_per_rank, 2,
             self._device_dtype, torch.device('cpu')
         ))
 
-        # Handle for async IO operations.
-        self._inflight_para_handle: Tuple[int, Waitable] = (-1, None)
+    def _config_para_partition(self, parameters: Iterable[Parameter]):
+        # Get the configuration.
+        config = get_flextrain_config()
+
+        # The original numel of the parameters in a unit.
+        self._original_unit_numel = sum(p.numel() for p in parameters)
+
+        # The number of micro-batches.
+        num_micro_batches = config.batch_size // config.micro_batch_size
+        self._micro_batch_per_rank = num_micro_batches // dist.get_world_size()
+        self._num_micro_batches = num_micro_batches
+
+        # The aligned numel of the parameters in a unit.
+        self._aligned_unit_numel = align_numel(
+            self._original_unit_numel, self._num_micro_batches
+        )
+        # The aligned numel of the parameters prepared in a micro-batch.
+        assert self._aligned_unit_numel % self._num_micro_batches == 0
+        self._aligned_micro_batch_numel = \
+            self._aligned_unit_numel // self._num_micro_batches
+
+        # How to split the parameters at micro-batch level.
+        self._micro_batch_para_numels = _get_split_numels(
+            self._aligned_micro_batch_numel, config.split_ratio.parameter
+        )
 
     @property
     def is_initialized(self):
@@ -224,8 +267,12 @@ class FlexTrainParaCoordinator:
         return self._num_units
 
     @property
-    def unit_numel(self):
+    def original_unit_numel(self):
         return self._original_unit_numel
+
+    @property
+    def aligned_unit_numel(self):
+        return self._aligned_unit_numel
 
     @property
     def unit_parameter_map(self):
@@ -233,11 +280,7 @@ class FlexTrainParaCoordinator:
 
     @property
     def numel_per_rank(self):
-        return self._numel_per_rank
-
-    @property
-    def model_split_numels(self):
-        return self._para_numels
+        return self._aligned_unit_numel // dist.get_world_size()
 
     @property
     def _gpu_inflight_paras(self):
@@ -333,45 +376,48 @@ class FlexTrainParaCoordinator:
         self._num_units += 1
 
         # Allocate parameter bases
-        self._gpu_para_base.append(torch.empty(
-            self._para_numels[0],
-            dtype=self._device_dtype,
-            device=torch.cuda.current_device()
+        self._gpu_para_base.append(_allocate_memory_chunks(
+            self._micro_batch_para_numels[0], self._micro_batch_per_rank,
+            self._device_dtype, torch.cuda.current_device()
         ))
-        self._cpu_para_base.append(torch.empty(
-            self._para_numels[1],
-            dtype=self._device_dtype,
-            device=torch.device('cpu')
+        self._cpu_para_base.append(_allocate_memory_chunks(
+            self._micro_batch_para_numels[1], self._micro_batch_per_rank,
+            self._device_dtype, torch.device('cpu')
         ))
 
         # Track the unit parameters.
         self._unit_parameters[unit_index] = ContiguousParaGroup(unit_paras)
 
-        # Using GPU working window to conduct the broadcast.
+        # Using GPU working window to prepare the parameters.
         temp_gpu_buffer = self._gpu_inflight_paras
 
         # Move parameters into contiguous memory.
         move_into_contiguous(unit_paras, temp_gpu_buffer)
 
-        # Broadcast the parameters.
-        dist.broadcast(temp_gpu_buffer, src=0)
-
         # Partition parameters.
-        partitioned_paras = torch.chunk(
-            temp_gpu_buffer, dist.get_world_size()
-        )[dist.get_rank()]
-
-        # Get GPU, CPU and NVMe views of partitioned parameters.
-        gpu_view, cpu_view, nvme_view = torch.split(
-            partitioned_paras, self._para_numels
+        micro_batch_partitioned_paras = torch.chunk(
+            temp_gpu_buffer, self._micro_batch_per_rank
         )
 
-        # Store the views.
-        self._gpu_para_base[unit_index].copy_(gpu_view)
-        self._cpu_para_base[unit_index].copy_(cpu_view)
+        # Target memory buffer for each memory type.
+        tar_nvme_partitions = torch.chunk(
+            self._nvme_available_paras,
+            self._micro_batch_per_rank
+        )
+        for i, para in enumerate(micro_batch_partitioned_paras):
+            # Locate the memory for each rank.
+            tar_mem = torch.chunk(para, dist.get_world_size())[dist.get_rank()]
+            gpu_view, cpu_view, nvme_view = torch.split(
+                tar_mem, self._micro_batch_para_numels
+            )
+            # Store the views.
+            self._gpu_para_base[unit_index][i].copy_(gpu_view)
+            self._cpu_para_base[unit_index][i].copy_(cpu_view)
+            tar_nvme_partitions[i].copy_(nvme_view)
+
+        # Offload the NVMe parameters.
         _nvme_offload(
-            FlexTrainDataID(unit_index, Dtype.PARA),
-            nvme_view
+            FlexTrainDataID(unit_index, Dtype.PARA), self._nvme_available_paras
         )
 
         # Detach the parameters from the memory.
@@ -383,16 +429,22 @@ class FlexTrainParaCoordinator:
         """
         rank0_logger.info(
             "\n\n> "
-            f"FlexTrain parameter coordinator initialized with configurations:\n"
+            f"FlexTrain parameter coordinator initialized with configurations:"
+            f"\n"
+            f"  - number of ranks: {dist.get_world_size()}\n"
+            f"  - number of micro-batches per rank: "
+            f"{self._micro_batch_per_rank}\n"
             f"  - device dtype: {self._device_dtype}\n"
             f"  - master dtype: {self._master_dtype}\n"
             f"  - number of units: {self._num_units}\n"
-            f"  - unit parameter numel: {self._original_unit_numel}\n"
-            f"  - each rank numel: {self._numel_per_rank}\n"
-            f"  - parameter split numels: {self._para_numels}\n"
+            f"  - numel per unit: {self._original_unit_numel}\n"
+            f"  - numel per unit aligned: {self._aligned_unit_numel}\n"
+            f"  - numel per micro-batch: {self._aligned_micro_batch_numel}\n"
+            f"  - micro-batch parameter splits: "
+            f"{self._micro_batch_para_numels}\n"
         )
 
-    def _async_prepare_cpu_paras(self, unit_index: int):
+    def _async_load_cpu_paras(self, unit_index: int):
         """
         Move NVMe parameters to CPU for further processing.
         The CPU parameters are prepared in _cpu_inflight_paras.
@@ -411,14 +463,15 @@ class FlexTrainParaCoordinator:
             self._nvme_inflight_paras, async_op=True
         )
 
-    def _async_prepare_gpu_paras(self, unit_index: int):
+    def _async_load_gpu_paras(self, unit_index: int, micro_batch_index: int):
         """
         Prepare the GPU parameters for the unit.
         The GPU parameters are prepared in _gpu_inflight_paras.
+        Task is submitted to the data stream (so not started yet).
         """
         # 0. Check if the unit is valid.
         if self._is_invalid_unit(unit_index):
-            return DummyHandle()
+            return
 
         # 1. Locate the target memory.
         # 2. Copy parameters from three resources:
@@ -426,21 +479,33 @@ class FlexTrainParaCoordinator:
         #    - CPU part from CPU base
         #    - NVMe part from CPU available buffer
         # 3. Conduct all-gather into tensor if necessary.
-        with torch.cuda.stream(self._data_stream):
+        def load_gpu_para_task():
+            # Locate the target memory.
             tar_full_paras = self._gpu_inflight_paras
-            mem_partitions = torch.chunk(tar_full_paras, dist.get_world_size())
-            mem_partition = mem_partitions[dist.get_rank()]
+            micro_batch_mem = torch.chunk(
+                tar_full_paras, self._micro_batch_per_rank
+            )[micro_batch_index]
+            rank_mem = torch.chunk(
+                micro_batch_mem, dist.get_world_size()
+            )[dist.get_rank()]
             gpu_view, cpu_view, nvme_view = torch.split(
-                mem_partition, self._para_numels
+                rank_mem, self._micro_batch_para_numels
             )
-            gpu_view.copy_(self._gpu_para_base[unit_index], True)
-            cpu_view.copy_(self._cpu_para_base[unit_index], True)
-            nvme_view.copy_(self._nvme_available_paras, True)
-            dist.all_gather(tar_full_paras, mem_partition)
+            # Copy parameters from three resources.
+            gpu_src = self._gpu_para_base[unit_index][micro_batch_index]
+            cpu_src = self._cpu_para_base[unit_index][micro_batch_index]
+            nvme_src = torch.chunk(
+                self._nvme_available_paras, self._micro_batch_per_rank
+            )[micro_batch_index]
+            gpu_view.copy_(gpu_src, non_blocking=True)
+            cpu_view.copy_(cpu_src, non_blocking=True)
+            nvme_view.copy_(nvme_src, non_blocking=True)
+            dist.all_gather(micro_batch_mem, rank_mem, async_op=True)
 
-        return FunctionHandle(self._data_stream.synchronize)
+        # Submit the task to the data stream.
+        self._data_stream.submit(load_gpu_para_task)
 
-    def _submit_prepare_paras(self, unit_index: int):
+    def _submit_prepare_paras(self, unit_index: int, forward: bool = True):
         """
         Launch the async IO operation to prepare parameters for the unit.
 
@@ -455,15 +520,11 @@ class FlexTrainParaCoordinator:
             return
 
         # Prepare the CPU parameters.
-        cpu_handle = self._async_prepare_cpu_paras(unit_index + 1)
-
-        # Prepare the GPU parameters.
-        gpu_handle = self._async_prepare_gpu_paras(unit_index)
+        offset = 1 if forward else -1
+        cpu_handle = self._async_load_cpu_paras(unit_index + offset)
 
         # Keep track of the inflight operation.
-        self._inflight_para_handle = (
-            unit_index, FusedHandle([cpu_handle, gpu_handle])
-        )
+        self._inflight_para_handle = (unit_index, cpu_handle)
 
     def _synchronize_prepare_paras(self, unit_index: int):
         """
@@ -506,18 +567,57 @@ class FlexTrainParaCoordinator:
         """
 
         # Load the first unit parameters to CPU.
-        self._async_prepare_cpu_paras(0).wait()
+        self._async_load_cpu_paras(0).wait()
         self._nvme_prefetch_buffer.rotate()
 
         # Launch the first unit forward.
         self._submit_prepare_paras(0)
+        for i in range(self._micro_batch_per_rank):
+            self._async_load_gpu_paras(0, i)
+        self._data_stream.execute()
+
+    def pre_forward_micro_batch(self, unit_index: int, micro_batch_index: int):
+        """
+        Submit the prefetching task for the given micro-batch in forward pass.
+
+        Args:
+            unit_index (int): Index of the unit.
+            micro_batch_index (int): Index of the micro-batch.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        self._async_load_gpu_paras(unit_index + 1, micro_batch_index)
+
+    def pre_backward_micro_batch(
+        self, unit_index: int, micro_batch_index: int
+    ):
+        """
+        Submit the prefetching task for the given micro-batch in backward pass.
+
+        Args:
+            unit_index (int): Index of the unit.
+            micro_batch_index (int): Index of the micro-batch.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        self._async_load_gpu_paras(unit_index - 1, micro_batch_index)
 
     def pre_forward_unit(self, unit_index: int):
         """
         Prepare the unit for forward pass.
 
         Functions:
-        1. Ensure the availability of the parameters and checkpoint.
+        1. Ensure the availability of the parameters.
         2. Kick off relevant prefetching tasks if needed.
 
         Args:
@@ -538,7 +638,7 @@ class FlexTrainParaCoordinator:
         Prepare the unit for backward pass.
 
         Functions:
-        1. Ensure the availability of the parameters and checkpoint.
+        1. Ensure the availability of the parameters.
         2. Kick off relevant prefetching tasks if needed.
         3. Allocate zeroed memory for gradients and link to the unit.
 
@@ -553,7 +653,7 @@ class FlexTrainParaCoordinator:
             return
 
         self._synchronize_prepare_paras(unit_index)
-        self._submit_prepare_paras(unit_index - 1)
+        self._submit_prepare_paras(unit_index - 1, forward=False)
 
 
 _PARA_COORDINATOR = FlexTrainParaCoordinator()
@@ -619,6 +719,7 @@ class FlexTrainOptCoordinator:
         )
 
     def _copy_master_parameters(self):
+        assert False, "Not implemented yet."
         # Unpack numels
         gpu_opt_numel, cpu_opt_numel, nvme_opt_numel = self._opt_numels
         gpu_mdl_numel, cpu_mdl_numel, nvme_mdl_numel = self._model_numels
@@ -1045,7 +1146,7 @@ class FlexTrainInterLayerCoordinator:
         ckpt_prefetch: InterLayerTask = None,
         ckpt_offload: InterLayerTask = None
     ):
-        with torch.cuda.stream(self._data_stream):
+        def interlayer_task():
             if ckpt_prefetch is not None:
                 prefetch_tar: Tensor = self.inflight_layer_ckpt
                 prefetch_src = self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch]
@@ -1054,12 +1155,13 @@ class FlexTrainInterLayerCoordinator:
                 offload_tar = self.cpu_ckpt_base[ckpt_offload.unit][ckpt_offload.micro_batch]
                 offload_tar.copy_(ckpt_offload.tensor.flatten(), non_blocking=True)
 
-        def synchronize_free():
-            torch.cuda.current_stream().synchronize()
+        _DATA_STREAM.submit(interlayer_task)
+
+        def free_ckpt_memory():
             if ckpt_offload is not None and ckpt_offload.tensor is not None:
                 free_tensor(ckpt_offload.tensor)
 
-        self._inflight_handle = FunctionHandle(synchronize_free)
+        self._inflight_handle = FunctionHandle(free_ckpt_memory)
 
     def pre_forward_micro_batch(
         self,

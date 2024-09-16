@@ -6,7 +6,7 @@ from torch.nn import Parameter
 from typing import Iterable
 
 from flextrain.config import get_flextrain_config
-from flextrain.utils.distributed import get_rank, get_world_size
+from flextrain.utils.distributed import get_rank
 
 
 class FlexTrainDataType(Enum):
@@ -31,14 +31,9 @@ class FlexTrainDataID:
 
     def __str__(self):
         checkpoint_interval = get_flextrain_config().checkpoint_interval
-        num_layers = get_flextrain_config().num_layers
         start = self.unit_index * checkpoint_interval
         end = start + checkpoint_interval - 1
-        end = min(end, num_layers - 1)
-        if start == end:
-            layer_str = f"layer{start}"
-        else:
-            layer_str = f"layer{start}-{end}"
+        layer_str = f"layer{start}-{end}"
         return (
             f"rank{get_rank()}_"
             f"{layer_str}_"
@@ -46,30 +41,8 @@ class FlexTrainDataID:
         )
 
 
-def contiguous_allgathered_numel(paras: Iterable[Parameter]):
-    """ Allgathered numel of the contiguous memory for the parameters. """
-
-    world_size = get_world_size()
-    total_numel = sum(para.numel() for para in paras)
-
-    # Align the total numel to the world size.
-    if total_numel % world_size:
-        total_numel += world_size - total_numel % world_size
-
-    return total_numel
-
-
-def contiguous_partitioned_numel(paras: Iterable[Parameter]):
-    """ Partitioned numel of the contiguous memory for the parameters. """
-
-    world_size = get_world_size()
-    total_numel = sum(para.numel() for para in paras)
-
-    # Align the total numel to the world size.
-    if total_numel % world_size:
-        total_numel += world_size - total_numel % world_size
-
-    return total_numel // world_size
+def align_numel(original_numel: int, align_size: int):
+    return (original_numel + align_size - 1) // align_size * align_size
 
 
 def free_tensor(tensor: Tensor, record_stream=False):

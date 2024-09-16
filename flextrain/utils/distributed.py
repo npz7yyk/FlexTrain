@@ -141,6 +141,11 @@ def barrier(group=None):
     return torch.distributed.barrier(group)
 
 
+def print_rank0(*args, **kwargs):
+    if get_rank() == 0:
+        print(*args, **kwargs)
+
+
 def print_rank_by_rank(*args, **kwargs):
     for i in range(get_world_size()):
         barrier()
