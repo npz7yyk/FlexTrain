@@ -94,7 +94,7 @@ class Init(object):
 
         # Manage the unit memory by the parameter coordinator
         get_para_coordinator().init_unit_parameters(
-            self._unit_count, unit_paras
+            curr_layer, self._unit_count, unit_paras
         )
 
         # Update unit information

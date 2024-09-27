@@ -107,7 +107,8 @@ class FlexTrainEngine(object):
         self.micro_batch_loss_rsts: Dict[int, Sequence[Any]] = {}
 
         # DEV
-        self.offload_task: InterLayerTask = None
+        self.ckpt_offload: InterLayerTask = None
+        self.grad_offload: InterLayerTask = None
 
     @torch.no_grad()
     def _conduct_first_unit(self, task: LLMTask):
@@ -116,7 +117,6 @@ class FlexTrainEngine(object):
         # Unpack a micro batch
         pre_inputs, post_inputs, loss_inputs = LLMFunc.get_batch()
         # Store the inputs
-        # self.micro_batch_pre_inputs[task.micro_batch] = pre_inputs
         self.micro_batch_post_inputs[task.micro_batch] = post_inputs
         self.micro_batch_loss_inputs[task.micro_batch] = loss_inputs
 
@@ -131,7 +131,7 @@ class FlexTrainEngine(object):
 
             # Conduct forward
             start = task.unit * config.checkpoint_interval
-            end = min(start + config.checkpoint_interval, config.num_layers)
+            end = start + config.checkpoint_interval
             return LLMFunc.layer_forward(start, end)(
                 *passed_down, *every_layer
             )
@@ -148,10 +148,10 @@ class FlexTrainEngine(object):
         # 1. Prefetch the next passed_down and offload the last passed_down
         next_task = self.scheduler.next_task
         # If the next task is in the same micro batch, prefetch is not needed
-        prefetch_task = None if next_task.micro_batch == task.micro_batch \
+        ckpt_prefetch = None if next_task.micro_batch == task.micro_batch \
             else InterLayerTask(next_task.unit - 1, next_task.micro_batch)
         self.interlayer_coordinator.pre_forward_micro_batch(
-            prefetch_task, self.offload_task
+            ckpt_prefetch, self.ckpt_offload
         )
         # 2. Prefetch the parameter of the next unit
         self.para_coordinator.pre_forward_micro_batch(
@@ -183,7 +183,7 @@ class FlexTrainEngine(object):
             # Conduct forward
             passed_down = detach_variable(passed_down)
             start = task.unit * config.checkpoint_interval
-            end = min(start + config.checkpoint_interval, config.num_layers)
+            end = start + config.checkpoint_interval
             passed_down, ctx = checkpointed_forward(
                 LLMFunc.layer_forward(start, end),
                 *passed_down, *every_layer
@@ -192,29 +192,14 @@ class FlexTrainEngine(object):
         # Save recent passed down tensor and context
         self.micro_batch_passed_down[task.micro_batch] = passed_down
         self.micro_batch_unit_ctx[task.micro_batch][task.unit] = ctx
-        # Record the offload task
-        self.offload_task = InterLayerTask(
+        # Record the checkpoint to offload
+        self.ckpt_offload = InterLayerTask(
             task.unit, task.micro_batch, retrieve_tensor(passed_down)
         )
 
     @torch.enable_grad()
     def _conduct_last_unit(self, task: LLMTask):
         config = get_flextrain_config()
-
-        # Submit prefetching the next passed_down
-        next_task = self.scheduler.next_task
-        # If the next task is in the same micro batch, prefetch is not needed
-        prefetch_task = None if next_task.micro_batch == task.micro_batch \
-            else InterLayerTask(next_task.unit - 1, next_task.micro_batch)
-        self.interlayer_coordinator.pre_forward_micro_batch(
-            prefetch_task, None  # DEV
-        )
-        # End of submit prefetching the next passed_down
-
-        # Wait for all in-flight operations
-        self.data_stream.synchronize()
-        # Execute just submitted operations
-        self.data_stream.execute()
 
         # 1. Conduct forward of the last unit
         passed_down = self.micro_batch_passed_down[task.micro_batch]
@@ -226,7 +211,10 @@ class FlexTrainEngine(object):
                 self.interlayer_coordinator.available_layer_ckpt
 
         start = task.unit * config.checkpoint_interval
-        end = min(start + config.checkpoint_interval, config.num_layers)
+        end = min(
+            start + config.checkpoint_interval,
+            self.para_coordinator.num_layers
+        )
         passed_down = detach_variable(passed_down)
         last_passed_down = LLMFunc.layer_forward(start, end)(
             *passed_down, *every_layer
@@ -258,28 +246,70 @@ class FlexTrainEngine(object):
         passed_back = retrieve_tensor_grads(passed_down)
         self.micro_batch_passed_back[task.micro_batch] = passed_back
 
+        return passed_back
+
     def _conduct_backward(self, task: LLMTask):
         scheduler = self.scheduler
 
-        # Need to fetch new unit parameters
-        # Need to prepare buffer for gradient accumulation
+        # Submit prefetching the next passed_down
+        next_task = self.scheduler.next_task
+        ckpt_prefetch = InterLayerTask(
+            next_task.unit - 1, next_task.micro_batch
+        )
+        grad_prefetch = None if next_task.micro_batch == task.micro_batch \
+            else InterLayerTask(next_task.unit, next_task.micro_batch)
+        self.interlayer_coordinator.pre_backward_micro_batch(
+            ckpt_prefetch, grad_prefetch, self.grad_offload
+        )
+        # End of submit prefetching the next passed_down
+
+        # 2. Prefetch the parameter of the next unit
+        self.para_coordinator.pre_backward_micro_batch(
+            task.unit, task.micro_batch
+        )
+        # Link parameters to memory (prefetch NVMe parameters if needed)
         if scheduler.new_unit_entered:
             self.para_coordinator.pre_backward_unit(task.unit)
             # self.opt_coordinator.pre_backward_unit(task.unit)
-        # End of new_unit_entered
+        # End of submit prefetching and offloading tasks
+
+        # Wait for all in-flight operations
+        self.data_stream.synchronize()
+        # Execute just submitted operations
+        dist.print_rank0(f"\n\nExecute backward unit {task.unit}, micro batch {task.micro_batch}")
+        self.data_stream.execute()
 
         # Last unit needs special treatment
         if scheduler.in_last_unit:
-            self._conduct_last_unit(task)
+            passed_back = self._conduct_last_unit(task)
         else:
-            # Conduct backward
+            # Link to the checkpoint buffer if not in the first unit
             ctx = self.micro_batch_unit_ctx[task.micro_batch][task.unit]
+            if not scheduler.in_first_unit:
+                # fwd_args[0] is passed_down, except for the first unit
+                checkpoint_tensor = retrieve_tensor(ctx.fwd_args[0])
+                checkpoint_tensor.data = \
+                    self.interlayer_coordinator.available_layer_ckpt
+
             passed_back = self.micro_batch_passed_back[task.micro_batch]
+            passed_back_tensor = retrieve_tensor(passed_back)
+            # If passed_back is empty, use the available layer gradient
+            if passed_back_tensor.numel() == 0:
+                passed_back_tensor.data = \
+                    self.interlayer_coordinator.available_layer_grad
+            # dist.print_rank0(f"Passed back: {passed_back_tensor.flatten()[:10]}")
             passed_back = checkpointed_backward(ctx, *passed_back)
+
             # Exclude every layer tensor in the passed back
             passed_back = passed_back[:-self.every_layer_len]
             self.micro_batch_passed_back[task.micro_batch] = passed_back
         # End of conduct backward
+
+        # Record the gradient to offload
+        # First unit does not have tensor input, thus no gradient to offload
+        self.grad_offload = InterLayerTask(
+            task.unit - 1, task.micro_batch, retrieve_tensor(passed_back)
+        ) if not scheduler.in_first_unit else None
 
     def override_loss_scale(self, loss_scale: float):
         self.custom_loss_scaler = True
@@ -336,6 +366,9 @@ class FlexTrainEngine(object):
         times = times[5:]
         avg_time = sum(times) / len(times)
         dist.print_rank_by_rank(avg_time * 1000)
+
+        for p in self.optimizer.non_layerwise_params:
+            dist.print_rank0(p.grad.flatten()[:10])
 
         # 3. Conduct optimizer step
         self.optimizer.step()

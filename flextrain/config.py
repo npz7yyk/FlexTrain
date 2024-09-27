@@ -5,6 +5,7 @@ from flextrain.defaults import (
     CHECKPOINT_INTERVAL, CHECKPOINT_INTERVAL_DEFAULT,
     SPLIT_RATIO,
     CHECKPOINT, CHECKPOINT_DEFAULT,
+    GRADIENT, GRADIENT_DEFAULT,
     PARAMETER, PARAMETER_DEFAULT,
     OPTIMIZER, OPTIMIZER_DEFAULT,
     NVME_SWAP,
@@ -35,6 +36,16 @@ class SplitRatioConfig:
     checkpoint: Tuple[float, float]
     """
     How to split the checkpointed activations among the memory hierarchy.
+    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
+    User can also provide numels of each level as:
+    Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
+    Defaults to (1.0, 0.0) if not provided.
+    """
+
+    gradient: Tuple[float, float]
+    """
+    How to split the gradients of activations among the memory hierarchy.
+    Note: The gradients are NOT those of the model parameters.
     Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
     User can also provide numels of each level as:
     Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
@@ -74,11 +85,13 @@ class SplitRatioConfig:
 
         # Set split ratio.
         checkpoint = split_ratio.get(CHECKPOINT, CHECKPOINT_DEFAULT)
+        gradient = split_ratio.get(GRADIENT, GRADIENT_DEFAULT)
         parameter = split_ratio.get(PARAMETER, PARAMETER_DEFAULT)
         optimizer = split_ratio.get(OPTIMIZER, OPTIMIZER_DEFAULT)
 
         # Convert percent to float if necessary.
         self.checkpoint = self._percent_to_float(checkpoint)
+        self.gradient = self._percent_to_float(gradient)
         self.parameter = self._percent_to_float(parameter)
         self.optimizer = self._percent_to_float(optimizer)
 
@@ -87,6 +100,7 @@ class SplitRatioConfig:
         return (
             f"{tab_indent}\"{SPLIT_RATIO}\": {LEFT_BRACE}\n"
             f"{tab_indent}\t\"{CHECKPOINT}\": {self.checkpoint},\n"
+            f"{tab_indent}\t\"{GRADIENT}\": {self.gradient},\n"
             f"{tab_indent}\t\"{PARAMETER}\": {self.parameter},\n"
             f"{tab_indent}\t\"{OPTIMIZER}\": {self.optimizer}\n"
             f"{tab_indent}{RIGHT_BRACE}"
@@ -306,12 +320,6 @@ class FlexTrainConfig:
     MUST be provided by user.
     """
 
-    num_layers: int
-    """
-    Number of layers in the given LLM.
-    MUST be provided by user.
-    """
-
     checkpoint_interval: int
     """
     Checkpoint interval used for activation checkpointing.
@@ -336,7 +344,7 @@ class FlexTrainConfig:
     Defaults values will be used if not provided.
     """
 
-    _NECESSARY_KEYS = ["batch_size", "micro_batch_size", "num_layers"]
+    _NECESSARY_KEYS = ["batch_size", "micro_batch_size"]
 
     def __init__(self, config_dict: dict):
         # Assertions.
@@ -349,7 +357,6 @@ class FlexTrainConfig:
         # Set necessary keys.
         self.batch_size = config_dict["batch_size"]
         self.micro_batch_size = config_dict["micro_batch_size"]
-        self.num_layers = config_dict["num_layers"]
 
         # Set remaining keys.
         self.checkpoint_interval = config_dict.get(
@@ -379,7 +386,6 @@ class FlexTrainConfig:
             f"\n> FlexTrain configuration: {LEFT_BRACE}\n"
             f"\t\"batch_size\": {self.batch_size},\n"
             f"\t\"micro_batch_size\": {self.micro_batch_size},\n"
-            f"\t\"num_layers\": {self.num_layers},\n"
             f"\t\"{CHECKPOINT_INTERVAL}\": {self.checkpoint_interval},\n"
             f"{self.split_ratio.to_log(indent=1)},\n"
             f"{self.nvme_swap.to_log(indent=1)},\n"

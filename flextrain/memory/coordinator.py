@@ -212,6 +212,8 @@ class FlexTrainParaCoordinator:
         # Configuration for parameter partition.
         self._config_para_partition(parameters)
 
+        # Number of layers in the model.
+        self._num_layers = 0
         # Number of units in the model.
         self._num_units = 0
         # Map of unit index to its parameters.
@@ -263,6 +265,10 @@ class FlexTrainParaCoordinator:
         return self._initialized
 
     @property
+    def num_layers(self):
+        return self._num_layers
+
+    @property
     def num_units(self):
         return self._num_units
 
@@ -277,10 +283,6 @@ class FlexTrainParaCoordinator:
     @property
     def unit_parameter_map(self):
         return self._unit_parameters
-
-    @property
-    def numel_per_rank(self):
-        return self._aligned_unit_numel // dist.get_world_size()
 
     @property
     def _gpu_inflight_paras(self):
@@ -350,6 +352,7 @@ class FlexTrainParaCoordinator:
 
     def init_unit_parameters(
         self,
+        num_layers: int,
         unit_index: int,
         unit_paras: Iterable[Parameter]
     ):
@@ -358,9 +361,10 @@ class FlexTrainParaCoordinator:
         Parameters are moved into contiguous memory and partitioned.
         The contiguous memory is partitioned as:
         [(GPU, CPU, NVMe), (GPU, CPU, NVMe), ... (GPU, CPU, NVMe)].
-        Each (GPU, CPU, NVMe) is owned by a rank.
+        Each (GPU, CPU, NVMe) is corresponding to a micro-batch.
 
         Args:
+            num_layers (int): Number of layers in the unit.
             unit_index (int): Index of the unit.
             unit_parameters (List[Parameter]): \
                 List of parameters in a unit.
@@ -372,6 +376,8 @@ class FlexTrainParaCoordinator:
         # Initialize memory allocation if not done.
         self._init_coordinator(unit_paras)
 
+        # Update the number of layers.
+        self._num_layers += num_layers
         # Update the number of units.
         self._num_units += 1
 
@@ -436,6 +442,7 @@ class FlexTrainParaCoordinator:
             f"{self._micro_batch_per_rank}\n"
             f"  - device dtype: {self._device_dtype}\n"
             f"  - master dtype: {self._master_dtype}\n"
+            f"  - number of layers: {self._num_layers}\n"
             f"  - number of units: {self._num_units}\n"
             f"  - numel per unit: {self._original_unit_numel}\n"
             f"  - numel per unit aligned: {self._aligned_unit_numel}\n"
@@ -669,6 +676,237 @@ def get_para_coordinator():
     return _PARA_COORDINATOR
 
 
+@dataclass
+class InterLayerTask:
+    unit: int
+    micro_batch: int
+    tensor: Tensor = None
+
+
+def retrieve_tensor(interlayer: Tensor | Tuple[Tensor, ...]) -> Tensor:
+    # If interlayer is a single tensor, return it.
+    if isinstance(interlayer, Tensor):
+        return interlayer
+
+    # Unpack the tuple.
+    # Currently, only one tensor is supported.
+    tar = None
+    for tensor in interlayer:
+        if isinstance(tensor, Tensor):
+            assert tar is None, (
+                "Currently, only one tensor is supported for FlexTrain "
+                "checkpointing. You may consider manually place all "
+                "inter-layer results into a single tensor."
+            )
+            tar = tensor
+
+    assert tar is not None, "No tensor can be found in inter-layer results."
+    return tar
+
+
+class FlexTrainInterLayerCoordinator:
+
+    def __init__(self):
+        # Lazy initialization of checkpoint coordinator.
+        self._initialized = False
+
+    def _init_coordinator(self, tensor: Tensor):
+        # If already initialized, return.
+        if self._initialized:
+            return
+        self._initialized = True
+
+        # Memory lazy allocation.
+        self._mem_allocated = False
+
+        # CUDA streams for async IO operations.
+        self._data_stream = torch.cuda.Stream()
+        # Last task handle.
+        self._inflight_handle: Waitable = DummyHandle()
+
+        # TEMP: pure CPU offloading for now.
+        config = get_flextrain_config()
+        self._num_units = get_para_coordinator().num_units
+        num_micro_batches = config.batch_size // config.micro_batch_size
+        self._micro_batch_per_rank = num_micro_batches // dist.get_world_size()
+        self._num_micro_batches = num_micro_batches
+
+        # Record the tensor shape.
+        self._tensor_shape = tensor.shape
+
+        # Allocate memory for CPU checkpoint buffer.
+        self.cpu_ckpt_base = [_allocate_memory_chunks(
+            tensor.numel(),
+            self._num_micro_batches,
+            torch.float16,
+            torch.device('cpu')
+        ) for _ in range(self._num_units - 1)]
+        self.cpu_grad_base = _allocate_memory_chunks(
+            tensor.numel(),
+            self._num_micro_batches,
+            torch.float16,
+            torch.device('cpu')
+        )
+
+        # Allocate memory for GPU checkpoint buffer.
+        self._gpu_full_ckpts = RotateContainer(
+            _allocate_memory_chunks(
+                tensor.numel(), 2,
+                torch.float16,
+                torch.cuda.current_device()
+            )
+        )
+        # Allocate memory for GPU gradient buffer.
+        self._gpu_full_grads = RotateContainer(
+            _allocate_memory_chunks(
+                tensor.numel(), 2,
+                torch.float16,
+                torch.cuda.current_device()
+            )
+        )
+
+    def _mask_invalid_task(self, task: InterLayerTask):
+        if not self._initialized or task is None:
+            return task
+        unit = task.unit
+        micro_batch = task.micro_batch
+        if unit < 0 or unit >= self._num_units - 1:
+            return None
+        elif micro_batch < 0 or micro_batch >= self._num_micro_batches:
+            return None
+        else:
+            return task
+
+    @property
+    def inflight_layer_ckpt(self):
+        return self._gpu_full_ckpts[0]
+
+    @property
+    def available_layer_ckpt(self):
+        ckpt_mem: Tensor = self._gpu_full_ckpts[1]
+        return ckpt_mem.view(self._tensor_shape)
+
+    @property
+    def inflight_layer_grad(self):
+        return self._gpu_full_grads[0]
+
+    @property
+    def available_layer_grad(self):
+        grad_mem: Tensor = self._gpu_full_grads[1]
+        return grad_mem.view(self._tensor_shape)
+
+    def _sync_pre_forward_micro_batch(self):
+        self._inflight_handle.wait()
+        self._gpu_full_ckpts.rotate()
+
+    def _submit_pre_forward_micro_batch(
+        self,
+        ckpt_prefetch: InterLayerTask = None,
+        ckpt_offload: InterLayerTask = None
+    ):
+        def interlayer_task():
+            if ckpt_prefetch is not None:
+                prefetch_tar: Tensor = self.inflight_layer_ckpt
+                prefetch_src = self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch]
+                prefetch_tar.copy_(prefetch_src, non_blocking=True)
+            if ckpt_offload is not None:
+                offload_tar = self.cpu_ckpt_base[ckpt_offload.unit][ckpt_offload.micro_batch]
+                offload_tar.copy_(ckpt_offload.tensor.flatten(), non_blocking=True)
+
+        _DATA_STREAM.submit(interlayer_task)
+
+        def free_ckpt_memory():
+            if ckpt_offload is not None and ckpt_offload.tensor is not None:
+                free_tensor(ckpt_offload.tensor)
+
+        self._inflight_handle = FunctionHandle(free_ckpt_memory)
+
+    def pre_forward_micro_batch(
+        self,
+        ckpt_prefetch: InterLayerTask = None,
+        ckpt_offload: InterLayerTask = None
+    ):
+        # Mask invalid tasks.
+        ckpt_prefetch = self._mask_invalid_task(ckpt_prefetch)
+        ckpt_offload = self._mask_invalid_task(ckpt_offload)
+
+        # Initialize coordinator if not done.
+        if not self._initialized:
+            if ckpt_offload is not None:
+                self._init_coordinator(ckpt_offload.tensor)
+
+        # If still not initialized, return.
+        if not self._initialized:
+            return
+
+        self._sync_pre_forward_micro_batch()
+        self._submit_pre_forward_micro_batch(ckpt_prefetch, ckpt_offload)
+
+    def _sync_pre_backward_micro_batch(self):
+        self._inflight_handle.wait()
+        self._gpu_full_ckpts.rotate()
+        self._gpu_full_grads.rotate()
+
+    def _submit_pre_backward_micro_batch(
+        self,
+        ckpt_prefetch: InterLayerTask = None,
+        grad_prefetch: InterLayerTask = None,
+        grad_offload: InterLayerTask = None
+    ):
+        def interlayer_task():
+            if ckpt_prefetch is not None:
+                # dist.print_rank0("prefetching ckpt", "unit", ckpt_prefetch.unit, "micro_batch", ckpt_prefetch.micro_batch, "src", self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch][:10])
+                prefetch_tar: Tensor = self.inflight_layer_ckpt
+                prefetch_src = self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch]
+                prefetch_tar.copy_(prefetch_src, non_blocking=True)
+            if grad_prefetch is not None:
+                # dist.print_rank0("prefetching grad", "unit", grad_prefetch.unit, "micro_batch", grad_prefetch.micro_batch, "src", self.cpu_grad_base[grad_prefetch.micro_batch][:10])
+                prefetch_tar: Tensor = self.inflight_layer_grad
+                prefetch_src = self.cpu_grad_base[grad_prefetch.micro_batch]
+                prefetch_tar.copy_(prefetch_src, non_blocking=True)
+            if grad_offload is not None:
+                # dist.print_rank0("offloading grad", "unit", grad_offload.unit, "micro_batch", grad_offload.micro_batch, "src", grad_offload.tensor.flatten()[:10])
+                offload_tar = self.cpu_grad_base[grad_offload.micro_batch]
+                offload_tar.copy_(grad_offload.tensor.flatten(), non_blocking=True)
+
+        _DATA_STREAM.submit(interlayer_task)
+
+        def free_ckpt_memory():
+            if grad_offload is not None and grad_offload.tensor is not None:
+                free_tensor(grad_offload.tensor)
+
+        self._inflight_handle = FunctionHandle(free_ckpt_memory)
+
+    def pre_backward_micro_batch(
+        self,
+        ckpt_prefetch: InterLayerTask = None,
+        grad_prefetch: InterLayerTask = None,
+        grad_offload: InterLayerTask = None
+    ):
+        # Mask invalid tasks.
+        ckpt_prefetch = self._mask_invalid_task(ckpt_prefetch)
+        grad_prefetch = self._mask_invalid_task(grad_prefetch)
+        grad_offload = self._mask_invalid_task(grad_offload)
+
+        self._sync_pre_backward_micro_batch()
+        self._submit_pre_backward_micro_batch(
+            ckpt_prefetch, grad_prefetch, grad_offload
+        )
+
+
+_INTERLAYER_COORDINATOR = FlexTrainInterLayerCoordinator()
+
+
+def get_interlayer_coordinator():
+    """
+    Get the inter-layer coordinator.
+
+    Returns:
+        FlexTrainInterLayerCoordinator: The inter-layer coordinator.
+    """
+    return _INTERLAYER_COORDINATOR
+
+
 class FlexTrainOptCoordinator:
 
     def __init__(self):
@@ -711,7 +949,7 @@ class FlexTrainOptCoordinator:
     def each_numel_num_states(self):
         return self._each_numel_num_states - 1
 
-    def get_unit_gpu_states(self, unit_index: int):
+    def get_unit_gpu_optimizer_states(self, unit_index: int):
         mem_index = self._train_units.index(unit_index)
         return torch.chunk(
             self._gpu_master_opts[mem_index],
@@ -847,33 +1085,33 @@ class FlexTrainOptCoordinator:
         self._device_dtype = config.mixed_precision.device_dtype
         self._master_dtype = config.mixed_precision.master_dtype
 
-        numel_per_rank = para_coordinator.numel_per_rank
-        self._unit_numel = numel_per_rank * dist.get_world_size()
-        self._model_numels = para_coordinator.model_split_numels
-        self._opt_numels = _get_split_numels(
-            numel_per_rank, config.split_ratio.optimizer
-        )
-        self._grad_numels = (
-            self._opt_numels[0],  # GPU optimizer
-            self._opt_numels[1] + self._opt_numels[2]  # CPU optimizer
-        )
-        assert self._model_numels[0] >= self._opt_numels[0], \
-            "GPU parameter ratio should be larger than GPU optimizer ratio."
-        # Plus one for the master parameters.
-        self._each_numel_num_states = each_numel_num_states + 1
+        # numel_per_rank = para_coordinator.numel_per_rank
+        self._unit_numel = para_coordinator.aligned_unit_numel
+        # self._model_numels = para_coordinator.model_split_numels
+        # self._opt_numels = _get_split_numels(
+        #     numel_per_rank, config.split_ratio.optimizer
+        # )
+        # self._grad_numels = (
+        #     self._opt_numels[0],  # GPU optimizer
+        #     self._opt_numels[1] + self._opt_numels[2]  # CPU optimizer
+        # )
+        # assert self._model_numels[0] >= self._opt_numels[0], \
+        #     "GPU parameter ratio should be larger than GPU optimizer ratio."
+        # # Plus one for the master parameters.
+        # self._each_numel_num_states = each_numel_num_states + 1
 
         # Split the optimizer states.
         # We have algorithm splits and memory splits:
         # - algorithm splits: how different states are grouped.
         # - memory splits: how the data is stored in memory hierarchy.
-        gpu_numel = self._opt_numels[0]  # GPU optimizer
-        cpu_numel = self._opt_numels[1] + self._opt_numels[2]  # CPU optimizer
-        self._gpu_alg_splits = [gpu_numel] * self._each_numel_num_states
-        self._cpu_alg_splits = [cpu_numel] * self._each_numel_num_states
-        self._cpu_mem_splits = [
-            self._opt_numels[1] * self._each_numel_num_states,
-            self._opt_numels[2] * self._each_numel_num_states
-        ]
+        # gpu_numel = self._opt_numels[0]  # GPU optimizer
+        # cpu_numel = self._opt_numels[1] + self._opt_numels[2]  # CPU optimizer
+        # self._gpu_alg_splits = [gpu_numel] * self._each_numel_num_states
+        # self._cpu_alg_splits = [cpu_numel] * self._each_numel_num_states
+        # self._cpu_mem_splits = [
+        #     self._opt_numels[1] * self._each_numel_num_states,
+        #     self._opt_numels[2] * self._each_numel_num_states
+        # ]
 
         # 2. Log the optimizer coordinator configurations.
         self.log_configuration()
@@ -881,10 +1119,10 @@ class FlexTrainOptCoordinator:
         # 3. Allocate working memory.
         # a. We need 3 buffers for CPU optimizer states:
         #    prefetch buffer, working buffer, commit buffer.
-        self._cpu_opts_buffer = RotateContainer(_allocate_memory_chunks(
-            cpu_numel * each_numel_num_states, 3,
-            self._master_dtype, torch.device('cpu')
-        ))
+        # self._cpu_opts_buffer = RotateContainer(_allocate_memory_chunks(
+        #     cpu_numel * each_numel_num_states, 3,
+        #     self._master_dtype, torch.device('cpu')
+        # ))
         # b. GPU gradients buffer for backwarding, working at device precision.
         #    receiving buffer, transferring buffer.
         self._gpu_bwd_grads_buffer = RotateContainer(_allocate_memory_chunks(
@@ -893,13 +1131,13 @@ class FlexTrainOptCoordinator:
         ))
         # c. GPU gradients buffer for optimizer, working at master precision.
         #    receiving buffer, working buffer.
-        self._gpu_opt_grads_buffer = RotateContainer(_allocate_memory_chunks(
-            self._grad_numels[0], 2,
-            self._master_dtype, torch.cuda.current_device()
-        ))
+        # self._gpu_opt_grads_buffer = RotateContainer(_allocate_memory_chunks(
+        #     self._grad_numels[0], 2,
+        #     self._master_dtype, torch.cuda.current_device()
+        # ))
 
         # 4. Copy the master parameters.
-        self._copy_master_parameters()
+        # self._copy_master_parameters()
 
     def _prepare_unit_grads(self, unit_index: int):
         """
@@ -957,7 +1195,7 @@ class FlexTrainOptCoordinator:
             #     mem_partition, self._grad_numels
             # )
 
-            default_stream.synchronize()
+            # default_stream.synchronize()
 
             dist.reduce_scatter(
                 mem_partition, src_full_grads,
@@ -1029,170 +1267,3 @@ def get_opt_coordinator():
         FlexTrainOptCoordinator: The optimizer coordinator.
     """
     return _OPT_COORDINATOR
-
-
-@dataclass
-class InterLayerTask:
-    unit: int
-    micro_batch: int
-    tensor: Tensor = None
-    is_dvtn: bool = False
-
-
-def retrieve_tensor(interlayer: Tensor | Tuple[Tensor, ...]) -> Tensor:
-    # If interlayer is a single tensor, return it.
-    if isinstance(interlayer, Tensor):
-        return interlayer
-
-    # Unpack the tuple.
-    # Currently, only one tensor is supported.
-    tar = None
-    for tensor in interlayer:
-        if isinstance(tensor, Tensor):
-            assert tar is None, (
-                "Currently, only one tensor is supported for FlexTrain "
-                "checkpointing. You may consider manually place all "
-                "inter-layer results into a single tensor."
-            )
-            tar = tensor
-
-    assert tar is not None, "No tensor can be found in inter-layer results."
-    return tar
-
-
-class FlexTrainInterLayerCoordinator:
-
-    def __init__(self):
-        # Lazy initialization of checkpoint coordinator.
-        self._initialized = False
-
-    def _init_coordinator(self):
-        # If already initialized, return.
-        if self._initialized:
-            return
-        self._initialized = True
-
-        # Memory lazy allocation.
-        self._mem_allocated = False
-
-        # CUDA streams for async IO operations.
-        self._data_stream = torch.cuda.Stream()
-
-        # TEMP: pure CPU offloading for now.
-        config = get_flextrain_config()
-        batch_per_rank = config.batch_size // dist.get_world_size()
-        self._num_micro_batches = batch_per_rank // config.micro_batch_size
-        self._num_units = get_para_coordinator().num_units
-
-        # Last task handle.
-        self._inflight_handle: Waitable = DummyHandle()
-
-    def _allocate_memory(self, tensor: Tensor):
-        # If memory is already allocated, return.
-        if self._mem_allocated:
-            return
-        self._mem_allocated = True
-
-        # Record the tensor shape.
-        self._tensor_shape = tensor.shape
-
-        # Allocate memory for CPU checkpoint buffer.
-        self.cpu_ckpt_base = [_allocate_memory_chunks(
-            tensor.numel(),
-            self._num_micro_batches,
-            torch.float16,
-            torch.device('cpu')
-        ) for _ in range(self._num_units - 1)]
-
-        # Allocate memory for GPU checkpoint buffer.
-        self._gpu_full_ckpts = RotateContainer(
-            _allocate_memory_chunks(
-                tensor.numel(), 2,
-                torch.float16,
-                torch.cuda.current_device()
-            )
-        )
-
-    def _mask_invalid_task(self, task: InterLayerTask):
-        if task is None:
-            return None
-        unit = task.unit
-        micro_batch = task.micro_batch
-        if unit < 0 or unit >= self._num_units:
-            return None
-        elif micro_batch < 0 or micro_batch >= self._num_micro_batches:
-            return None
-        else:
-            return task
-
-    @property
-    def inflight_layer_ckpt(self):
-        return self._gpu_full_ckpts[0]
-
-    @property
-    def available_layer_ckpt(self):
-        ckpt_mem: Tensor = self._gpu_full_ckpts[1]
-        return ckpt_mem.view(self._tensor_shape)
-
-    def _sync_pre_forward_micro_batch(self):
-        if not self._mem_allocated:
-            return
-
-        self._inflight_handle.wait()
-        self._gpu_full_ckpts.rotate()
-
-    def _submit_pre_forward_micro_batch(
-        self,
-        ckpt_prefetch: InterLayerTask = None,
-        ckpt_offload: InterLayerTask = None
-    ):
-        def interlayer_task():
-            if ckpt_prefetch is not None:
-                prefetch_tar: Tensor = self.inflight_layer_ckpt
-                prefetch_src = self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch]
-                prefetch_tar.copy_(prefetch_src, non_blocking=True)
-            if ckpt_offload is not None:
-                offload_tar = self.cpu_ckpt_base[ckpt_offload.unit][ckpt_offload.micro_batch]
-                offload_tar.copy_(ckpt_offload.tensor.flatten(), non_blocking=True)
-
-        _DATA_STREAM.submit(interlayer_task)
-
-        def free_ckpt_memory():
-            if ckpt_offload is not None and ckpt_offload.tensor is not None:
-                free_tensor(ckpt_offload.tensor)
-
-        self._inflight_handle = FunctionHandle(free_ckpt_memory)
-
-    def pre_forward_micro_batch(
-        self,
-        ckpt_prefetch: InterLayerTask = None,
-        ckpt_offload: InterLayerTask = None
-    ):
-        # Initialize coordinator if not done.
-        self._init_coordinator()
-
-        # Check if the task is valid.
-        ckpt_prefetch = self._mask_invalid_task(ckpt_prefetch)
-        ckpt_offload = self._mask_invalid_task(ckpt_offload)
-
-        # Initialize memory allocation if not done.
-        # Assume that the first task is always about offloading.
-        if not self._mem_allocated and ckpt_offload is not None:
-            assert ckpt_offload.tensor is not None
-            self._allocate_memory(ckpt_offload.tensor)
-
-        self._sync_pre_forward_micro_batch()
-        self._submit_pre_forward_micro_batch(ckpt_prefetch, ckpt_offload)
-
-
-_INTERLAYER_COORDINATOR = FlexTrainInterLayerCoordinator()
-
-
-def get_interlayer_coordinator():
-    """
-    Get the inter-layer coordinator.
-
-    Returns:
-        FlexTrainInterLayerCoordinator: The inter-layer coordinator.
-    """
-    return _INTERLAYER_COORDINATOR

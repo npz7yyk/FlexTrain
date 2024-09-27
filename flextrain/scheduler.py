@@ -20,8 +20,7 @@ class GreedySnakeBlockScheduler:
 
     Arguments:
         micro_batch_per_block (int): Micro batch per block
-        num_layers (int): Number of layers in the given LLM
-        checkpoint_interval (int): Checkpoint interval
+        num_units (int): Number of units in the LLM
     """
 
     def __init__(
