@@ -276,7 +276,6 @@ class FlexTrainEngine(object):
         # Wait for all in-flight operations
         self.data_stream.synchronize()
         # Execute just submitted operations
-        dist.print_rank0(f"\n\nExecute backward unit {task.unit}, micro batch {task.micro_batch}")
         self.data_stream.execute()
 
         # Last unit needs special treatment

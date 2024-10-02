@@ -33,50 +33,35 @@ class SplitRatioConfig:
     Hyperparameters for data split ratio.
     """
 
-    checkpoint: Tuple[float, float]
+    checkpoint: float
     """
     How to split the checkpointed activations among the memory hierarchy.
-    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
-    User can also provide numels of each level as:
-    Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
-    Defaults to (1.0, 0.0) if not provided.
+    Ratio = GPU, CPU = 1 - GPU.
+    Defaults to 1.0 if not provided.
     """
 
-    gradient: Tuple[float, float]
+    gradient: float
     """
     How to split the gradients of activations among the memory hierarchy.
     Note: The gradients are NOT those of the model parameters.
-    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
-    User can also provide numels of each level as:
-    Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
-    Defaults to (1.0, 0.0) if not provided.
+    Ratio = GPU, CPU = 1 - GPU.
+    Defaults to 1.0 if not provided.
     """
 
     parameter: Tuple[float, float]
     """
     How to split the parameters among the memory hierarchy.
     Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
-    User can also provide numels of each level as:
-    Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
     Defaults to (1.0, 0.0) if not provided.
     """
 
     optimizer: Tuple[float, float]
     """
     How to split the optimizer states among the memory hierarchy.
-    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
-    User can also provide numels of each level as:
-    Ratio = (GPU, CPU), and NVMe = TOTAL - GPU - CPU.
     Note: FP32 model parameters are also considered as optimizer states.
+    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
     Defaults to (1.0, 0.0) if not provided.
     """
-
-    def _percent_to_float(self, ratio: Tuple[float, float]):
-        assert len(ratio) >= 2, "Ratio must have at least two elements"
-        if ratio[0] + ratio[1] > 1:
-            return (ratio[0] / 100, ratio[1] / 100)
-        else:
-            return (ratio[0], ratio[1])
 
     def __init__(self, split_ratio: dict):
         # Assertions.
@@ -84,16 +69,10 @@ class SplitRatioConfig:
             "Split ratio configuration must be provided as a dictionary."
 
         # Set split ratio.
-        checkpoint = split_ratio.get(CHECKPOINT, CHECKPOINT_DEFAULT)
-        gradient = split_ratio.get(GRADIENT, GRADIENT_DEFAULT)
-        parameter = split_ratio.get(PARAMETER, PARAMETER_DEFAULT)
-        optimizer = split_ratio.get(OPTIMIZER, OPTIMIZER_DEFAULT)
-
-        # Convert percent to float if necessary.
-        self.checkpoint = self._percent_to_float(checkpoint)
-        self.gradient = self._percent_to_float(gradient)
-        self.parameter = self._percent_to_float(parameter)
-        self.optimizer = self._percent_to_float(optimizer)
+        self.checkpoint = [split_ratio.get(CHECKPOINT, CHECKPOINT_DEFAULT)]
+        self.gradient = [split_ratio.get(GRADIENT, GRADIENT_DEFAULT)]
+        self.parameter = split_ratio.get(PARAMETER, PARAMETER_DEFAULT)
+        self.optimizer = split_ratio.get(OPTIMIZER, OPTIMIZER_DEFAULT)
 
     def to_log(self, indent=0):
         tab_indent = "\t" * indent

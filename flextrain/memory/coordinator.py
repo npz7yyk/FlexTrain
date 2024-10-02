@@ -73,11 +73,14 @@ def _filter_tensors(
     return non_empty_data_ids, non_empty_tensors
 
 
-def _get_split_numels(total_numel: int, ratios: Iterable[float]):
+def _get_split_numels(
+    total_numel: int,
+    ratios: Iterable[float],
+    num_levels: int = 3
+):
     # Ensure the number of levels is 2.
-    NUM_LEVELS = 3
-    if len(ratios) == NUM_LEVELS:
-        ratios = ratios[:NUM_LEVELS - 1]
+    if len(ratios) == num_levels:
+        ratios = ratios[:num_levels - 1]
 
     # User provides integer splits, compute the rest.
     if sum(ratios) > 1 and all(isinstance(r, int) for r in ratios):
@@ -719,30 +722,52 @@ class FlexTrainInterLayerCoordinator:
         # Memory lazy allocation.
         self._mem_allocated = False
 
+        # Record the tensor shape.
+        self._tensor_shape = tensor.shape
+
         # CUDA streams for async IO operations.
-        self._data_stream = torch.cuda.Stream()
+        self._data_stream = get_data_stream()
         # Last task handle.
         self._inflight_handle: Waitable = DummyHandle()
 
-        # TEMP: pure CPU offloading for now.
+        # Initialize coordinator configurations.
         config = get_flextrain_config()
         self._num_units = get_para_coordinator().num_units
         num_micro_batches = config.batch_size // config.micro_batch_size
         self._micro_batch_per_rank = num_micro_batches // dist.get_world_size()
         self._num_micro_batches = num_micro_batches
 
-        # Record the tensor shape.
-        self._tensor_shape = tensor.shape
+        # How to split the checkpoint tensor.
+        self._ckpt_numels = _get_split_numels(
+            tensor.numel(), config.split_ratio.checkpoint, num_levels=2
+        )
+        # How to split the gradient tensor.
+        self._grad_numels = _get_split_numels(
+            tensor.numel(), config.split_ratio.gradient, num_levels=2
+        )
 
-        # Allocate memory for CPU checkpoint buffer.
-        self.cpu_ckpt_base = [_allocate_memory_chunks(
-            tensor.numel(),
+        # Allocate memory for checkpoint.
+        self.gpu_ckpt_base = [_allocate_memory_chunks(
+            self._ckpt_numels[0],
             self._num_micro_batches,
-            torch.float16,
+            config.mixed_precision.device_dtype,
+            torch.cuda.current_device()
+        ) for _ in range(self._num_units - 1)]
+        self.cpu_ckpt_base = [_allocate_memory_chunks(
+            self._ckpt_numels[1],
+            self._num_micro_batches,
+            config.mixed_precision.device_dtype,
             torch.device('cpu')
         ) for _ in range(self._num_units - 1)]
+        # Allocate memory for gradient.
+        self.gpu_grad_base = _allocate_memory_chunks(
+            self._grad_numels[0],
+            self._num_micro_batches,
+            torch.float16,
+            torch.cuda.current_device()
+        )
         self.cpu_grad_base = _allocate_memory_chunks(
-            tensor.numel(),
+            self._grad_numels[1],
             self._num_micro_batches,
             torch.float16,
             torch.device('cpu')
@@ -799,6 +824,22 @@ class FlexTrainInterLayerCoordinator:
         self._inflight_handle.wait()
         self._gpu_full_ckpts.rotate()
 
+    def _prefetch_ckpt(self, task: InterLayerTask):
+        tar = self.inflight_layer_ckpt
+        gpu_tar, cpu_tar = tar.split(self._ckpt_numels)
+        gpu_src = self.gpu_ckpt_base[task.unit][task.micro_batch]
+        cpu_src = self.cpu_ckpt_base[task.unit][task.micro_batch]
+        gpu_tar.copy_(gpu_src, non_blocking=True)
+        cpu_tar.copy_(cpu_src, non_blocking=True)
+
+    def _offload_ckpt(self, task: InterLayerTask):
+        src = task.tensor.flatten()
+        gpu_src, cpu_src = src.split(self._ckpt_numels)
+        gpu_tar = self.gpu_ckpt_base[task.unit][task.micro_batch]
+        cpu_tar = self.cpu_ckpt_base[task.unit][task.micro_batch]
+        gpu_tar.copy_(gpu_src, non_blocking=True)
+        cpu_tar.copy_(cpu_src, non_blocking=True)
+
     def _submit_pre_forward_micro_batch(
         self,
         ckpt_prefetch: InterLayerTask = None,
@@ -806,14 +847,11 @@ class FlexTrainInterLayerCoordinator:
     ):
         def interlayer_task():
             if ckpt_prefetch is not None:
-                prefetch_tar: Tensor = self.inflight_layer_ckpt
-                prefetch_src = self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch]
-                prefetch_tar.copy_(prefetch_src, non_blocking=True)
+                self._prefetch_ckpt(ckpt_prefetch)
             if ckpt_offload is not None:
-                offload_tar = self.cpu_ckpt_base[ckpt_offload.unit][ckpt_offload.micro_batch]
-                offload_tar.copy_(ckpt_offload.tensor.flatten(), non_blocking=True)
+                self._offload_ckpt(ckpt_offload)
 
-        _DATA_STREAM.submit(interlayer_task)
+        self._data_stream.submit(interlayer_task)
 
         def free_ckpt_memory():
             if ckpt_offload is not None and ckpt_offload.tensor is not None:
@@ -847,6 +885,22 @@ class FlexTrainInterLayerCoordinator:
         self._gpu_full_ckpts.rotate()
         self._gpu_full_grads.rotate()
 
+    def _grad_prefetch(self, task: InterLayerTask):
+        tar = self.inflight_layer_grad
+        gpu_tar, cpu_tar = tar.split(self._grad_numels)
+        gpu_src = self.gpu_grad_base[task.micro_batch]
+        cpu_src = self.cpu_grad_base[task.micro_batch]
+        gpu_tar.copy_(gpu_src, non_blocking=True)
+        cpu_tar.copy_(cpu_src, non_blocking=True)
+
+    def _grad_offload(self, task: InterLayerTask):
+        src = task.tensor.flatten()
+        gpu_src, cpu_src = src.split(self._grad_numels)
+        gpu_tar = self.gpu_grad_base[task.micro_batch]
+        cpu_tar = self.cpu_grad_base[task.micro_batch]
+        gpu_tar.copy_(gpu_src, non_blocking=True)
+        cpu_tar.copy_(cpu_src, non_blocking=True)
+
     def _submit_pre_backward_micro_batch(
         self,
         ckpt_prefetch: InterLayerTask = None,
@@ -855,27 +909,19 @@ class FlexTrainInterLayerCoordinator:
     ):
         def interlayer_task():
             if ckpt_prefetch is not None:
-                # dist.print_rank0("prefetching ckpt", "unit", ckpt_prefetch.unit, "micro_batch", ckpt_prefetch.micro_batch, "src", self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch][:10])
-                prefetch_tar: Tensor = self.inflight_layer_ckpt
-                prefetch_src = self.cpu_ckpt_base[ckpt_prefetch.unit][ckpt_prefetch.micro_batch]
-                prefetch_tar.copy_(prefetch_src, non_blocking=True)
+                self._prefetch_ckpt(ckpt_prefetch)
             if grad_prefetch is not None:
-                # dist.print_rank0("prefetching grad", "unit", grad_prefetch.unit, "micro_batch", grad_prefetch.micro_batch, "src", self.cpu_grad_base[grad_prefetch.micro_batch][:10])
-                prefetch_tar: Tensor = self.inflight_layer_grad
-                prefetch_src = self.cpu_grad_base[grad_prefetch.micro_batch]
-                prefetch_tar.copy_(prefetch_src, non_blocking=True)
+                self._grad_prefetch(grad_prefetch)
             if grad_offload is not None:
-                # dist.print_rank0("offloading grad", "unit", grad_offload.unit, "micro_batch", grad_offload.micro_batch, "src", grad_offload.tensor.flatten()[:10])
-                offload_tar = self.cpu_grad_base[grad_offload.micro_batch]
-                offload_tar.copy_(grad_offload.tensor.flatten(), non_blocking=True)
+                self._grad_offload(grad_offload)
 
-        _DATA_STREAM.submit(interlayer_task)
+        self._data_stream.submit(interlayer_task)
 
-        def free_ckpt_memory():
+        def free_grad_memory():
             if grad_offload is not None and grad_offload.tensor is not None:
                 free_tensor(grad_offload.tensor)
 
-        self._inflight_handle = FunctionHandle(free_ckpt_memory)
+        self._inflight_handle = FunctionHandle(free_grad_memory)
 
     def pre_backward_micro_batch(
         self,
