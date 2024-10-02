@@ -36,21 +36,24 @@ class RotateContainer:
 
 def _allocate_memory_chunks(
     numel: int,
-    chunks: int,
+    chunks: int | Tuple[int, ...],
     dtype: torch.dtype,
-    device: torch.device,
-    set_zero: bool = False
+    device: torch.device
 ):
+    # Wrap the chunks into a tuple.
+    if isinstance(chunks, int):
+        chunks = (chunks,)
+
+    # Calculate the total memory size.
+    total_numel = numel
+    for dim in chunks:
+        total_numel *= dim
+
     device = torch.device(device)
-    mem = torch.empty(
-        numel * chunks,
-        dtype=dtype,
-        device=device,
+    return torch.empty(
+        total_numel, dtype=dtype, device=device,
         pin_memory=True if device.type == 'cpu' else False
-    )
-    if set_zero:
-        mem.zero_()
-    return torch.chunk(mem, chunks)
+    ).reshape(*chunks, numel)
 
 
 def _filter_tensors(
@@ -747,29 +750,30 @@ class FlexTrainInterLayerCoordinator:
         )
 
         # Allocate memory for checkpoint.
-        self.gpu_ckpt_base = [_allocate_memory_chunks(
+        self.gpu_ckpt_base = _allocate_memory_chunks(
             self._ckpt_numels[0],
-            self._num_micro_batches,
+            (self._num_units - 1, self._num_micro_batches),
             config.mixed_precision.device_dtype,
             torch.cuda.current_device()
-        ) for _ in range(self._num_units - 1)]
-        self.cpu_ckpt_base = [_allocate_memory_chunks(
+        )
+        self.cpu_ckpt_base = _allocate_memory_chunks(
             self._ckpt_numels[1],
-            self._num_micro_batches,
+            (self._num_units - 1, self._num_micro_batches),
             config.mixed_precision.device_dtype,
             torch.device('cpu')
-        ) for _ in range(self._num_units - 1)]
+        )
+
         # Allocate memory for gradient.
         self.gpu_grad_base = _allocate_memory_chunks(
             self._grad_numels[0],
             self._num_micro_batches,
-            torch.float16,
+            config.mixed_precision.device_dtype,
             torch.cuda.current_device()
         )
         self.cpu_grad_base = _allocate_memory_chunks(
             self._grad_numels[1],
             self._num_micro_batches,
-            torch.float16,
+            config.mixed_precision.device_dtype,
             torch.device('cpu')
         )
 
@@ -777,7 +781,7 @@ class FlexTrainInterLayerCoordinator:
         self._gpu_full_ckpts = RotateContainer(
             _allocate_memory_chunks(
                 tensor.numel(), 2,
-                torch.float16,
+                config.mixed_precision.device_dtype,
                 torch.cuda.current_device()
             )
         )
@@ -785,7 +789,7 @@ class FlexTrainInterLayerCoordinator:
         self._gpu_full_grads = RotateContainer(
             _allocate_memory_chunks(
                 tensor.numel(), 2,
-                torch.float16,
+                config.mixed_precision.device_dtype,
                 torch.cuda.current_device()
             )
         )
