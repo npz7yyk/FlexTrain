@@ -738,7 +738,6 @@ class FlexTrainInterLayerCoordinator:
         self._num_units = get_para_coordinator().num_units
         num_micro_batches = config.batch_size // config.micro_batch_size
         self._micro_batch_per_rank = num_micro_batches // dist.get_world_size()
-        self._num_micro_batches = num_micro_batches
 
         # How to split the checkpoint tensor.
         self._ckpt_numels = _get_split_numels(
@@ -752,13 +751,13 @@ class FlexTrainInterLayerCoordinator:
         # Allocate memory for checkpoint.
         self.gpu_ckpt_base = _allocate_memory_chunks(
             self._ckpt_numels[0],
-            (self._num_units - 1, self._num_micro_batches),
+            (self._num_units - 1, self._micro_batch_per_rank),
             config.mixed_precision.device_dtype,
             torch.cuda.current_device()
         )
         self.cpu_ckpt_base = _allocate_memory_chunks(
             self._ckpt_numels[1],
-            (self._num_units - 1, self._num_micro_batches),
+            (self._num_units - 1, self._micro_batch_per_rank),
             config.mixed_precision.device_dtype,
             torch.device('cpu')
         )
@@ -766,13 +765,13 @@ class FlexTrainInterLayerCoordinator:
         # Allocate memory for gradient.
         self.gpu_grad_base = _allocate_memory_chunks(
             self._grad_numels[0],
-            self._num_micro_batches,
+            self._micro_batch_per_rank,
             config.mixed_precision.device_dtype,
             torch.cuda.current_device()
         )
         self.cpu_grad_base = _allocate_memory_chunks(
             self._grad_numels[1],
-            self._num_micro_batches,
+            self._micro_batch_per_rank,
             config.mixed_precision.device_dtype,
             torch.device('cpu')
         )
@@ -794,6 +793,18 @@ class FlexTrainInterLayerCoordinator:
             )
         )
 
+        # Log the configuration.
+        self.log_configuration()
+
+    def log_configuration(self):
+        rank0_logger.info(
+            "\n\n> "
+            f"FlexTrain inter-layer coordinator initialized "
+            f"with configurations:\n"
+            f"  - checkpoint splits: {self._ckpt_numels}\n"
+            f"  - gradient splits: {self._grad_numels}\n"
+        )
+
     def _mask_invalid_task(self, task: InterLayerTask):
         if not self._initialized or task is None:
             return task
@@ -801,7 +812,7 @@ class FlexTrainInterLayerCoordinator:
         micro_batch = task.micro_batch
         if unit < 0 or unit >= self._num_units - 1:
             return None
-        elif micro_batch < 0 or micro_batch >= self._num_micro_batches:
+        elif micro_batch < 0 or micro_batch >= self._micro_batch_per_rank:
             return None
         else:
             return task
@@ -966,45 +977,6 @@ class FlexTrainOptCoordinator:
     @property
     def is_initialized(self):
         return self._initialized
-
-    @property
-    def _cpu_prefetch_opt_states(self):
-        return self._cpu_opts_buffer[0]
-
-    @property
-    def _cpu_work_opt_states(self):
-        return self._cpu_opts_buffer[1]
-
-    @property
-    def _cpu_commit_opt_states(self):
-        return self._cpu_opts_buffer[2]
-
-    @property
-    def _gpu_bwd_receive_grads(self):
-        return self._gpu_bwd_grads_buffer[0]
-
-    @property
-    def _gpu_bwd_transfer_grads(self):
-        return self._gpu_bwd_grads_buffer[1]
-
-    @property
-    def _gpu_opt_receive_grads(self):
-        return self._gpu_opt_grads_buffer[0]
-
-    @property
-    def _gpu_opt_work_grads(self):
-        return self._gpu_opt_grads_buffer[1]
-
-    @property
-    def each_numel_num_states(self):
-        return self._each_numel_num_states - 1
-
-    def get_unit_gpu_optimizer_states(self, unit_index: int):
-        mem_index = self._train_units.index(unit_index)
-        return torch.chunk(
-            self._gpu_master_opts[mem_index],
-            self._each_numel_num_states
-        )
 
     def _copy_master_parameters(self):
         assert False, "Not implemented yet."
