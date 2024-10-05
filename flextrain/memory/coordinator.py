@@ -186,6 +186,75 @@ def get_data_stream():
     return _DATA_STREAM
 
 
+class NVMeGroup:
+
+    def __init__(self, numels: Tuple[int, ...]):
+        self._numels = numels
+        self._group_numel = sum(numels)
+
+    def _rename(self, prefix: FlexTrainDataID, index: int):
+        return str(prefix) + f".{index}"
+
+    def single_offload(
+        self,
+        prefix: FlexTrainDataID,
+        tensor: Tensor,
+        index: int,
+        async_op: bool = False
+    ) -> Waitable:
+        assert tensor.numel() == self._numels[index]
+        return _nvme_offload(self._rename(prefix, index), tensor, async_op)
+
+    def group_offload(
+        self,
+        prefix: FlexTrainDataID,
+        tensors: Tensor | Iterable[Tensor],
+        async_op: bool = False
+    ) -> Waitable:
+        if isinstance(tensors, Tensor):
+            assert tensors.numel() == self._group_numel, (
+                f"Expected numel={self._group_numel}, "
+                f"got numel={tensors.numel()}"
+            )
+            tensors = torch.split(tensors, self._numels)
+
+        for tensor, numel in zip(tensors, self._numels):
+            assert tensor.numel() == numel
+
+        return _nvme_offload(
+            [self._rename(prefix, i) for i in range(len(tensors))],
+            tensors, async_op
+        )
+
+    def single_reload(
+        self,
+        prefix: FlexTrainDataID,
+        tensor: Tensor,
+        index: int,
+        async_op: bool = False
+    ) -> Waitable:
+        assert tensor.numel() == self._numels[index]
+        return _nvme_reload(self._rename(prefix, index), tensor, async_op)
+
+    def group_reload(
+        self,
+        prefix: FlexTrainDataID,
+        tensors: Tensor | Iterable[Tensor],
+        async_op: bool = False
+    ) -> Waitable:
+        if isinstance(tensors, Tensor):
+            assert tensors.numel() == self._group_numel
+            tensors = torch.split(tensors, self._numels)
+
+        for tensor, numel in zip(tensors, self._numels):
+            assert tensor.numel() == numel
+
+        return _nvme_reload(
+            [self._rename(prefix, i) for i in range(len(tensors))],
+            tensors, async_op
+        )
+
+
 class FlexTrainParaCoordinator:
 
     def __init__(self):
@@ -236,7 +305,7 @@ class FlexTrainParaCoordinator:
         ))
         # Allocate NVMe prefetch buffer in CPU memory.
         self._nvme_prefetch_buffer = RotateContainer(_allocate_memory_chunks(
-            self._micro_batch_para_numels[2] * self._micro_batch_per_rank, 2,
+            self._micro_batch_para_splits[2] * self._micro_batch_per_rank, 2,
             self._device_dtype, torch.device('cpu')
         ))
 
@@ -262,9 +331,46 @@ class FlexTrainParaCoordinator:
             self._aligned_unit_numel // self._num_micro_batches
 
         # How to split the parameters at micro-batch level.
-        self._micro_batch_para_numels = _get_split_numels(
+        self._micro_batch_para_splits = _get_split_numels(
             self._aligned_micro_batch_numel, config.split_ratio.parameter
         )
+
+        # How to split the GPU parameters at micro-batch level.
+        self._micro_batch_gpu_alpha_splits = _get_split_numels(
+            self._micro_batch_para_splits[0],
+            config.split_ratio.alpha, num_levels=2
+        )
+        # How to split the GPU parameters at unit level.
+        self._unit_gpu_alpha_splits = [
+            split * self._micro_batch_per_rank
+            for split in self._micro_batch_gpu_alpha_splits
+        ]
+
+        # How to split the CPU parameters at micro-batch level.
+        self._micro_batch_cpu_alpha_splits = _get_split_numels(
+            self._micro_batch_para_splits[1],
+            config.split_ratio.alpha, num_levels=2
+        )
+        # How to split the CPU parameters at unit level.
+        self._unit_cpu_alpha_splits = [
+            split * self._micro_batch_per_rank
+            for split in self._micro_batch_cpu_alpha_splits
+        ]
+
+        # How to split the NVMe parameters at micro-batch level.
+        self._micro_batch_nvme_alpha_splits = _get_split_numels(
+            self._micro_batch_para_splits[2],
+            config.split_ratio.alpha, num_levels=2
+        )
+        # How to split the NVMe parameters at unit level.
+        self._unit_nvme_alpha_splits = [
+            split * self._micro_batch_per_rank
+            for split in self._micro_batch_nvme_alpha_splits
+        ]
+
+        # NVMe group for offloading and reloading a group of data.
+        # Here it is used for offloading and reloading the NVMe parameters.
+        self._nvme_group = NVMeGroup(self._unit_nvme_alpha_splits)
 
     @property
     def is_initialized(self):
@@ -277,14 +383,6 @@ class FlexTrainParaCoordinator:
     @property
     def num_units(self):
         return self._num_units
-
-    @property
-    def original_unit_numel(self):
-        return self._original_unit_numel
-
-    @property
-    def aligned_unit_numel(self):
-        return self._aligned_unit_numel
 
     @property
     def unit_parameter_map(self):
@@ -389,11 +487,11 @@ class FlexTrainParaCoordinator:
 
         # Allocate parameter bases
         self._gpu_para_base.append(_allocate_memory_chunks(
-            self._micro_batch_para_numels[0], self._micro_batch_per_rank,
+            self._micro_batch_para_splits[0], self._micro_batch_per_rank,
             self._device_dtype, torch.cuda.current_device()
         ))
         self._cpu_para_base.append(_allocate_memory_chunks(
-            self._micro_batch_para_numels[1], self._micro_batch_per_rank,
+            self._micro_batch_para_splits[1], self._micro_batch_per_rank,
             self._device_dtype, torch.device('cpu')
         ))
 
@@ -412,23 +510,34 @@ class FlexTrainParaCoordinator:
         )
 
         # Target memory buffer for each memory type.
-        tar_nvme_partitions = torch.chunk(
-            self._nvme_available_paras,
-            self._micro_batch_per_rank
+        nvme_backward_tar, nvme_forward_tar = torch.split(
+            self._nvme_available_paras, self._unit_nvme_alpha_splits
+        )
+        nvme_backward_partitions = torch.chunk(
+            nvme_backward_tar, self._micro_batch_per_rank
+        )
+        nvme_forward_partitions = torch.chunk(
+            nvme_forward_tar, self._micro_batch_per_rank
         )
         for i, para in enumerate(micro_batch_partitioned_paras):
             # Locate the memory for each rank.
             tar_mem = torch.chunk(para, dist.get_world_size())[dist.get_rank()]
             gpu_view, cpu_view, nvme_view = torch.split(
-                tar_mem, self._micro_batch_para_numels
+                tar_mem, self._micro_batch_para_splits
             )
             # Store the views.
             self._gpu_para_base[unit_index][i].copy_(gpu_view)
             self._cpu_para_base[unit_index][i].copy_(cpu_view)
-            tar_nvme_partitions[i].copy_(nvme_view)
+
+            # Split the NVMe view.
+            nvme_backward_view, nvme_forward_view = torch.split(
+                nvme_view, self._micro_batch_nvme_alpha_splits
+            )
+            nvme_backward_partitions[i].copy_(nvme_backward_view)
+            nvme_forward_partitions[i].copy_(nvme_forward_view)
 
         # Offload the NVMe parameters.
-        _nvme_offload(
+        self._nvme_group.group_offload(
             FlexTrainDataID(unit_index, Dtype.PARA), self._nvme_available_paras
         )
 
@@ -453,8 +562,7 @@ class FlexTrainParaCoordinator:
             f"  - numel per unit: {self._original_unit_numel}\n"
             f"  - numel per unit aligned: {self._aligned_unit_numel}\n"
             f"  - numel per micro-batch: {self._aligned_micro_batch_numel}\n"
-            f"  - micro-batch parameter splits: "
-            f"{self._micro_batch_para_numels}\n"
+            f"  - micro-batch split numels: {self._micro_batch_para_splits}\n"
         )
 
     def _async_load_cpu_paras(self, unit_index: int):
@@ -471,7 +579,7 @@ class FlexTrainParaCoordinator:
         if self._is_invalid_unit(unit_index):
             return DummyHandle()
 
-        return _nvme_reload(
+        return self._nvme_group.group_reload(
             FlexTrainDataID(unit_index, Dtype.PARA),
             self._nvme_inflight_paras, async_op=True
         )
@@ -486,14 +594,8 @@ class FlexTrainParaCoordinator:
         if self._is_invalid_unit(unit_index):
             return
 
-        # 1. Locate the target memory.
-        # 2. Copy parameters from three resources:
-        #    - GPU part from GPU base
-        #    - CPU part from CPU base
-        #    - NVMe part from CPU available buffer
-        # 3. Conduct all-gather into tensor if necessary.
         def load_gpu_para_task():
-            # Locate the target memory.
+            # Basic memory partition.
             tar_full_paras = self._gpu_inflight_paras
             micro_batch_mem = torch.chunk(
                 tar_full_paras, self._micro_batch_per_rank
@@ -501,18 +603,33 @@ class FlexTrainParaCoordinator:
             rank_mem = torch.chunk(
                 micro_batch_mem, dist.get_world_size()
             )[dist.get_rank()]
-            gpu_view, cpu_view, nvme_view = torch.split(
-                rank_mem, self._micro_batch_para_numels
+
+            # Locate the destination memory.
+            gpu_tar, cpu_tar, nvme_tar = torch.split(
+                rank_mem, self._micro_batch_para_splits
             )
-            # Copy parameters from three resources.
+            nvme_backward_tar, nvme_forward_tar = torch.split(
+                nvme_tar, self._micro_batch_nvme_alpha_splits
+            )
+
+            # Locate the source memory.
             gpu_src = self._gpu_para_base[unit_index][micro_batch_index]
             cpu_src = self._cpu_para_base[unit_index][micro_batch_index]
-            nvme_src = torch.chunk(
-                self._nvme_available_paras, self._micro_batch_per_rank
+            nvme_backward, nvme_forward = torch.split(
+                self._nvme_available_paras, self._unit_nvme_alpha_splits
+            )
+            nvme_backward_src = torch.chunk(
+                nvme_backward, self._micro_batch_per_rank
             )[micro_batch_index]
-            gpu_view.copy_(gpu_src, non_blocking=True)
-            cpu_view.copy_(cpu_src, non_blocking=True)
-            nvme_view.copy_(nvme_src, non_blocking=True)
+            nvme_forward_src = torch.chunk(
+                nvme_forward, self._micro_batch_per_rank
+            )[micro_batch_index]
+
+            # Copy parameters and potentially all-gather.
+            gpu_tar.copy_(gpu_src, non_blocking=True)
+            cpu_tar.copy_(cpu_src, non_blocking=True)
+            nvme_backward_tar.copy_(nvme_backward_src, non_blocking=True)
+            nvme_forward_tar.copy_(nvme_forward_src, non_blocking=True)
             dist.all_gather(micro_batch_mem, rank_mem, async_op=True)
 
         # Submit the task to the data stream.
@@ -794,9 +911,6 @@ class FlexTrainInterLayerCoordinator:
         )
 
         # Log the configuration.
-        self.log_configuration()
-
-    def log_configuration(self):
         rank0_logger.info(
             "\n\n> "
             f"FlexTrain inter-layer coordinator initialized "
