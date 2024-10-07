@@ -8,6 +8,7 @@ from flextrain.defaults import (
     GRADIENT, GRADIENT_DEFAULT,
     PARAMETER, PARAMETER_DEFAULT,
     OPTIMIZER, OPTIMIZER_DEFAULT,
+    ALPHA, ALPHA_DEFAULT,
     NVME_SWAP,
     SWAP_DIR, SWAP_DIR_DEFAULT,
     AIO_BLOCK_SIZE, AIO_BLOCK_SIZE_DEFAULT,
@@ -17,6 +18,7 @@ from flextrain.defaults import (
     AIO_OVERLAP_EVENTS, AIO_OVERLAP_EVENTS_DEFAULT,
     MIXED_PRECISION,
     DEVICE_DTYPE, DEVICE_DTYPE_DEFAULT,
+    GRADACC_DTYPE, GRADACC_DTYPE_DEFAULT,
     MASTER_DTYPE, MASTER_DTYPE_DEFAULT,
     DYNAMIC_LOSS_SCALING, DYNAMIC_LOSS_SCALING_DEFAULT,
     INITIAL_SCALE_POWER, INITIAL_SCALE_POWER_DEFAULT,
@@ -43,7 +45,7 @@ class SplitRatioConfig:
     gradient: float
     """
     How to split the gradients of activations among the memory hierarchy.
-    Note: The gradients are NOT those of the model parameters.
+    Note: These gradients are NOT those of the model parameters.
     Ratio = GPU, CPU = 1 - GPU.
     Defaults to 1.0 if not provided.
     """
@@ -63,6 +65,15 @@ class SplitRatioConfig:
     Defaults to (1.0, 0.0) if not provided.
     """
 
+    alpha: float
+    """
+    How to split the CPU optimizer task between backward / forward.
+    Ratio = backward, forward = 1 - backward.
+    Note: ratio is only used when CPU optimizer is needed,
+          and it is expected to be between (0.5, 1).
+    Defaults to 0.75 if not provided.
+    """
+
     def __init__(self, split_ratio: dict):
         # Assertions.
         assert isinstance(split_ratio, dict), \
@@ -73,6 +84,7 @@ class SplitRatioConfig:
         self.gradient = [split_ratio.get(GRADIENT, GRADIENT_DEFAULT)]
         self.parameter = split_ratio.get(PARAMETER, PARAMETER_DEFAULT)
         self.optimizer = split_ratio.get(OPTIMIZER, OPTIMIZER_DEFAULT)
+        self.alpha = [split_ratio.get(ALPHA, ALPHA_DEFAULT)]
 
     def to_log(self, indent=0):
         tab_indent = "\t" * indent
@@ -82,6 +94,7 @@ class SplitRatioConfig:
             f"{tab_indent}\t\"{GRADIENT}\": {self.gradient},\n"
             f"{tab_indent}\t\"{PARAMETER}\": {self.parameter},\n"
             f"{tab_indent}\t\"{OPTIMIZER}\": {self.optimizer}\n"
+            f"{tab_indent}\t\"{ALPHA}\": {self.alpha}\n"
             f"{tab_indent}{RIGHT_BRACE}"
         )
 
@@ -173,6 +186,12 @@ class MixedPercisionConfig:
     Defaults to torch.float16 if not provided.
     """
 
+    gradacc_dtype: torch.dtype
+    """
+    Data type used for gradient accumulation in mixed precision training.
+    Defaults to torch.float32 if not provided.
+    """
+
     master_dtype: torch.dtype
     """
     Data type used for master copy in mixed precision training.
@@ -224,6 +243,8 @@ class MixedPercisionConfig:
         # Set mixed precision settings.
         self.device_dtype = mixed_precision.get(
             DEVICE_DTYPE, DEVICE_DTYPE_DEFAULT)
+        self.gradacc_dtype = mixed_precision.get(
+            GRADACC_DTYPE, GRADACC_DTYPE_DEFAULT)
         self.master_dtype = mixed_precision.get(
             MASTER_DTYPE, MASTER_DTYPE_DEFAULT)
         self.dynamic_loss_scaling = mixed_precision.get(
@@ -259,6 +280,7 @@ class MixedPercisionConfig:
 
         # Convert dtypes to torch.dtype.
         self.device_dtype = _convert_dtype(self.device_dtype)
+        self.gradacc_dtype = _convert_dtype(self.gradacc_dtype)
         self.master_dtype = _convert_dtype(self.master_dtype)
 
     def to_log(self, indent=0):
@@ -266,6 +288,7 @@ class MixedPercisionConfig:
         return (
             f"{tab_indent}\"{MIXED_PRECISION}\": {LEFT_BRACE}\n"
             f"{tab_indent}\t\"{DEVICE_DTYPE}\": \"{self.device_dtype}\",\n"
+            f"{tab_indent}\t\"{GRADACC_DTYPE}\": \"{self.gradacc_dtype}\",\n"
             f"{tab_indent}\t\"{MASTER_DTYPE}\": \"{self.master_dtype}\",\n"
             f"{tab_indent}\t\"{DYNAMIC_LOSS_SCALING}\": "
             f"{self.dynamic_loss_scaling},\n"

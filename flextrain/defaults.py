@@ -36,6 +36,11 @@ OPTIMIZER = "optimizer"
 # Default optimizer split ratio
 OPTIMIZER_DEFAULT = (1.0, 0.0)
 
+# Name of the optimizer step split ratio configuration
+ALPHA = "alpha"
+# Default optimizer step split ratio
+ALPHA_DEFAULT = 0.75
+
 # # --- end of split ratio configuration defaults ---
 
 
@@ -62,7 +67,7 @@ AIO_QUEUE_DEPTH_DEFAULT = 8
 # Name of the NVMe swap thread count configuration
 AIO_THREAD_COUNT = "aio_thread_count"
 # Default number of aio threads
-AIO_THREAD_COUNT_DEFAULT = 1
+AIO_THREAD_COUNT_DEFAULT = 4
 
 # Name of the NVMe swap single submit configuration
 AIO_SINGLE_SUBMIT = "aio_single_submit"
@@ -86,6 +91,11 @@ MIXED_PRECISION = "mixed_precision"
 DEVICE_DTYPE = "device_dtype"
 # Default device dtype
 DEVICE_DTYPE_DEFAULT = torch.float16
+
+# Name of the gradient accumulation dtype configuration
+GRADACC_DTYPE = "gradacc_dtype"
+# Default gradient accumulation dtype
+GRADACC_DTYPE_DEFAULT = torch.float32
 
 # Name of the master dtype configuration
 MASTER_DTYPE = "master_dtype"
