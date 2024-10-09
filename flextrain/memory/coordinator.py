@@ -1186,7 +1186,8 @@ class FlexTrainOptCoordinator:
         # TEMP
         self._data_stream = get_data_stream()
         self._grad_partition = _allocate_memory_chunks(
-            self._unit_numel // dist.get_world_size(), self._num_units,
+            self._unit_numel // dist.get_world_size() // self._micro_batch_per_rank,
+            (self._num_units, self._micro_batch_per_rank),
             gradacc_dtype, torch.cuda.current_device()
         )
 
@@ -1254,11 +1255,12 @@ class FlexTrainOptCoordinator:
         # Link the gradients.
         unit_paras.link_grad_to(grad_buffer)
 
-    def _submit_transfer_grads(self, unit_index: int):
-        """ Launch the async IO operation to transfer gradients for the unit.
+    def _submit_transfer_grads(self, unit_index: int, micro_batch_index: int):
+        """ Launch the async IO operation to transfer gradients.
 
         Args:
             unit_index (int): Index of the unit.
+            micro_batch_index (int): Index of the micro-batch.
 
         Returns:
             None
@@ -1276,7 +1278,12 @@ class FlexTrainOptCoordinator:
 
         def transfer_grads():
             # Locate the target memory.
-            src_full_grads: torch.Tensor = self._gpu_bwd_transfer_grads
+            src_full_grads = torch.chunk(
+                self._gpu_bwd_transfer_grads, self._micro_batch_per_rank
+            )[micro_batch_index]
+            mem_partition = torch.chunk(
+                src_full_grads, dist.get_world_size()
+            )[dist.get_rank()]
 
             # Synchonize with the default stream for the first unit.
             # Because there is no torch.cuda.synchronize() before.
@@ -1284,16 +1291,15 @@ class FlexTrainOptCoordinator:
                 default_stream.synchronize()
 
             # All-reduce the gradients.
-            mem_partition = torch.chunk(
-                src_full_grads, dist.get_world_size()
-            )[dist.get_rank()]
             dist.reduce_scatter(
                 mem_partition, src_full_grads,
                 dist.ReduceOp.AVG
             )
 
             # Copy the gradients to the optimizer working buffer.
-            self._grad_partition[unit_index].copy_(mem_partition)
+            if micro_batch_index == 0:
+                dist.print_rank0(f"Unit {unit_index} mem_partition: {mem_partition[:10]}")
+            self._grad_partition[unit_index][micro_batch_index].copy_(mem_partition)
 
         # Submit the task to the data stream.
         self._data_stream.submit(transfer_grads)
@@ -1318,7 +1324,9 @@ class FlexTrainOptCoordinator:
         if self._gradacc_dtype_incompatible:
             torch.zero_(self._gpu_bwd_extra_grads)
 
-        # TODO: submit gradient transfer task.
+        # Submit gradient transfer task.
+        # It should be about the previous unit.
+        self._submit_transfer_grads(unit_index + 1, micro_batch_index)
 
     def post_micro_batch_backward(
         self, unit_index: int, micro_batch_index: int
@@ -1359,7 +1367,6 @@ class FlexTrainOptCoordinator:
             return
 
         self._gpu_bwd_grads_buffer.rotate()
-        self._submit_transfer_grads(unit_index + 1)
         self._prepare_unit_grads(unit_index)
 
     def clear_backward_pipeline(self):
@@ -1367,7 +1374,8 @@ class FlexTrainOptCoordinator:
         Cleanup the backward pipeline.
         """
         self._gpu_bwd_grads_buffer.rotate()
-        self._submit_transfer_grads(0)
+        for i in range(self._micro_batch_per_rank):
+            self._submit_transfer_grads(0, i)
         self._data_stream.execute()
         self._data_stream.synchronize()
 
