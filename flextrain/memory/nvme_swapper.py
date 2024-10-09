@@ -3,6 +3,13 @@ import torch
 
 from typing import Iterable
 
+from flextrain.defaults import (
+    AIO_BLOCK_SIZE_DEFAULT,
+    AIO_QUEUE_DEPTH_DEFAULT,
+    AIO_THREAD_COUNT_DEFAULT,
+    AIO_SINGLE_SUBMIT_DEFAULT,
+    AIO_OVERLAP_EVENTS_DEFAULT
+)
 from flextrain.memory import (
     FlexTrainDataID,
     Waitable,
@@ -26,11 +33,11 @@ class AsyncNVMeSwapper:
     def __init__(
         self,
         swap_dir: str,
-        aio_block_size: int,
-        aio_queue_depth: int,
-        aio_thread_count: int,
-        aio_single_submit: bool,
-        aio_overlap_events: bool
+        aio_block_size: int = AIO_BLOCK_SIZE_DEFAULT,
+        aio_queue_depth: int = AIO_QUEUE_DEPTH_DEFAULT,
+        aio_thread_count: int = AIO_THREAD_COUNT_DEFAULT,
+        aio_single_submit: bool = AIO_SINGLE_SUBMIT_DEFAULT,
+        aio_overlap_events: bool = AIO_OVERLAP_EVENTS_DEFAULT
     ):
         # Directory to store the swapped tensors
         self.swap_dir = swap_dir
@@ -66,6 +73,8 @@ class AsyncNVMeSwapper:
     ):
         # If data_ids is not iterable, convert it to a list.
         if isinstance(data_ids, FlexTrainDataID):
+            data_ids = [data_ids]
+        if isinstance(data_ids, str):
             data_ids = [data_ids]
         if isinstance(mem_srcs, torch.Tensor):
             mem_srcs = [mem_srcs]

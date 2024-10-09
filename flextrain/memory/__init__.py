@@ -3,7 +3,7 @@ import torch
 from enum import Enum
 from torch import Tensor
 from torch.nn import Parameter
-from typing import Iterable
+from typing import Iterable, List
 
 from flextrain.config import get_flextrain_config
 from flextrain.utils.distributed import get_rank
@@ -33,7 +33,8 @@ class FlexTrainDataID:
         checkpoint_interval = get_flextrain_config().checkpoint_interval
         start = self.unit_index * checkpoint_interval
         end = start + checkpoint_interval - 1
-        layer_str = f"layer{start}-{end}"
+        layer_str = f"layer{start}-{end}" \
+            if checkpoint_interval > 1 else f"layer{start}"
         return (
             f"rank{get_rank()}_"
             f"{layer_str}_"
@@ -78,6 +79,50 @@ def move_into_contiguous(srcs: Iterable[Tensor], dst: Tensor):
 
         # Update the offset.
         offset += numel
+
+
+def copy_segment(srcs: List[torch.Tensor], dsts: List[torch.Tensor]) -> None:
+    """
+    Copies data from a list of source tensors to a list of destination tensors.
+
+    Args:
+        srcs (List[torch.Tensor]): List of source tensors.
+        dsts (List[torch.Tensor]): List of destination tensors.
+    """
+    srcs = [src.flatten() for src in srcs if src.numel() > 0]
+    dsts = [dst.flatten() for dst in dsts if dst.numel() > 0]
+
+    total_src_elements = sum(src.numel() for src in srcs)
+    total_dst_elements = sum(dst.numel() for dst in dsts)
+
+    assert total_src_elements == total_dst_elements
+
+    inner_src_offset = 0
+    inner_dst_offset = 0
+
+    while srcs and dsts:
+        src = srcs[0]
+        dst = dsts[0]
+
+        src_numel = src.numel() - inner_src_offset
+        dst_numel = dst.numel() - inner_dst_offset
+
+        numel_to_copy = min(src_numel, dst_numel)
+
+        src_seg = src[inner_src_offset: inner_src_offset + numel_to_copy]
+        dst_seg = dst[inner_dst_offset: inner_dst_offset + numel_to_copy]
+
+        dst_seg.copy_(src_seg, non_blocking=True)
+
+        inner_src_offset += numel_to_copy
+        inner_dst_offset += numel_to_copy
+
+        if inner_src_offset >= src.numel():
+            inner_src_offset = 0
+            srcs.pop(0)
+        if inner_dst_offset >= dst.numel():
+            inner_dst_offset = 0
+            dsts.pop(0)
 
 
 class ContiguousParaGroup:

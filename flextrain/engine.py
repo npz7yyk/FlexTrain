@@ -106,7 +106,7 @@ class FlexTrainEngine(object):
         # Loss result container
         self.micro_batch_loss_rsts: Dict[int, Sequence[Any]] = {}
 
-        # DEV
+        # Last checkpoint / gradient to offload
         self.ckpt_offload: InterLayerTask = None
         self.grad_offload: InterLayerTask = None
 
@@ -150,16 +150,16 @@ class FlexTrainEngine(object):
         # If the next task is in the same micro batch, prefetch is not needed
         ckpt_prefetch = None if next_task.micro_batch == task.micro_batch \
             else InterLayerTask(next_task.unit - 1, next_task.micro_batch)
-        self.interlayer_coordinator.pre_forward_micro_batch(
+        self.interlayer_coordinator.pre_micro_batch_forward(
             ckpt_prefetch, self.ckpt_offload
         )
         # 2. Prefetch the parameter of the next unit
-        self.para_coordinator.pre_forward_micro_batch(
+        self.para_coordinator.pre_micro_batch_forward(
             task.unit, task.micro_batch
         )
         # Link parameters to memory (prefetch NVMe parameters if needed)
         if scheduler.new_unit_entered:
-            self.para_coordinator.pre_forward_unit(task.unit)
+            self.para_coordinator.pre_unit_forward(task.unit)
         # End of submit prefetching and offloading tasks
 
         # Wait for all in-flight operations
@@ -258,19 +258,22 @@ class FlexTrainEngine(object):
         )
         grad_prefetch = None if next_task.micro_batch == task.micro_batch \
             else InterLayerTask(next_task.unit, next_task.micro_batch)
-        self.interlayer_coordinator.pre_backward_micro_batch(
+        self.interlayer_coordinator.pre_micro_batch_backward(
             ckpt_prefetch, grad_prefetch, self.grad_offload
         )
         # End of submit prefetching the next passed_down
 
         # 2. Prefetch the parameter of the next unit
-        self.para_coordinator.pre_backward_micro_batch(
+        self.para_coordinator.pre_micro_batch_backward(
+            task.unit, task.micro_batch
+        )
+        self.opt_coordinator.pre_micro_batch_backward(
             task.unit, task.micro_batch
         )
         # Link parameters to memory (prefetch NVMe parameters if needed)
         if scheduler.new_unit_entered:
-            self.para_coordinator.pre_backward_unit(task.unit)
-            # self.opt_coordinator.pre_backward_unit(task.unit)
+            self.para_coordinator.pre_unit_backward(task.unit)
+            self.opt_coordinator.pre_unit_backward(task.unit)
         # End of submit prefetching and offloading tasks
 
         # Wait for all in-flight operations
@@ -296,7 +299,6 @@ class FlexTrainEngine(object):
             if passed_back_tensor.numel() == 0:
                 passed_back_tensor.data = \
                     self.interlayer_coordinator.available_layer_grad
-            # dist.print_rank0(f"Passed back: {passed_back_tensor.flatten()[:10]}")
             passed_back = checkpointed_backward(ctx, *passed_back)
 
             # Exclude every layer tensor in the passed back
@@ -340,6 +342,7 @@ class FlexTrainEngine(object):
 
     def train_iteration(self):
         # 1. Conduct reset
+        assert self.data_stream.is_empty()
         self._reset_context()
 
         import time
@@ -359,15 +362,19 @@ class FlexTrainEngine(object):
                 torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
                 self._conduct_backward(task)
                 torch.cuda.nvtx.range_pop()
-        # self.opt_coordinator.clear_backward_pipeline()
+        self.opt_coordinator.clear_backward_pipeline()
+        self.opt_coordinator._calculate_global_grad_norm()
 
         times = sorted(times, reverse=True)
         times = times[5:]
         avg_time = sum(times) / len(times)
-        dist.print_rank_by_rank(avg_time * 1000)
+        # dist.print_rank_by_rank(avg_time * 1000)
 
         for p in self.optimizer.non_layerwise_params:
             dist.print_rank0(p.grad.flatten()[:10])
+            p.grad.zero_()
+
+        exit()
 
         # 3. Conduct optimizer step
         self.optimizer.step()
@@ -380,7 +387,7 @@ class FlexTrainEngine(object):
         if not hasattr(self, 'count'):
             self.count = 0
         self.count += 1
-        if self.count % 10 == 0:
+        if self.count % 30 == 0:
             exit()
 
         return loss_rsts

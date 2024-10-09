@@ -143,10 +143,7 @@ class FlexTrainOptimizer:
 
         # 4. Initialize the optimizer coordinator.
         self.coordinator = get_opt_coordinator()
-        # self.coordinator.initialize(
-        #     self.unit_group_map.keys(),
-        #     each_numel_num_states
-        # )
+        self.coordinator.initialize()
 
     def is_cpu_optimizer_needed(self):
         return get_flextrain_config().split_ratio.optimizer[0] < 1
