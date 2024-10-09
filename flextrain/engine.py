@@ -351,7 +351,8 @@ class FlexTrainEngine(object):
         self._reset_context()
 
         import time
-        times = []
+        times_fwd = []
+        times_bwd = []
 
         # 2. Conduct all tasks assigned by the scheduler
         self.para_coordinator.warmup_forward_pipeline()
@@ -361,19 +362,27 @@ class FlexTrainEngine(object):
                 t_start = time.time()
                 self._conduct_forward(task)
                 t_end = time.time()
-                times.append(t_end - t_start)
+                times_fwd.append(t_end - t_start)
                 torch.cuda.nvtx.range_pop()
             else:
+                t_start = time.time()
                 torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
                 self._conduct_backward(task)
+                t_end = time.time()
+                times_bwd.append(t_end - t_start)
                 torch.cuda.nvtx.range_pop()
         self.opt_coordinator.clear_backward_pipeline()
         self.opt_coordinator._calculate_global_grad_norm()
 
-        times = sorted(times, reverse=True)
+        times = sorted(times_fwd, reverse=True)
         times = times[5:]
         avg_time = sum(times) / len(times)
-        # dist.print_rank_by_rank(avg_time * 1000)
+        dist.print_rank_by_rank(avg_time * 1000)
+
+        times = sorted(times_bwd, reverse=True)
+        times = times[5:]
+        avg_time = sum(times) / len(times)
+        dist.print_rank_by_rank(avg_time * 1000)
 
         for p in self.optimizer.non_layerwise_params:
             dist.print_rank0(p.grad.flatten()[:10])

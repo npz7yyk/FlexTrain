@@ -6,6 +6,7 @@ from torch import Tensor
 from torch.nn import Parameter
 from typing import SupportsIndex, Iterable, Callable, Tuple, List, Dict
 
+from flextrain.checkpointing import set_pre_backward_function
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
     free_tensor,
@@ -1188,7 +1189,7 @@ class FlexTrainOptCoordinator:
         self._grad_partition = _allocate_memory_chunks(
             self._unit_numel // dist.get_world_size() // self._micro_batch_per_rank,
             (self._num_units, self._micro_batch_per_rank),
-            gradacc_dtype, torch.cuda.current_device()
+            gradacc_dtype, torch.device('cpu')
         )
 
     # TMEP
@@ -1198,6 +1199,7 @@ class FlexTrainOptCoordinator:
         for unit in reversed(range(self._num_units)):
             global_grad_norm += self._grad_partition[unit].norm() ** 2
             dist.print_rank0(f"Rank {dist.get_rank()} layer {unit} grad norm: {global_grad_norm.item()}")
+        torch.save(self._grad_partition, f"/shared_ssd_storage/yikang/FlexTrain/logs/cpu/grad_norm_{dist.get_rank()}.pt")
         dist.all_reduce(global_grad_norm, op=dist.ReduceOp.SUM)
         dist.print_rank0(global_grad_norm.item())
         return global_grad_norm.item()
@@ -1297,8 +1299,8 @@ class FlexTrainOptCoordinator:
             )
 
             # Copy the gradients to the optimizer working buffer.
-            if micro_batch_index == 0:
-                dist.print_rank0(f"Unit {unit_index} mem_partition: {mem_partition[:10]}")
+            # if micro_batch_index == 0:
+            #     dist.print_rank0(f"Unit {unit_index} mem_partition: {mem_partition[:10]}")
             self._grad_partition[unit_index][micro_batch_index].copy_(mem_partition)
 
         # Submit the task to the data stream.
@@ -1326,7 +1328,11 @@ class FlexTrainOptCoordinator:
 
         # Submit gradient transfer task.
         # It should be about the previous unit.
-        self._submit_transfer_grads(unit_index + 1, micro_batch_index)
+        # Trick: We submit and execute the task after recomputation.
+        def pre_micro_batch_backward_task():
+            self._submit_transfer_grads(unit_index + 1, micro_batch_index)
+            self._data_stream.execute()
+        set_pre_backward_function(pre_micro_batch_backward_task)
 
     def post_micro_batch_backward(
         self, unit_index: int, micro_batch_index: int
