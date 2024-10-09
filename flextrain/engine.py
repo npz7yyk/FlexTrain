@@ -312,6 +312,11 @@ class FlexTrainEngine(object):
             task.unit - 1, task.micro_batch, retrieve_tensor(passed_back)
         ) if not scheduler.in_first_unit else None
 
+        # Conduct gradient accumulation
+        self.opt_coordinator.post_micro_batch_backward(
+            task.unit, task.micro_batch
+        )
+
     def override_loss_scale(self, loss_scale: float):
         self.custom_loss_scaler = True
         self.external_loss_scale = loss_scale

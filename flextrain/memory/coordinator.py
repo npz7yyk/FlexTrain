@@ -1137,10 +1137,11 @@ class FlexTrainOptCoordinator:
         # Configuration for mixed precision.
         device_dtype = config.mixed_precision.device_dtype
         gradacc_dtype = config.mixed_precision.gradacc_dtype
-        self._gpu_extra_grad_buffer = device_dtype != gradacc_dtype
+        self._gradacc_dtype_incompatible = device_dtype != gradacc_dtype
 
         # Configuration for optimizer partition.
         self._unit_numel = para._aligned_unit_numel
+        self._micro_batch_per_rank = para._micro_batch_per_rank
 
         self._mb_gpu_para_alpha_splits = para._micro_batch_gpu_alpha_splits
         self._mb_cpu_para_alpha_splits = para._micro_batch_cpu_alpha_splits
@@ -1176,7 +1177,7 @@ class FlexTrainOptCoordinator:
 
         # If gradacc_dtype is different from device_dtype,
         # we need an extra buffer for backward gradients.
-        if self._gpu_extra_grad_buffer:
+        if self._gradacc_dtype_incompatible:
             self._gpu_bwd_extra_grads = torch.empty(
                 self._unit_numel, dtype=device_dtype,
                 device=torch.cuda.current_device()
@@ -1241,10 +1242,14 @@ class FlexTrainOptCoordinator:
         # Get the unit parameters.
         unit_paras = self._unit_parameters[unit_index]
 
-        # Get the gradients.
-        grad_buffer = self._gpu_bwd_extra_grads if \
-            self._gpu_extra_grad_buffer else self._gpu_bwd_receive_grads
-        torch.zero_(grad_buffer)
+        # Get the gradient buffer.
+        if self._gradacc_dtype_incompatible:
+            grad_buffer = self._gpu_bwd_extra_grads
+        else:
+            grad_buffer = self._gpu_bwd_receive_grads
+
+        # Zero the receive buffer.
+        torch.zero_(self._gpu_bwd_receive_grads)
 
         # Link the gradients.
         unit_paras.link_grad_to(grad_buffer)
@@ -1261,14 +1266,6 @@ class FlexTrainOptCoordinator:
         # Check if the unit is valid.
         if self._is_invalid_unit(unit_index):
             return
-
-        # Gradients are ready for transfer.
-        self._gpu_bwd_grads_buffer.rotate()
-
-        # Copy the gradients to the transfer buffer.
-        # Temporary solution for the extra buffer.
-        src_full_grads = self._gpu_bwd_transfer_grads
-        src_full_grads.copy_(self._gpu_bwd_extra_grads)
 
         # 1. Locate the target memory.
         # 2. Conduct all-reduce into tensor if necessary.
@@ -1301,33 +1298,10 @@ class FlexTrainOptCoordinator:
         # Submit the task to the data stream.
         self._data_stream.submit(transfer_grads)
 
-        self._inflight_grad_handle = (
-            unit_index, DummyHandle()
-        )
-
-    def _synchronize_transfer_grads(self, unit_index: int):
-        """ Synchronize the transfer of gradients for the unit.
-
-        Args:
-            unit_index (int): Index of the unit.
-
-        Returns:
-            None
-        """
-        # Check if the unit is valid.
-        if self._is_invalid_unit(unit_index):
-            return
-
-        # Wait for the async IO operation to finish.
-        inflight_unit, handle = self._inflight_grad_handle
-        assert inflight_unit == unit_index, (
-            f"Async IO operation is not for this unit: "
-            f"unit_index={unit_index} != inflight_unit={inflight_unit}"
-        )
-        handle.wait()
-
-    def pre_micro_batch_backward(self, unit_index: int, micro_batch_index: int):
-        """ Submit the prefetching task for the given micro-batch in backward pass.
+    def pre_micro_batch_backward(
+        self, unit_index: int, micro_batch_index: int
+    ):
+        """ Submit tasks for the given micro-batch in backward pass.
 
         Args:
             unit_index (int): Index of the unit.
@@ -1340,8 +1314,33 @@ class FlexTrainOptCoordinator:
         if self._is_invalid_unit(unit_index):
             return
 
-        # Submit the prefetching task for the micro-batch.
-        self._submit_transfer_grads(unit_index)
+        # Zero the extra buffer if necessary.
+        if self._gradacc_dtype_incompatible:
+            torch.zero_(self._gpu_bwd_extra_grads)
+
+        # TODO: submit gradient transfer task.
+
+    def post_micro_batch_backward(
+        self, unit_index: int, micro_batch_index: int
+    ):
+        """ Conduct post-processing after the backward of the micro-batch.
+
+        Args:
+            unit_index (int): Index of the unit.
+            micro_batch_index (int): Index of the micro-batch.
+
+        Returns:
+            None
+        """
+        # Check if the unit is valid.
+        if self._is_invalid_unit(unit_index):
+            return
+
+        # If the gradients are not compatible with the device dtype,
+        # we need explicitly accumulate the gradients.
+        if self._gradacc_dtype_incompatible:
+            gradacc_buffer = self._gpu_bwd_receive_grads
+            gradacc_buffer += self._gpu_bwd_extra_grads
 
     def pre_unit_backward(self, unit_index: int):
         """ Prepare the unit for backward pass.
@@ -1359,7 +1358,7 @@ class FlexTrainOptCoordinator:
         if self._is_invalid_unit(unit_index):
             return
 
-        self._synchronize_transfer_grads(unit_index + 2)
+        self._gpu_bwd_grads_buffer.rotate()
         self._submit_transfer_grads(unit_index + 1)
         self._prepare_unit_grads(unit_index)
 
@@ -1367,7 +1366,7 @@ class FlexTrainOptCoordinator:
         """
         Cleanup the backward pipeline.
         """
-        self._synchronize_transfer_grads(1)
+        self._gpu_bwd_grads_buffer.rotate()
         self._submit_transfer_grads(0)
         self._data_stream.execute()
         self._data_stream.synchronize()
