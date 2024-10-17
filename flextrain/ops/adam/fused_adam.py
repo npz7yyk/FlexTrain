@@ -79,7 +79,6 @@ class FusedAdam(torch.optim.Optimizer):
         )
         super(FusedAdam, self).__init__(params, defaults)
         self.adam_w_mode = 1 if adam_w_mode else 0
-        self.set_grad_none = set_grad_none
 
         fused_adam_cuda = FusedAdamBuilder().load()
         # Skip buffer
@@ -88,16 +87,8 @@ class FusedAdam(torch.optim.Optimizer):
         )
         self.multi_tensor_adam = fused_adam_cuda.multi_tensor_adam
 
-    def link_layerwise_parameters(self, param_states: List[Tuple[Tensor]]):
-        # Link optimizer buffers to related parameters
-        for p, m, v in param_states:
-            state = self.state[p]
-            state['step'] = 0
-            state['exp_avg'] = m
-            state['exp_avg_sq'] = v
-
-    def zero_grad(self):
-        if self.set_grad_none:
+    def zero_grad(self, set_to_none=True):
+        if set_to_none:
             for group in self.param_groups:
                 for p in group['params']:
                     p.grad = None
@@ -135,6 +126,8 @@ class FusedAdam(torch.optim.Optimizer):
 
             for p in group['params']:
                 if p.grad is None:
+                    continue
+                if p.numel() == 0:
                     continue
                 if p.grad.data.is_sparse:
                     raise RuntimeError(

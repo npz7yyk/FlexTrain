@@ -10,7 +10,7 @@ from .defaults import (
     TORCH_DISTRIBUTED_INIT_METHOD_DEFAULT,
     PROCESS_GROUP_TIMEOUT_DEFAULT
 )
-from .engine import FlexTrainEngine
+from .engine import LRScheduler, FlexTrainEngine
 from .llm_func import set_llm_func, LLMFunc         # noqa: F401
 from .memory.initializer import Init                # noqa: F401
 from .optimizer import FlexTrainOptimizer
@@ -51,6 +51,7 @@ def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
 def initialize(
     model: torch.nn.Module,
     optimizer: FlexTrainOptimizer,
+    lr_scheduler: LRScheduler = None,
     config: dict = None,
     dist_init_required=False,
     dist_backend=TORCH_DISTRIBUTED_BACKEND_DEFAULT,
@@ -74,6 +75,10 @@ def initialize(
         )
 
     # Wrap the model with FlexTrainEngine
-    model = FlexTrainEngine(model, optimizer)
+    model = FlexTrainEngine(
+        model=model,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler
+    )
 
     return model

@@ -5,7 +5,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from torch import Tensor
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory.coordinator import (
@@ -27,7 +27,8 @@ class FlexTrainOptimizer:
     Args:
         param_groups (List[Dict]): A list where each dictionary contains
             the parameters and their respective arguments.
-        each_numel_num_states (int): The number of states for each parameter.
+        opt_state_per_element (int): \
+            The number of optimizer states per element in the optimizer.
 
     Attributes:
         param_groups (List[Dict]): A list where each dictionary contains
@@ -41,7 +42,7 @@ class FlexTrainOptimizer:
             responsible for managing the optimization process.
     """
 
-    def __init__(self, param_groups: List[Dict], each_numel_num_states):
+    def __init__(self, param_groups: List[Dict], opt_state_per_element: int):
         # Ensure that the param_groups is a list of dictionaries.
         # So that the parameters keep the same order across processes.
         assert isinstance(param_groups, list)
@@ -56,16 +57,17 @@ class FlexTrainOptimizer:
             "rather than a list of parameters."
         )
         self.param_groups = param_groups
+        self.opt_state_per_element = opt_state_per_element
 
         self.param_group_map: Dict[Tensor, Dict] = {}
-        param_orders = {}
+        param_id_map: Dict[Tensor, int] = {}
         for group in param_groups:
             # Ensure parameters are stored in a list.
             assert isinstance(group[PARAMS_KEY], list)
             # Store the group for each parameter
             for param in group[PARAMS_KEY]:
                 self.param_group_map[param] = group
-                param_orders[param] = len(param_orders)
+                param_id_map[param] = len(param_id_map)
 
         # 2. Try to group the parameters by their unit index.
         #    Find non-layerwise parameters and group them.
@@ -98,13 +100,16 @@ class FlexTrainOptimizer:
                         "All parameters in a unit should be in the same group."
             # The whole unit is not under training.
             if group is None:
-                continue
+                assert NotImplementedError, (
+                    "FlexTrain currently only supports training "
+                    "all the parameters in the model."
+                )
             # Link the unit index to the group.
             self.unit_group_map[i] = group
 
         # Convert the non-layerwise parameters to a list.
         self.non_layerwise_params = list(self.non_layerwise_params)
-        self.non_layerwise_params.sort(key=lambda p: param_orders[p])
+        self.non_layerwise_params.sort(key=lambda p: param_id_map[p])
 
         # End of grouping parameters.
 
@@ -125,7 +130,6 @@ class FlexTrainOptimizer:
 
         # Create / link the master parameters.
         offset = 0
-        self._master_non_layerwise_params: List[Tensor] = []
         for param in self.non_layerwise_params:
             param.data = param.data.to(
                 device=torch.cuda.current_device(), dtype=device_dtype
@@ -135,36 +139,27 @@ class FlexTrainOptimizer:
             param.grad = self._device_grads[offset:end].view_as(param)
             master_param.grad = self._master_grads[offset:end].view_as(param)
             offset = offset + param.numel()
-
-            # Link to the master parameters.
-            self._master_non_layerwise_params.append(master_param)
-
         # End of allocating GPU memory for non-layerwise gradients.
 
         # 4. Initialize the optimizer coordinator.
-        self.coordinator = get_opt_coordinator()
-        self.coordinator.initialize()
+        coordinator = get_opt_coordinator()
+        coordinator.initialize(self.cpu_optimizer, self.opt_state_per_element)
 
     def is_cpu_optimizer_needed(self):
         return get_flextrain_config().split_ratio.optimizer[0] < 1
 
-    @property
-    def gpu_layerwise_states(self):
-        # Note: it is not necessary to keep the unit order.
-        return [
-            self.coordinator.get_unit_gpu_states(unit)
-            for unit in self.unit_group_map.keys()
-        ]
-
     def step(self, closure=None):
-        """ TODO """
         # Perform the optimization step of non-layerwise parameters.
 
         # 1. Conduct all-reduce for the gradients of non-layerwise parameters.
         dist.all_reduce(self._device_grads, op=dist.ReduceOp.AVG)
-        return
 
-        self.gpu_optimizer.step(closure)
+        # 2. Conduct the optimization step for the non-layerwise parameters.
+        # self.gpu_optimizer.step(closure)
+        self.gpu_optimizer.zero_grad(set_to_none=False)
+
+    def update_state(self):
+        self.cpu_optimizer.update_state()
 
 
 @dataclass
@@ -177,7 +172,7 @@ class FlexTrainCPUOptimizer(ABC):
 
     def __init__(self, unit_group_map: Dict[int, Dict]):
         self._executor = ThreadPoolExecutor(max_workers=1)
-        self._future: Future = None
+        self._future: Tuple[int, int, Future] = None
         self._unit_group_map = unit_group_map
 
         # Initialize the state for each unit.
@@ -187,27 +182,50 @@ class FlexTrainCPUOptimizer(ABC):
             self.state[unit] = {STEP_KEY: 0}
 
     @abstractmethod
-    def unit_step(self, step: int, args: Dict, opt_tar: OptTar):
+    def _step(self, step: int, args: Dict, opt_tar: OptTar):
         pass
 
-    def synchronize(self):
+    def synchronize_micro_batch_step(
+        self,
+        unit_index: int,
+        micro_batch_index: int
+    ):
         if self._future is None:
             return
-        self._future.result()
+
+        last_unit_index, last_micro_batch_index, future = self._future
+        assert unit_index == last_unit_index
+        assert micro_batch_index == last_micro_batch_index
+        future.result()
         self._future = None
 
-    def submit_unit_step(self, unit_index: int, opt_tar: OptTar):
+    def update_state(self):
+        for unit in self._unit_group_map:
+            self.state[unit][STEP_KEY] += 1
+
+    def _submit_micro_batch_step(
+        self,
+        unit_index: int,
+        micro_batch_index: int,
+        opt_tar: OptTar
+    ):
         assert unit_index in self._unit_group_map, (
             "The unit index is not in the unit group map."
         )
 
         # Submit the step function to the executor.
-        self._future = self._executor.submit(
-            self.unit_step,
+        future = self._executor.submit(
+            self._step,
             self.state[unit_index][STEP_KEY],
             self._unit_group_map[unit_index],
             opt_tar
         )
+        self._future = (unit_index, micro_batch_index, future)
 
-        # Update the step count.
-        self.state[unit_index][STEP_KEY] += 1
+    @abstractmethod
+    def submit_micro_batch_step(
+        self, unit_index: int, micro_batch_index: int,
+        para: torch.Tensor, grad: torch.Tensor,
+        *args, **kwargs
+    ):
+        pass

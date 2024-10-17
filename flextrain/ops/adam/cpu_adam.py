@@ -126,7 +126,7 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
             group.setdefault('amsgrad', False)
 
     @torch.no_grad()
-    def unit_step(self, step: int, args: Dict, opt_tar: AdamOptTar):
+    def _step(self, step: int, args: Dict, opt_tar: AdamOptTar):
         beta1, beta2 = args['betas']
         self.cpu_adam.adam_update(
             self.opt_id, step, args['lr'],
@@ -135,3 +135,11 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
             opt_tar.para.data, opt_tar.grad.data,
             opt_tar.exp_avg.data, opt_tar.exp_avg_sq.data
         )
+
+    def submit_micro_batch_step(
+        self, unit_index: int, micro_batch_index: int,
+        para: torch.Tensor, grad: torch.Tensor,
+        exp_avg: torch.Tensor, exp_avg_sq: torch.Tensor
+    ):
+        opt_tar = AdamOptTar(para, grad, exp_avg, exp_avg_sq)
+        self._submit_micro_batch_step(unit_index, micro_batch_index, opt_tar)

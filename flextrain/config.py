@@ -67,11 +67,9 @@ class SplitRatioConfig:
 
     alpha: float
     """
-    How to split the CPU optimizer task between backward / forward.
-    Ratio = backward, forward = 1 - backward.
-    Note: ratio is only used when CPU optimizer is needed,
-          and it is expected to be between (0.5, 1).
-    Defaults to 0.75 if not provided.
+    How to split the CPU optimizer task between forward and backward.
+    Ratio = forward, backward = 1 - forward.
+    Defaults to 0.25 if not provided.
     """
 
     def __init__(self, split_ratio: dict):

@@ -1,7 +1,7 @@
 import torch
 
 from torch.nn import Module
-from typing import Any, Sequence, Tuple, List, Dict
+from typing import Any, Callable, Sequence, Tuple, List, Dict
 
 from flextrain import distributed as dist
 from flextrain.checkpointing import (
@@ -26,6 +26,11 @@ from flextrain.optimizer import FlexTrainOptimizer
 from flextrain.scheduler import LLMTask, GreedySnakeBlockScheduler
 
 
+class LRScheduler:
+    def step(self, **kwargs):
+        pass
+
+
 class FlexTrainEngine(object):
     """
     FlexTrainEngine is designed to maximize the training throughput.
@@ -35,7 +40,8 @@ class FlexTrainEngine(object):
     def __init__(
         self,
         model: Module,
-        optimizer: FlexTrainOptimizer
+        optimizer: FlexTrainOptimizer,
+        lr_scheduler: LRScheduler = None
     ):
         super().__init__()
 
@@ -53,11 +59,11 @@ class FlexTrainEngine(object):
         )
         self.optimizer = optimizer
 
-        # Link to parameter & optimizer coordinators
+        # Link to parameter, interlayer and optimizer coordinator.
         self.data_stream = get_data_stream()
         self.para_coordinator = get_para_coordinator()
-        self.opt_coordinator = get_opt_coordinator()
         self.interlayer_coordinator = get_interlayer_coordinator()
+        self.opt_coordinator = get_opt_coordinator()
 
         # LLM training information
         self.micro_batch_per_batch = self._compute_micro_batch_per_batch()
@@ -73,6 +79,12 @@ class FlexTrainEngine(object):
         self.custom_loss_scaler = False
         self.loss_scaler = create_loss_scaler()
 
+        # Link to lr_scheduler
+        self.lr_scheduler = lr_scheduler
+
+        # Post-forward / pre-backward functions
+        self.delayed_functions: List[Callable] = []
+
     def _compute_micro_batch_per_batch(self):
         config = get_flextrain_config()
         batch_size = config.batch_size
@@ -83,9 +95,6 @@ class FlexTrainEngine(object):
         return batch_size // (micro_batch_size * world_size)
 
     def _reset_context(self):
-        # Micro batch pre-inputs
-        # self.micro_batch_pre_inputs: Dict[int, Tuple] = {}
-
         # Recent passed down container
         self.micro_batch_passed_down: Dict[int, Tuple] = {}
         # Recent passed back container
@@ -200,6 +209,9 @@ class FlexTrainEngine(object):
     @torch.enable_grad()
     def _conduct_last_unit(self, task: LLMTask):
         config = get_flextrain_config()
+
+        # 0. Conduct post-forward / pre-backward functions
+        self._dalayed_step()
 
         # 1. Conduct forward of the last unit
         passed_down = self.micro_batch_passed_down[task.micro_batch]
@@ -336,8 +348,32 @@ class FlexTrainEngine(object):
     def dynamic_loss_scaling(self):
         return self.loss_scaler.dynamic
 
-    def step(self):
+    def step(
+        self, *,  # Enforce keyword-only arguments
+        lr_kwargs: Dict = None
+    ):
+        # Conduct on the spot tasks
+        pass
+        # End of on the spot tasks
+
+        # Submit delayed tasks
+        def _update_lr():
+            if self.lr_scheduler is not None and lr_kwargs is not None:
+                self.lr_scheduler.step(**lr_kwargs)
+
+        self.delayed_functions.append(_update_lr)
+        self.delayed_functions.append(self.optimizer.update_state)
+        # End of submit delayed tasks
+
         return
+
+    def _dalayed_step(self):
+        # Conduct delayed tasks
+        for func in self.delayed_functions:
+            func()
+
+        # Clear delayed tasks
+        self.delayed_functions.clear()
 
     def train(self):
         self.model.train()
@@ -371,8 +407,8 @@ class FlexTrainEngine(object):
                 t_end = time.time()
                 times_bwd.append(t_end - t_start)
                 torch.cuda.nvtx.range_pop()
+        self.para_coordinator.clear_backward_pipeline()
         self.opt_coordinator.clear_backward_pipeline()
-        self.opt_coordinator._calculate_global_grad_norm()
 
         times = sorted(times_fwd, reverse=True)
         times = times[5:]
@@ -386,9 +422,6 @@ class FlexTrainEngine(object):
 
         for p in self.optimizer.non_layerwise_params:
             dist.print_rank0(p.grad.flatten()[:10])
-            p.grad.zero_()
-
-        exit()
 
         # 3. Conduct optimizer step
         self.optimizer.step()
@@ -401,7 +434,7 @@ class FlexTrainEngine(object):
         if not hasattr(self, 'count'):
             self.count = 0
         self.count += 1
-        if self.count % 30 == 0:
+        if self.count % 10 == 0:
             exit()
 
         return loss_rsts

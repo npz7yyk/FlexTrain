@@ -39,7 +39,7 @@ OPTIMIZER_DEFAULT = (1.0, 0.0)
 # Name of the optimizer step split ratio configuration
 ALPHA = "alpha"
 # Default optimizer step split ratio
-ALPHA_DEFAULT = 0.75
+ALPHA_DEFAULT = 0.25
 
 # # --- end of split ratio configuration defaults ---
 

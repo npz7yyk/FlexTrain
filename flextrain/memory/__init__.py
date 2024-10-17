@@ -81,13 +81,19 @@ def move_into_contiguous(srcs: Iterable[Tensor], dst: Tensor):
         offset += numel
 
 
-def copy_segment(srcs: List[torch.Tensor], dsts: List[torch.Tensor]) -> None:
-    """
-    Copies data from a list of source tensors to a list of destination tensors.
+def copy_segment(
+    srcs: List[torch.Tensor],
+    dsts: List[torch.Tensor],
+    force_equal: bool = True
+) -> None:
+    """ Copies from a list of source tensors to a list of destination tensors.
 
     Args:
         srcs (List[torch.Tensor]): List of source tensors.
         dsts (List[torch.Tensor]): List of destination tensors.
+        force_equal (bool, optional): \
+            Whether to force the total number of elements in the source \
+            and destination tensors to be equal. Defaults to True.
     """
     srcs = [src.flatten() for src in srcs if src.numel() > 0]
     dsts = [dst.flatten() for dst in dsts if dst.numel() > 0]
@@ -95,7 +101,8 @@ def copy_segment(srcs: List[torch.Tensor], dsts: List[torch.Tensor]) -> None:
     total_src_elements = sum(src.numel() for src in srcs)
     total_dst_elements = sum(dst.numel() for dst in dsts)
 
-    assert total_src_elements == total_dst_elements
+    if force_equal:
+        assert total_src_elements == total_dst_elements
 
     inner_src_offset = 0
     inner_dst_offset = 0
