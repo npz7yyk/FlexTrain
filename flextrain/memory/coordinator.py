@@ -1,6 +1,9 @@
 import gc
 import torch
 
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass
 from math import ceil
 from torch import Tensor
@@ -1105,6 +1108,78 @@ def get_interlayer_coordinator():
     return _INTERLAYER_COORDINATOR
 
 
+@dataclass
+class OptTarget(ABC):
+    para: Tensor
+    grad: Tensor
+
+
+STEP_KEY = "step"
+
+
+class FlexTrainCPUOptimizer(ABC):
+
+    def __init__(self, unit_group_map: Dict[int, Dict]):
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._future: Tuple[int, int, Future] = None
+        self._unit_group_map = unit_group_map
+
+        # Initialize the state for each unit.
+        if not hasattr(self, "state"):
+            self.state = defaultdict(dict)
+        for unit in unit_group_map:
+            self.state[unit] = {STEP_KEY: 0}
+
+    @abstractmethod
+    def _step(self, step: int, args: Dict, opt_target: OptTarget):
+        pass
+
+    def synchronize_micro_batch_step(
+        self,
+        unit_index: int,
+        micro_batch_index: int
+    ):
+        if self._future is None:
+            return
+
+        last_unit_index, last_micro_batch_index, future = self._future
+        assert unit_index == last_unit_index
+        assert micro_batch_index == last_micro_batch_index
+        future.result()
+        self._future = None
+
+    def update_state(self):
+        for unit in self._unit_group_map:
+            self.state[unit][STEP_KEY] += 1
+
+    def _submit_micro_batch_step(
+        self,
+        unit_index: int,
+        micro_batch_index: int,
+        opt_target: OptTarget
+    ):
+        assert unit_index in self._unit_group_map, (
+            "The unit index is not in the unit group map."
+        )
+
+        # Submit the step function to the executor.
+        future = self._executor.submit(
+            self._step,
+            self.state[unit_index][STEP_KEY],
+            self._unit_group_map[unit_index],
+            opt_target
+        )
+        self._future = (unit_index, micro_batch_index, future)
+
+    @abstractmethod
+    def submit_micro_batch_step(
+        self, unit_index: int, micro_batch_index: int,
+        para: torch.Tensor, grad: torch.Tensor,
+        *args, **kwargs
+    ):
+        pass
+
+
 class FlexTrainOptCoordinator:
 
     def __init__(self):
@@ -1145,7 +1220,7 @@ class FlexTrainOptCoordinator:
 
     def initialize(
         self,
-        cpu_optimizer,
+        cpu_optimizer: FlexTrainCPUOptimizer,
         opt_state_per_element: int
     ):
         # 0. Before initialization:

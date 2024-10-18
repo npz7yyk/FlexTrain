@@ -1,22 +1,18 @@
 import torch
 
-from abc import ABC, abstractmethod
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, Future
-from dataclasses import dataclass
 from torch import Tensor
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory.coordinator import (
     get_para_coordinator,
-    get_opt_coordinator
+    get_opt_coordinator,
+    FlexTrainCPUOptimizer
 )
 from flextrain.utils import dist
 
 
 PARAMS_KEY = "params"
-STEP_KEY = "step"
 
 
 class FlexTrainOptimizer:
@@ -160,72 +156,3 @@ class FlexTrainOptimizer:
 
     def update_state(self):
         self.cpu_optimizer.update_state()
-
-
-@dataclass
-class OptTar(ABC):
-    para: Tensor
-    grad: Tensor
-
-
-class FlexTrainCPUOptimizer(ABC):
-
-    def __init__(self, unit_group_map: Dict[int, Dict]):
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._future: Tuple[int, int, Future] = None
-        self._unit_group_map = unit_group_map
-
-        # Initialize the state for each unit.
-        if not hasattr(self, "state"):
-            self.state = defaultdict(dict)
-        for unit in unit_group_map:
-            self.state[unit] = {STEP_KEY: 0}
-
-    @abstractmethod
-    def _step(self, step: int, args: Dict, opt_tar: OptTar):
-        pass
-
-    def synchronize_micro_batch_step(
-        self,
-        unit_index: int,
-        micro_batch_index: int
-    ):
-        if self._future is None:
-            return
-
-        last_unit_index, last_micro_batch_index, future = self._future
-        assert unit_index == last_unit_index
-        assert micro_batch_index == last_micro_batch_index
-        future.result()
-        self._future = None
-
-    def update_state(self):
-        for unit in self._unit_group_map:
-            self.state[unit][STEP_KEY] += 1
-
-    def _submit_micro_batch_step(
-        self,
-        unit_index: int,
-        micro_batch_index: int,
-        opt_tar: OptTar
-    ):
-        assert unit_index in self._unit_group_map, (
-            "The unit index is not in the unit group map."
-        )
-
-        # Submit the step function to the executor.
-        future = self._executor.submit(
-            self._step,
-            self.state[unit_index][STEP_KEY],
-            self._unit_group_map[unit_index],
-            opt_tar
-        )
-        self._future = (unit_index, micro_batch_index, future)
-
-    @abstractmethod
-    def submit_micro_batch_step(
-        self, unit_index: int, micro_batch_index: int,
-        para: torch.Tensor, grad: torch.Tensor,
-        *args, **kwargs
-    ):
-        pass

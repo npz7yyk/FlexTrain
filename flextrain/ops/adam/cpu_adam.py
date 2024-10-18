@@ -11,13 +11,13 @@ from dataclasses import dataclass
 from typing import Dict
 
 from flextrain.config import get_flextrain_config
-from flextrain.utils import rank0_logger
+from flextrain.memory.coordinator import OptTarget, FlexTrainCPUOptimizer
 from flextrain.ops.op_builder import CPUAdamBuilder
-from flextrain.optimizer import OptTar, FlexTrainCPUOptimizer
+from flextrain.utils import rank0_logger
 
 
 @dataclass
-class AdamOptTar(OptTar):
+class AdamOptTarget(OptTarget):
     exp_avg: torch.Tensor
     exp_avg_sq: torch.Tensor
 
@@ -126,14 +126,14 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
             group.setdefault('amsgrad', False)
 
     @torch.no_grad()
-    def _step(self, step: int, args: Dict, opt_tar: AdamOptTar):
+    def _step(self, step: int, args: Dict, opt_target: AdamOptTarget):
         beta1, beta2 = args['betas']
         self.cpu_adam.adam_update(
             self.opt_id, step, args['lr'],
             beta1, beta2, args['eps'],
             args['weight_decay'], args['bias_correction'],
-            opt_tar.para.data, opt_tar.grad.data,
-            opt_tar.exp_avg.data, opt_tar.exp_avg_sq.data
+            opt_target.para.data, opt_target.grad.data,
+            opt_target.exp_avg.data, opt_target.exp_avg_sq.data
         )
 
     def submit_micro_batch_step(
@@ -141,5 +141,7 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
         para: torch.Tensor, grad: torch.Tensor,
         exp_avg: torch.Tensor, exp_avg_sq: torch.Tensor
     ):
-        opt_tar = AdamOptTar(para, grad, exp_avg, exp_avg_sq)
-        self._submit_micro_batch_step(unit_index, micro_batch_index, opt_tar)
+        self._submit_micro_batch_step(
+            unit_index, micro_batch_index,
+            AdamOptTarget(para, grad, exp_avg, exp_avg_sq)
+        )

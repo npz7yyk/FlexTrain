@@ -5,7 +5,6 @@
 # Commit: 0d9cfa0
 # License: Apache-2.0
 
-import os
 from .builder import CPUOpBuilder
 
 
