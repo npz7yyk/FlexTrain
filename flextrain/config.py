@@ -62,7 +62,7 @@ class SplitRatioConfig:
     How to split the optimizer states among the memory hierarchy.
     Note: FP32 model parameters are also considered as optimizer states.
     Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
-    Defaults to (1.0, 0.0) if not provided.
+    Defaults to (0.0, 1.0) if not provided.
     """
 
     alpha: float

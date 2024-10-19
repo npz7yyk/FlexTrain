@@ -6,7 +6,6 @@ from typing import List, Dict
 from flextrain.config import get_flextrain_config
 from flextrain.memory.coordinator import (
     get_para_coordinator,
-    get_opt_coordinator,
     FlexTrainCPUOptimizer
 )
 from flextrain.utils import dist
@@ -136,13 +135,6 @@ class FlexTrainOptimizer:
             master_param.grad = self._master_grads[offset:end].view_as(param)
             offset = offset + param.numel()
         # End of allocating GPU memory for non-layerwise gradients.
-
-        # 4. Initialize the optimizer coordinator.
-        coordinator = get_opt_coordinator()
-        coordinator.initialize(self.cpu_optimizer, self.opt_state_per_element)
-
-    def is_cpu_optimizer_needed(self):
-        return get_flextrain_config().split_ratio.optimizer[0] < 1
 
     def step(self, closure=None):
         # Perform the optimization step of non-layerwise parameters.

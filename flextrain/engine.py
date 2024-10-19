@@ -64,6 +64,10 @@ class FlexTrainEngine(object):
         self.para_coordinator = get_para_coordinator()
         self.interlayer_coordinator = get_interlayer_coordinator()
         self.opt_coordinator = get_opt_coordinator()
+        self.opt_coordinator.initialize(
+            self.optimizer.cpu_optimizer,
+            self.optimizer.opt_state_per_element
+        )
 
         # LLM training information
         self.micro_batch_per_batch = self._compute_micro_batch_per_batch()
@@ -348,6 +352,9 @@ class FlexTrainEngine(object):
     def dynamic_loss_scaling(self):
         return self.loss_scaler.dynamic
 
+    def _warmup_forward_pipeline(self):
+        self.para_coordinator.warmup_forward_pipeline()
+
     def step(
         self, *,  # Enforce keyword-only arguments
         lr_kwargs: Dict = None
@@ -391,7 +398,8 @@ class FlexTrainEngine(object):
         times_bwd = []
 
         # 2. Conduct all tasks assigned by the scheduler
-        self.para_coordinator.warmup_forward_pipeline()
+        # self.para_coordinator.warmup_forward_pipeline()
+        self._warmup_forward_pipeline()
         for task in self.scheduler:
             if task.is_forwarding:
                 torch.cuda.nvtx.range_push(f"Forward unit {task.unit}")
