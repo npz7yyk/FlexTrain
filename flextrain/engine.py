@@ -14,8 +14,8 @@ from flextrain.checkpointing import (
 from flextrain.config import get_flextrain_config
 from flextrain.llm_func import LLMFunc, retrieve_llm_loss
 from flextrain.loss_scaler import create_loss_scaler
+from flextrain.memory import get_data_stream
 from flextrain.memory.coordinator import (
-    get_data_stream,
     get_para_coordinator,
     get_opt_coordinator,
     get_interlayer_coordinator,
@@ -214,8 +214,10 @@ class FlexTrainEngine(object):
     def _conduct_last_unit(self, task: LLMTask):
         config = get_flextrain_config()
 
-        # 0. Conduct post-forward / pre-backward functions
+        # 0.1 Conduct post-forward / pre-backward functions
         self._dalayed_step()
+        # 0.2 Finalize the optimizer coordinator if needed
+        self.opt_coordinator.finalize_alpha_split()
 
         # 1. Conduct forward of the last unit
         passed_down = self.micro_batch_passed_down[task.micro_batch]

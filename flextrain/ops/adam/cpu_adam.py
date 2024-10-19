@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from typing import Dict
 
 from flextrain.config import get_flextrain_config
-from flextrain.memory.coordinator import OptTarget, FlexTrainCPUOptimizer
+from flextrain.optimizer import (
+    OptTarget,
+    FlexTrainCPUOptimizer
+)
 from flextrain.ops.op_builder import CPUAdamBuilder
 from flextrain.utils import rank0_logger
 

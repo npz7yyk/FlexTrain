@@ -1,9 +1,11 @@
+import gc
 import torch
 
 from enum import Enum
+from math import ceil
 from torch import Tensor
 from torch.nn import Parameter
-from typing import Iterable, List
+from typing import SupportsIndex, Iterable, Callable, Tuple, List
 
 from flextrain.config import get_flextrain_config
 from flextrain.utils.distributed import get_rank
@@ -220,3 +222,107 @@ class FusedHandle(Waitable):
     def _wait_task(self):
         for handle in self._handles:
             handle.wait()
+
+
+class RotateContainer:
+    def __init__(self, items: Tuple):
+        self._items = list(items)
+
+    def __getitem__(self, index: SupportsIndex):
+        return self._items[index]
+
+    def rotate(self):
+        self._items.append(self._items.pop(0))
+
+
+def allocate_memory_chunks(
+    numel: int,
+    chunks: int | Tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device
+):
+    # Wrap the chunks into a tuple.
+    if isinstance(chunks, int):
+        chunks = (chunks,)
+
+    # Calculate the total memory size.
+    total_numel = numel
+    for dim in chunks:
+        total_numel *= dim
+
+    # Try to free the memory before allocation.
+    device = torch.device(device)
+    if device.type == 'cpu':
+        gc.collect()
+    else:
+        torch.cuda.empty_cache()
+
+    return torch.empty(
+        total_numel, dtype=dtype, device=device,
+        pin_memory=True if device.type == 'cpu' else False
+    ).reshape(*chunks, numel)
+
+
+def get_split_numels(
+    total_numel: int,
+    ratios: Iterable[float],
+    num_levels: int = 3,
+    aligned_numel: int = 4096
+):
+    # Ensure the number of levels is 2.
+    if len(ratios) == num_levels:
+        ratios = ratios[:num_levels - 1]
+
+    # User provides integer splits, compute the rest.
+    if sum(ratios) > 1 and all(isinstance(r, int) for r in ratios):
+        numels = ratios + [total_numel - sum(ratios)]
+        return tuple(numels)
+
+    # Try to avoid the last one being 0.
+    numels = [
+        ceil(r * total_numel / aligned_numel) * aligned_numel
+        for r in ratios
+    ]
+    if sum(numels) > total_numel:
+        numels[-1] -= sum(numels) - total_numel
+    numels.append(total_numel - sum(numels))
+    return tuple(numels)
+
+
+class FlexTrainDataStream:
+
+    def __init__(self):
+        self._stream = torch.cuda.Stream()
+        self._tasks: List[Callable] = []
+
+    def is_empty(self):
+        return len(self._tasks) == 0
+
+    def submit(self, task):
+        self._tasks.append(task)
+
+    def execute(self):
+        with torch.cuda.stream(self._stream):
+            for task in self._tasks:
+                task()
+        self._tasks.clear()
+
+    def synchronize(self):
+        torch.cuda.synchronize()
+
+
+_DATA_STREAM: FlexTrainDataStream = None
+
+
+def get_data_stream():
+    """
+    Get the data stream for async IO operations.
+
+    Returns:
+        FlexTrainDataStream: The data stream.
+    """
+    # Lazy initialization of the data stream
+    global _DATA_STREAM
+    if _DATA_STREAM is None:
+        _DATA_STREAM = FlexTrainDataStream()
+    return _DATA_STREAM

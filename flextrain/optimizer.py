@@ -4,8 +4,9 @@ from torch import Tensor
 from typing import List, Dict
 
 from flextrain.config import get_flextrain_config
-from flextrain.memory.coordinator import (
-    get_para_coordinator,
+from flextrain.memory.coordinator import get_para_coordinator
+from flextrain.memory.coordinator.optimizer import (  # noqa: F401
+    OptTarget,
     FlexTrainCPUOptimizer
 )
 from flextrain.utils import dist

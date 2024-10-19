@@ -224,7 +224,7 @@ class MixedPercisionConfig:
     consecutive_hysteresis: bool
     """
     whether to refill the hysteresis if we reach an iteration
-    that doesn’t overflow. Defaults to False if not provided.
+    that doesn't overflow. Defaults to False if not provided.
     """
 
     min_loss_scale: float
