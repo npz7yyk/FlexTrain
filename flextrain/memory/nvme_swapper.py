@@ -117,7 +117,7 @@ def _filter_tensors(
     data_ids: FlexTrainDataID | Iterable[FlexTrainDataID],
     tensors: Tensor | Iterable[Tensor]
 ):
-    if isinstance(data_ids, FlexTrainDataID):
+    if isinstance(data_ids, (FlexTrainDataID, str)):
         data_ids = [data_ids]
     if isinstance(tensors, Tensor):
         tensors = [tensors]
