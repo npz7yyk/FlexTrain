@@ -214,11 +214,6 @@ class FlexTrainEngine(object):
     def _conduct_last_unit(self, task: LLMTask):
         config = get_flextrain_config()
 
-        # 0.1 Conduct post-forward / pre-backward functions
-        self._dalayed_step()
-        # 0.2 Finalize the optimizer coordinator if needed
-        self.opt_coordinator.finalize_alpha_split()
-
         # 1. Conduct forward of the last unit
         passed_down = self.micro_batch_passed_down[task.micro_batch]
         every_layer = self.micro_batch_every_layer[task.micro_batch]
@@ -354,7 +349,7 @@ class FlexTrainEngine(object):
     def dynamic_loss_scaling(self):
         return self.loss_scaler.dynamic
 
-    def _warmup_forward_pipeline(self):
+    def _warmup_pipeline(self):
         self.para_coordinator.warmup_forward_pipeline()
 
     def step(
@@ -399,26 +394,35 @@ class FlexTrainEngine(object):
         times_fwd = []
         times_bwd = []
 
+        self._warmup_pipeline()
+
         # 2. Conduct all tasks assigned by the scheduler
-        # self.para_coordinator.warmup_forward_pipeline()
-        self._warmup_forward_pipeline()
+        # Forward
         for task in self.scheduler:
-            if task.is_forwarding:
-                torch.cuda.nvtx.range_push(f"Forward unit {task.unit}")
-                t_start = time.time()
-                self._conduct_forward(task)
-                t_end = time.time()
-                times_fwd.append(t_end - t_start)
-                torch.cuda.nvtx.range_pop()
-            else:
-                t_start = time.time()
-                torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
-                self._conduct_backward(task)
-                t_end = time.time()
-                times_bwd.append(t_end - t_start)
-                torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push(f"Forward unit {task.unit}")
+            t_start = time.time()
+            self._conduct_forward(task)
+            t_end = time.time()
+            times_fwd.append(t_end - t_start)
+            torch.cuda.nvtx.range_pop()
+
+        # Conduct delayed step
+        self._dalayed_step()
+        # Finalize the optimizer coordinator if needed
+        self.opt_coordinator.finalize_alpha_split()
+
+        # Backward
+        for task in self.scheduler:
+            t_start = time.time()
+            torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
+            self._conduct_backward(task)
+            t_end = time.time()
+            times_bwd.append(t_end - t_start)
+            torch.cuda.nvtx.range_pop()
+
         self.para_coordinator.clear_backward_pipeline()
         self.opt_coordinator.clear_backward_pipeline()
+        norm = self.opt_coordinator._calculate_global_grad_norm()
 
         times = sorted(times_fwd, reverse=True)
         times = times[5:]
@@ -435,6 +439,14 @@ class FlexTrainEngine(object):
 
         # 3. Conduct optimizer step
         self.optimizer.step()
+
+        # norm = torch.tensor([norm], device='cuda')
+        # dist.all_reduce(norm)
+        for p in self.optimizer.non_layerwise_params:
+            dist.print_rank0(p.grad.float().norm() ** 2)
+            norm += (p.grad.float().norm() ** 2).item()
+
+        dist.print_rank0(norm)
 
         # 4. Return the loss results
         loss_rsts = []

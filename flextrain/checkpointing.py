@@ -316,7 +316,8 @@ def retrieve_tensor_grads(
 
 # Function to run before the backward pass.
 # Typically used for communication.
-_PRE_BACKWARD_FUNCTION: Callable = lambda: None
+def _PRE_BACKWARD_FUNCTION():
+    pass
 
 
 def set_pre_backward_function(func: Callable):

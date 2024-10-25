@@ -83,7 +83,7 @@ def move_into_contiguous(srcs: Iterable[Tensor], dst: Tensor):
         offset += numel
 
 
-def copy_segment(
+def copy_segments(
     srcs: List[torch.Tensor],
     dsts: List[torch.Tensor],
     force_equal: bool = True
