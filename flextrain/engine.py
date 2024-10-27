@@ -170,9 +170,15 @@ class FlexTrainEngine(object):
         self.para_coordinator.pre_micro_batch_forward(
             task.unit, task.micro_batch
         )
+        # 3. Conduct forward part of the optimizer
+        self.opt_coordinator.pre_micro_batch_forward(
+            task.unit, task.micro_batch
+        )
         # Link parameters to memory (prefetch NVMe parameters if needed)
+        # Conduct NVMe parameter updating
         if scheduler.new_unit_entered:
             self.para_coordinator.pre_unit_forward(task.unit)
+            self.opt_coordinator.pre_unit_forward(task.unit)
         # End of submit prefetching and offloading tasks
 
         # Wait for all in-flight operations
