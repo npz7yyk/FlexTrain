@@ -162,6 +162,7 @@ class FlexTrainOptCoordinator:
         cpu_optimizer: FlexTrainCPUOptimizer,
         opt_state_per_element: int
     ):
+        return
         # 0. Before initialization:
         # Ensure that the parameter coordinator is initialized.
         para = get_para_coordinator()
@@ -211,9 +212,6 @@ class FlexTrainOptCoordinator:
         self._mb_gpu_para_alpha_splits = para._micro_batch_gpu_alpha_splits
         self._mb_cpu_para_alpha_splits = para._micro_batch_cpu_alpha_splits
         self._mb_nvme_para_alpha_splits = para._micro_batch_nvme_alpha_splits
-        self._unit_gpu_para_alpha_splits = para._unit_gpu_alpha_splits
-        self._unit_cpu_para_alpha_splits = para._unit_cpu_alpha_splits
-        self._unit_nvme_para_alpha_splits = para._unit_nvme_alpha_splits
 
         # Calculate the parameter numels of forward and backward.
         self._forward_numel = \
