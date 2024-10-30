@@ -65,6 +65,9 @@ class GreedySnakeBlockScheduler:
             cur_micro_batch = cur_micro_batch
         return LLMTask(cur_micro_batch, cur_unit)
 
+    def reset(self):
+        self.cur_task_num = 0
+
     @property
     def new_unit_entered(self):
         return self.cur_task_num % self._num_micro_batch == 0
@@ -89,3 +92,10 @@ class GreedySnakeBlockScheduler:
             return self._generate_task(0)
         else:
             return self._generate_task(self.cur_task_num + 1)
+
+    def kth_next_forward_task(self, k):
+        task_num = self.cur_task_num + k
+        if task_num >= self._num_fwd_task:
+            return None  # Out of bound, only used for forward pipeline
+        else:
+            return self._generate_task(self.cur_task_num + k)

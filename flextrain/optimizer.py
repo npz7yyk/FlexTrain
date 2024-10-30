@@ -145,7 +145,7 @@ class FlexTrainOptimizer:
 
         # 2. Conduct the optimization step for the non-layerwise parameters.
         # self.gpu_optimizer.step(closure)
-        self.gpu_optimizer.zero_grad(set_to_none=False)
+        # self.gpu_optimizer.zero_grad(set_to_none=False)
 
     def update_state(self):
         self.cpu_optimizer.update_state()
