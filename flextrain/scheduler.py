@@ -6,11 +6,11 @@ class LLMTask:
     """ FlexTrain LLM Task.
 
     Arguments:
-        micro_batch (int): Micro batch index in the batch
         unit (int): Unit index in the LLM to be executed
+        micro_batch (int): Micro batch index in the batch to be executed
     """
-    micro_batch: int
     unit: int
+    micro_batch: int
 
 
 class GreedySnakeBlockScheduler:
@@ -37,7 +37,6 @@ class GreedySnakeBlockScheduler:
         if self._in_forward:
             self.cur_task_num = 0
 
-        # Forward
         while True:
             yield self.curr_task
             self.cur_task_num += 1
@@ -50,23 +49,28 @@ class GreedySnakeBlockScheduler:
                     self._in_forward = True
                     break
 
-    def _generate_task(self, cur_task_num):
+    def _generate_task(self, cur_task_num, force_forward=False):
         # Calculate the current unit
         cur_unit = cur_task_num // self._num_micro_batch
         is_forwarding = cur_unit < self._num_unit - 1
-        if not is_forwarding:
+        if not is_forwarding and not force_forward:
             cur_unit = 2 * self._num_unit - 2 - cur_unit
 
         # Calculate the current micro batch
         cur_micro_batch = cur_task_num % self._num_micro_batch
-        if cur_unit & 1:
+        if (cur_unit + self._in_warmup) & 1:
             cur_micro_batch = self._num_micro_batch - 1 - cur_micro_batch
         else:
             cur_micro_batch = cur_micro_batch
-        return LLMTask(cur_micro_batch, cur_unit)
+        return LLMTask(cur_unit, cur_micro_batch)
 
-    def reset(self):
+    def enter_warmup_stage(self):
         self.cur_task_num = 0
+        self._in_warmup = True
+
+    def exit_warmup_stage(self):
+        self.cur_task_num = 0
+        self._in_warmup = False
 
     @property
     def new_unit_entered(self):
@@ -94,8 +98,4 @@ class GreedySnakeBlockScheduler:
             return self._generate_task(self.cur_task_num + 1)
 
     def kth_next_forward_task(self, k):
-        task_num = self.cur_task_num + k
-        if task_num >= self._num_fwd_task:
-            return None  # Out of bound, only used for forward pipeline
-        else:
-            return self._generate_task(self.cur_task_num + k)
+        return self._generate_task(self.cur_task_num + k, True)

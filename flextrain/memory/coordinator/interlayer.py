@@ -16,14 +16,13 @@ from flextrain.memory import (
     get_data_stream
 )
 from flextrain.memory.coordinator import get_para_coordinator
+from flextrain.scheduler import LLMTask
 from flextrain.utils import dist
 from flextrain.utils.logging import rank0_logger
 
 
 @dataclass
-class InterLayerTask:
-    unit: int
-    micro_batch: int
+class InterLayerTask(LLMTask):
     tensor: Tensor = None
 
 

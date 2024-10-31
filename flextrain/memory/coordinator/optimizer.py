@@ -105,13 +105,11 @@ def _convert_dtype_view(
 
 
 @dataclass
-class MicroBatchTask:
+class MicroBatchTask(LLMTask):
     forward: bool
-    unit_index: int
-    micro_batch_index: int
 
 
-class FlexTrainOptCoordinator:
+class FlexTrainOptsCoordinator:
     TRANSFER_OPTS = 0
     RECOVER_GRAD = 0
     TRANSFER_GRAD = 0
@@ -180,6 +178,11 @@ class FlexTrainOptCoordinator:
         return micro_batch_index < 0 or \
             micro_batch_index >= self._micro_batch_per_rank
 
+    def _is_invalid_task(self, task: LLMTask):
+        return task is None or \
+            self._is_invalid_unit(task.unit) or \
+            self._is_invalid_micro_batch(task.micro_batch)
+
     def initialize(
         self,
         cpu_optimizer: FlexTrainCPUOptimizer,
@@ -192,12 +195,6 @@ class FlexTrainOptCoordinator:
             "Parameter coordinator must be initialized before init_optimizer."
         )
         self._para = para
-        # Ensure that the optimizer coordinator is not initialized yet.
-        assert not self._initialized, (
-            "Optimizer coordinator is already initialized."
-        )
-        self._initialized = True
-        self._finalized = False
 
         # Link the optimizer to the coordinator.
         self._optimizer = cpu_optimizer
@@ -444,15 +441,15 @@ class FlexTrainOptCoordinator:
         # 1. transfer_opts + recover_grad / transfer_grad
         # 2. optimizer_step + None / offload_grad
         # 3. update_opts + update_para
-        # 4. para_offload
+        # 4. None / para_offload
         self._inflight_task_queue: deque[MicroBatchTask] = deque(maxlen=4)
         self._inflight_task_set: Set[Waitable] = set()
 
-    def _finalize_alpha_split(self):
-        # If the coordinator is already finalized, return.
-        if self._finalized:
+    def _initialize_alpha_split(self):
+        # If the coordinator is already initialized, return.
+        if self._initialized:
             return
-        self._finalized = True
+        self._initialized = True
 
         # Ensure that the parameter coordinator is initialized.
         para = get_para_coordinator()
@@ -645,15 +642,52 @@ class FlexTrainOptCoordinator:
         unit_index: int,
         micro_batch_index: int
     ):
-        # Submit the task to the task queue.
-        if self._is_invalid_unit(unit_index) or \
-                self._is_invalid_micro_batch(micro_batch_index):
-            task = None
-        else:
-            task = MicroBatchTask(forward, unit_index, micro_batch_index)
-        self._inflight_task_queue.appendleft(task)
+        # If optimizer coordinator is not ready, return.
+        if not self.is_initialized:
+            return
 
-    def _synchronize_inflight_tasks(self):
+        # Build micro-batch task.
+        task = MicroBatchTask(unit_index, micro_batch_index, forward)
+
+        # If the task is invalid, add placeholder to the queue.
+        if self._is_invalid_task(task):
+            self._inflight_task_queue.appendleft(None)
+        else:
+            # Submit the task to the task queue.
+            self._inflight_task_queue.appendleft(task)
+
+        # Submit general tasks.
+        self._submit_transfer_opts()
+        self._submit_optimizer_step()
+        self._submit_update_opts()
+        self._submit_update_para()
+
+        if task.forward:
+            # Submit gradient recover task.
+            self._submit_recover_grad()
+        else:
+            # Submit gradient offload task.
+            self._submit_offload_grad()
+            # Submit offload parameter task.
+            self._submit_offload_para()
+
+            # Submit gradient transfer task.
+            def pre_micro_batch_backward_task():
+                self._submit_transfer_grad()
+                self._data_stream.execute()
+
+            # Trick: execute gradient reduce-scatter after recomputation.
+            # For the first unit, submit the task directly.
+            if task.unit:
+                set_pre_backward_function(pre_micro_batch_backward_task)
+            else:
+                self._submit_transfer_grad()
+
+    def _sync_inflight_operations(self, skip_rotate_buffers=False):
+        # If optimizer coordinator is not ready, return.
+        if not self.is_initialized:
+            return
+
         # Synchronize the inflight tasks.
         for task in self._inflight_task_set:
             # Synchronize the task.
@@ -662,7 +696,11 @@ class FlexTrainOptCoordinator:
         # Clear the inflight task set.
         self._inflight_task_set.clear()
 
-    def _rotate_buffers(self):
+        if skip_rotate_buffers:
+            return
+
+        dist.print_rank0("\nRotate buffers.")
+
         # Rotate micro-batch buffers.
         self._cpu_opt_grad_buffers.rotate()
         self._cpu_opt_work_buffers.rotate()
@@ -699,7 +737,7 @@ class FlexTrainOptCoordinator:
         # Link the gradients.
         unit_paras.link_grad_to(grad_buffer)
 
-    def _submit_transfer_grads(self):
+    def _submit_transfer_grad(self):
         """ Launch the async IO operation to transfer gradients. """
         # Locate and unpack the task.
         task = self._inflight_task_queue[self.TRANSFER_GRAD]
@@ -707,7 +745,7 @@ class FlexTrainOptCoordinator:
         if task is None:
             return
         dist.print_rank0("Transfer grads:", task)
-        unit_index, micro_batch_index = task.unit_index, task.micro_batch_index
+        unit_index, micro_batch_index = task.unit, task.micro_batch
 
         # 1. Locate the target memory.
         # 2. Conduct all-reduce into tensor if necessary.
@@ -762,7 +800,7 @@ class FlexTrainOptCoordinator:
         # Submit the task to the data stream.
         self._data_stream.submit(transfer_grads)
 
-    def _submit_recover_grads(self):
+    def _submit_recover_grad(self):
         """ Launch the async IO operation to recover forward gradients. """
         # Locate and unpack the task.
         task = self._inflight_task_queue[self.RECOVER_GRAD]
@@ -991,59 +1029,48 @@ class FlexTrainOptCoordinator:
             src_mem, index=0 if forward else 1, async_op=True
         )
 
+    def _validate_forward_task(self, curr_task: LLMTask):
+        # For the first iteration, the optimizer is not ready.
+        if not self.is_initialized:
+            return
+
+        # Find the just finished parameter update task.
+        last_para_update = self._inflight_task_queue[self.UPDATE_PARA]
+        # Unpack the current task.
+        curr_unit = curr_task.unit
+        curr_micro_batch = curr_task.micro_batch
+        assert last_para_update is not None
+        assert last_para_update.forward
+        assert last_para_update.unit == curr_unit + 1, (
+            f"Last para update unit {last_para_update.unit} "
+            f"!= current unit {curr_unit + 1}"
+        )
+        assert last_para_update.micro_batch == curr_micro_batch, (
+            f"Last para update micro-batch {last_para_update.micro_batch} "
+            f"!= current micro-batch {curr_micro_batch}"
+        )
+
     def pre_micro_batch_forward(
         self, curr_task: LLMTask, third_next_task: LLMTask
     ):
-        # For the first iteration, the optimizer is not finalized.
-        if not self._finalized:
+        # For the first iteration, the optimizer is not ready.
+        if not self.is_initialized:
             return
 
         # Synchronize inflight tasks.
-        self._synchronize_inflight_tasks()
-        self._rotate_buffers()
+        self._sync_inflight_operations()
 
         # Check if the last optimizer step is valid.
-        if curr_task is not None:
-            # Get the last parameter update task.
-            last_para_update = self._inflight_task_queue[self.UPDATE_PARA]
-            # Unpack the current task.
-            curr_unit = curr_task.unit
-            curr_micro_batch = curr_task.micro_batch
-            assert last_para_update is not None
-            assert last_para_update.forward
-            assert last_para_update.unit_index == curr_unit + 1, (
-                f"Last para update unit {last_para_update.unit_index} "
-                f"!= current unit {curr_unit + 1}"
-            )
-            assert last_para_update.micro_batch_index == curr_micro_batch, (
-                f"Last para update micro-batch {last_para_update.micro_batch_index} "
-                f"!= current micro-batch {curr_micro_batch}"
-            )
+        self._validate_forward_task(curr_task)
 
         # Submit a new task to the inflight task queue.
-        # If the next task is None, no need to submit a new task.
-        if third_next_task is None:
-            return
+        self._submit_micro_batch_task(
+            True,
+            third_next_task.unit + 1,
+            third_next_task.micro_batch
+        )
 
-        # Unpack the third next task.
-        new_unit = third_next_task.unit
-        new_micro_batch = third_next_task.micro_batch
-
-        # Submit a new task to the inflight task queue.
-        # It should be about the next unit.
-        self._submit_micro_batch_task(True, new_unit + 1, new_micro_batch)
-
-        # Submit micro-batch tasks.
-        self._submit_transfer_opts()
-        self._submit_recover_grads()
-        self._submit_optimizer_step()
-        self._submit_update_opts()
-        self._submit_update_para()
-        self._submit_offload_para()
-
-    def pre_micro_batch_backward(
-        self, unit_index: int, micro_batch_index: int
-    ):
+    def pre_micro_batch_backward(self, curr_task: LLMTask):
         """ Submit tasks for the given micro-batch in backward pass.
 
         Args:
@@ -1058,37 +1085,16 @@ class FlexTrainOptCoordinator:
             torch.zero_(self._gpu_bwd_extra_grads)
 
         # Synchronize inflight tasks.
-        self._synchronize_inflight_tasks()
-        self._rotate_buffers()
+        self._sync_inflight_operations()
 
         # Submit a new task to the inflight task queue.
-        # It should be about the previous unit.
-        self._submit_micro_batch_task(False, unit_index + 1, micro_batch_index)
+        self._submit_micro_batch_task(
+            False,
+            curr_task.unit + 1,
+            curr_task.micro_batch
+        )
 
-        # Submit gradient transfer task.
-        def pre_micro_batch_backward_task():
-            self._submit_transfer_grads()
-            self._data_stream.execute()
-            dist.print_rank0()
-
-        # Trick: We submit and execute the task after recomputation.
-        if unit_index >= 0:
-            set_pre_backward_function(pre_micro_batch_backward_task)
-        else:
-            # For the first unit, we need to submit the task directly.
-            self._submit_transfer_grads()
-
-        # Submit remaining tasks.
-        self._submit_transfer_opts()
-        self._submit_optimizer_step()
-        self._submit_offload_grad()
-        self._submit_update_opts()
-        self._submit_update_para()
-        self._submit_offload_para()
-
-    def post_micro_batch_backward(
-        self, unit_index: int, micro_batch_index: int
-    ):
+    def post_micro_batch_backward(self, curr_task: LLMTask):
         """ Conduct post-processing after the backward of the micro-batch.
 
         Args:
@@ -1099,7 +1105,8 @@ class FlexTrainOptCoordinator:
             None
         """
         # Check if the unit is valid.
-        if self._is_invalid_unit(unit_index):
+        if self._is_invalid_task(curr_task):
+            assert False
             return
 
         # If the gradients are not compatible with the device dtype,
@@ -1132,8 +1139,8 @@ class FlexTrainOptCoordinator:
         self._prepare_unit_grads(unit_index)
 
     def warmup_backward_pipeline(self):
-        # Finalize the initialization.
-        self._finalize_alpha_split()
+        # Complete the initialization.
+        self._initialize_alpha_split()
         # Inform the parameter coordinator that future updates are coming.
         self._para.parameter_updated = True
 
@@ -1151,28 +1158,28 @@ class FlexTrainOptCoordinator:
         self._gpu_bwd_grad_buffers.rotate()
 
         # Conduct the optimizer step of the first unit.
-        for mb in range(self._micro_batch_per_rank):
+        for mb in reversed(range(self._micro_batch_per_rank)):
             self._data_stream.synchronize()
-            self._synchronize_inflight_tasks()
-            self._rotate_buffers()
+            self._sync_inflight_operations()
 
-            self.pre_micro_batch_backward(-1, mb)
+            # Unpack the current task and submit a new task.
+            self._submit_micro_batch_task(False, 0, mb)
             self._data_stream.execute()
-            dist.print_rank0()
 
         # Synchronize the inflight tasks.
+        # Do not rotate buffers here.
         self._data_stream.synchronize()
-        self._synchronize_inflight_tasks()
+        self._sync_inflight_operations(skip_rotate_buffers=True)
 
 
-_OPT_COORDINATOR = FlexTrainOptCoordinator()
+_OPTS_COORDINATOR = FlexTrainOptsCoordinator()
 
 
-def get_opt_coordinator():
+def get_opts_coordinator():
     """
     Get the optimizer coordinator.
 
     Returns:
-        FlexTrainOptCoordinator: The optimizer coordinator.
+        FlexTrainOptsCoordinator: The optimizer coordinator.
     """
-    return _OPT_COORDINATOR
+    return _OPTS_COORDINATOR

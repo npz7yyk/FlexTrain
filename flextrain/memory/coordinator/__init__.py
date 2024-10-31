@@ -4,7 +4,7 @@ from .interlayer import (                       # noqa: F401
     InterLayerTask,
     retrieve_tensor
 )
-from .optimizer import get_opt_coordinator      # noqa: F401
+from .optimizer import get_opts_coordinator
 
 from flextrain.memory import get_data_stream
 from flextrain.scheduler import (
@@ -12,54 +12,60 @@ from flextrain.scheduler import (
     GreedySnakeBlockScheduler
 )
 
-# TEMP
-from flextrain.utils import dist
-
 
 def warmup_forward_pipeline(scheduler: GreedySnakeBlockScheduler):
     """
-    Warm up the pipeline using both parameter and optimizer coordinator.
+    Warm up the pipeline of both parameter and optimizer coordinators.
     """
     para = get_para_coordinator()
-    opt = get_opt_coordinator()
+    opts = get_opts_coordinator()
     data_stream = get_data_stream()
     micro_batch_per_rank = para._micro_batch_per_rank
 
-    # Reset the scheduler to the beginning.
-    scheduler.reset()
+    # Reset the scheduler to the beginning and enter the warmup stage.
+    scheduler.enter_warmup_stage()
+    tasks = iter(scheduler)
 
     # Figure out the offset of the first task for the optimizer.
-    opt_task_offset = opt.UPDATE_PARA + 1
+    for i in range(opts.UPDATE_PARA + 1):
+        next_task: LLMTask = next(tasks)
 
-    for i in range(opt_task_offset):
-        third_next_task = scheduler.kth_next_forward_task(i)
-        assert third_next_task is not None
-        # We need to decrease the unit by 1 to align with the optimizer.
-        third_next_task.unit -= 1
-        dist.print_rank0(third_next_task)
-        opt.pre_micro_batch_forward(None, third_next_task)
-        data_stream.execute()
+        # Synchronize inflight tasks.
         data_stream.synchronize()
-        dist.print_rank0()
+        opts._sync_inflight_operations()
+
+        opts._submit_micro_batch_task(
+            True,
+            next_task.unit,
+            next_task.micro_batch
+        )
+        data_stream.execute()
 
     # Ensure the availability of the first unit.
-    para._async_load_nvme_paras(0, 0)
-    for i in range(micro_batch_per_rank):
-        para._sync_nvme_operations(0, i)
+    para._async_load_nvme_paras(0, micro_batch_per_rank - 1)
+    for i in reversed(range(micro_batch_per_rank)):
         data_stream.synchronize()
+        para._sync_nvme_operations(0, i)
+        opts._sync_inflight_operations()
 
-        third_next_task = scheduler.kth_next_forward_task(i + opt_task_offset)
-        opt.pre_micro_batch_forward(LLMTask(i, -1), third_next_task)
-        para._async_load_nvme_paras(0, i + 1)
+        # Ensure that two coordinators are aligned.
+        opts._validate_forward_task(LLMTask(-1, i))
+
+        para._async_load_nvme_paras(0, i - 1)
         para._async_load_gpu_paras(0, i)
+        next_task: LLMTask = next(tasks)
+        opts._submit_micro_batch_task(
+            True,
+            next_task.unit,
+            next_task.micro_batch
+        )
         data_stream.execute()
-        dist.print_rank0()
-
-    if opt._finalized:
-        exit(0)
 
     # Submit the next task.
     para._async_load_nvme_paras(1, 0)
+
+    # Reset the scheduler to the beginning and exit the warmup stage.
+    scheduler.exit_warmup_stage()
 
 
 def warmup_backward_pipeline(*args, **kwargs):
@@ -69,8 +75,8 @@ def warmup_backward_pipeline(*args, **kwargs):
     para = get_para_coordinator()
     para.warmup_backward_pipeline()
 
-    opt = get_opt_coordinator()
-    opt.warmup_backward_pipeline()
+    opts = get_opts_coordinator()
+    opts.warmup_backward_pipeline()
 
 
 def clear_backward_pipeline(*args, **kwargs):
@@ -80,5 +86,5 @@ def clear_backward_pipeline(*args, **kwargs):
     para = get_para_coordinator()
     para.clear_backward_pipeline()
 
-    opt = get_opt_coordinator()
-    opt.clear_backward_pipeline()
+    opts = get_opts_coordinator()
+    opts.clear_backward_pipeline()
