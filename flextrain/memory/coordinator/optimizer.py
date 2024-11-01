@@ -25,11 +25,7 @@ from flextrain.memory.coordinator import (
     get_para_coordinator,
     get_interlayer_coordinator
 )
-from flextrain.memory.nvme_swapper import (
-    NVMeGroup,
-    _nvme_offload,
-    _nvme_reload
-)
+from flextrain.memory.nvme_swapper import NVMeGroup
 from flextrain.scheduler import LLMTask
 from flextrain.utils import dist
 from flextrain.utils.logging import rank0_logger
