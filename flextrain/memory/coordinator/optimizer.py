@@ -695,7 +695,7 @@ class FlexTrainOptsCoordinator:
         if skip_rotate_buffers:
             return
 
-        dist.print_rank0("\nRotate buffers.")
+        # dist.print_rank0("\nRotate buffers.")
 
         # Rotate micro-batch buffers.
         self._cpu_opt_grad_buffers.rotate()
@@ -740,7 +740,7 @@ class FlexTrainOptsCoordinator:
         # Return if no task to conduct.
         if task is None:
             return
-        dist.print_rank0("Transfer grads:", task)
+        # dist.print_rank0("Transfer grads:", task)
         unit_index, micro_batch_index = task.unit, task.micro_batch
 
         # 1. Locate the target memory.
@@ -803,7 +803,7 @@ class FlexTrainOptsCoordinator:
         # Return if no task to conduct.
         if task is None:
             return
-        dist.print_rank0("Recover grads:", task)
+        # dist.print_rank0("Recover grads:", task)
         return
 
         # Copy the forward gradients from borrowed memory into working buffer.
@@ -841,7 +841,7 @@ class FlexTrainOptsCoordinator:
         # Return if no task to conduct.
         if task is None:
             return
-        dist.print_rank0("Transfer opts:", task)
+        # dist.print_rank0("Transfer opts:", task)
         return
 
         # dist.print_rank0(f"Submitting transfer opts unit {unit_index} micro_batch {micro_batch_index}")
@@ -873,7 +873,7 @@ class FlexTrainOptsCoordinator:
         # Return if no task to conduct.
         if task is None:
             return
-        dist.print_rank0("Optimizer step:", task)
+        # dist.print_rank0("Optimizer step:", task)
         return
 
         # 1. Locate the parameters / gradients / optimizer states.
@@ -900,7 +900,7 @@ class FlexTrainOptsCoordinator:
         # Return if no task to conduct.
         if task is None:
             return
-        dist.print_rank0("Offload grads:", task)
+        # dist.print_rank0("Offload grads:", task)
         return
 
         # 1. Submit the optimizer step task.
@@ -917,7 +917,7 @@ class FlexTrainOptsCoordinator:
         # Return if no task to conduct.
         if task is None:
             return
-        dist.print_rank0("Update opts:", task)
+        # dist.print_rank0("Update opts:", task)
         return
 
         # First, write back the optimizer states.
@@ -977,7 +977,7 @@ class FlexTrainOptsCoordinator:
         # Return if no task to conduct.
         if task is None:
             return
-        dist.print_rank0("Update para:", task)
+        # dist.print_rank0("Update para:", task)
         return
 
         # 1. Locate the source memory.
@@ -1011,7 +1011,7 @@ class FlexTrainOptsCoordinator:
         # Return if no task to conduct.
         if task is None:
             return
-        dist.print_rank0("Para offload:", task)
+        # dist.print_rank0("Para offload:", task)
         return
 
         # 1. Locate the source memory.

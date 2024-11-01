@@ -6,7 +6,6 @@ from typing import Iterable, List, Dict
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
-    DummyHandle,
     RotateContainer,
     FlexTrainDataType as Dtype,
     FlexTrainDataID,
@@ -17,7 +16,7 @@ from flextrain.memory import (
     allocate_memory_chunks,
     get_data_stream
 )
-from flextrain.memory.nvme_swapper import NVMeGroup
+from flextrain.memory.nvme_swapper import get_nvme_swapper, NVMeGroup
 from flextrain.scheduler import LLMTask
 from flextrain.utils import dist
 from flextrain.utils.logging import rank0_logger
@@ -47,8 +46,8 @@ class FlexTrainParaCoordinator:
         # Mixed precision dtype for master.
         self._master_dtype = config.mixed_precision.master_dtype
 
-        # Lazy initialization of NVMe swapper.
-        self._nvme_swapper = None
+        # Async IO NVMe swapper.
+        self._nvme_swapper = get_nvme_swapper()
         # Async IO operation cuda stream.
         self._data_stream = get_data_stream()
 
@@ -79,7 +78,6 @@ class FlexTrainParaCoordinator:
 
         # Whether parameters are updated. Will be modified by optimizer.
         self.parameter_updated = False
-        self._inflight_nvme_offload = DummyHandle()
 
     def _config_para_partition(self, parameters: Iterable[Parameter]):
         # Get the configuration.
@@ -181,6 +179,10 @@ class FlexTrainParaCoordinator:
     def _is_invalid_micro_batch(self, micro_batch_index: int):
         return micro_batch_index < 0 or \
             micro_batch_index >= self._micro_batch_per_rank
+
+    def _is_invalid_task(self, unit_index: int, micro_batch_index: int):
+        return self._is_invalid_unit(unit_index) or \
+            self._is_invalid_micro_batch(micro_batch_index)
 
     def _link_unit_parameters(
         self,
@@ -343,10 +345,11 @@ class FlexTrainParaCoordinator:
         Returns:
             None
         """
+        # Register the inflight work.
+        self._inflight_nvme_load = (unit_index, micro_batch_index)
+
         # Check if the unit and micro-batch are valid.
-        if self._is_invalid_unit(unit_index) or \
-                self._is_invalid_micro_batch(micro_batch_index):
-            self._inflight_nvme_load = (unit_index, micro_batch_index, None)
+        if self._is_invalid_task(unit_index, micro_batch_index):
             return
 
         if self.parameter_updated and forward:
@@ -355,17 +358,16 @@ class FlexTrainParaCoordinator:
             )
             # Forward parameters are being copied from optimizer coordinator.
             # Only load backward NVMe parameters.
-            handle = self._nvme_group.single_reload(
+            self._nvme_group.single_reload(
                 FlexTrainDataID(unit_index, micro_batch_index, Dtype.PARA),
                 bwd_para, 1, async_op=True
             )
         else:
             # Load both forward and backward NVMe parameters.
-            handle = self._nvme_group.group_reload(
+            self._nvme_group.group_reload(
                 FlexTrainDataID(unit_index, micro_batch_index, Dtype.PARA),
                 self._nvme_inflight_paras, async_op=True
             )
-        self._inflight_nvme_load = (unit_index, micro_batch_index, handle)
 
     def _async_offload_nvme_paras(
         self, unit_index: int, micro_batch_index: int
@@ -381,8 +383,7 @@ class FlexTrainParaCoordinator:
             None
         """
         # Check if the unit and micro-batch are valid.
-        if self._is_invalid_unit(unit_index) or \
-                self._is_invalid_micro_batch(micro_batch_index):
+        if self._is_invalid_task(unit_index, micro_batch_index):
             return
 
         # If parameters are not updated, return.
@@ -395,13 +396,10 @@ class FlexTrainParaCoordinator:
         )
 
         # Offload the forward NVMe parameters.
-        handle = self._nvme_group.single_offload(
+        self._nvme_group.single_offload(
             FlexTrainDataID(unit_index, micro_batch_index, Dtype.PARA),
             fwd_para, 0, async_op=True
         )
-
-        # Update the inflight NVMe offload handle.
-        self._inflight_nvme_offload = handle
 
     def _sync_nvme_operations(
         self,
@@ -419,23 +417,18 @@ class FlexTrainParaCoordinator:
         Returns:
             None
         """
-        # Check if the unit is valid.
-        if self._is_invalid_unit(unit_index):
+        # Check if the unit and micro-batch are valid.
+        if self._is_invalid_task(unit_index, micro_batch_index):
             return
 
         # Wait for the async IO operation to finish.
-        inflight_unit, inflight_micro_batch, handle = self._inflight_nvme_load
+        inflight_unit, inflight_micro_batch = self._inflight_nvme_load
         assert inflight_unit == unit_index and \
             inflight_micro_batch == micro_batch_index, (
                 "Inflight NVMe load does not match the current task. "
                 f"Expected: {(unit_index, micro_batch_index)}, "
                 f"Actual: {(inflight_unit, inflight_micro_batch)}."
             )
-        handle.wait()
-
-        # Wait for the potential NVMe offload to finish.
-        if self.parameter_updated:
-            self._inflight_nvme_offload.wait()
 
         # Just available buffer is now the prefetch buffer.
         # Just inflight buffer is now available after handle.wait().
@@ -575,33 +568,14 @@ class FlexTrainParaCoordinator:
         # Link the parameters to the unit.
         self._link_unit_parameters(unit_index, self._gpu_available_paras)
 
-    def warmup_forward_pipeline(self):
-        """
-        Warm up the forward pipeline.
-        Recommendation: call before LLM pre_processing for further speedup.
-        """
-
-        # Ensure the availability of the first unit.
-        self._async_load_nvme_paras(0, 0)
-        for i in range(self._micro_batch_per_rank):
-            self._sync_nvme_operations(0, i)
-            self._data_stream.synchronize()
-
-            self._async_load_nvme_paras(0, i + 1)
-            self._async_load_gpu_paras(0, i)
-            self._data_stream.execute()
-
-        # Submit the next task.
-        self._async_load_nvme_paras(1, 0)
-
     def warmup_backward_pipeline(self):
         """
         Warm up the backward pipeline.
         """
         # Trick: use the last task of forward pipeline to warm up backward.
-        # Unpack the last task of forward pipeline.
-        unit_index, micro_batch_index, handle = self._inflight_nvme_load
-        assert handle is None
+        # Unpack the last task of forward pipeline (supposed to be invalid).
+        unit_index, micro_batch_index = self._inflight_nvme_load
+        assert self._is_invalid_task(unit_index, micro_batch_index)
 
         # The offset needs to be adjusted from 1 to -1, thus -2.
         self._async_load_nvme_paras(

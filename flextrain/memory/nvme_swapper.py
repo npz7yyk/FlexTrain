@@ -5,11 +5,7 @@ from torch import Tensor
 from typing import Iterable, Tuple
 
 from flextrain.config import get_flextrain_config
-from flextrain.memory import (
-    FlexTrainDataID,
-    Waitable,
-    AsyncIOHandle
-)
+from flextrain.memory import FlexTrainDataID, Waitable
 from flextrain.ops.aio import AsyncIOBuilder
 
 
@@ -54,16 +50,16 @@ class AsyncNVMeSwapper:
             return
         self._initialized = True
 
-        # Config for NVMe swapping
+        # Config for NVMe swapping.
         nvme_swap_config = get_flextrain_config().nvme_swap
 
-        # Directory to store the swapped tensors
+        # Directory to store the swapped tensors.
         self.swap_dir = nvme_swap_config.swap_dir
         os.makedirs(self.swap_dir, exist_ok=True)
-        # Ensure the directory is empty
+        # Ensure the directory is empty.
         os.system(f"rm -rf {self.swap_dir}/*")
 
-        # Create the aio read and write handles
+        # Create the aio read and write handles.
         aio_handle = AsyncIOBuilder().load().aio_handle
         self._aio_read_handle: Waitable = aio_handle(
             nvme_swap_config.aio_block_size,
@@ -79,6 +75,14 @@ class AsyncNVMeSwapper:
             nvme_swap_config.aio_single_submit,
             nvme_swap_config.aio_overlap_events
         )
+
+        # Numbers of inflight read and write handles.
+        self._inflight_read_tasks = 0
+        self._inflight_write_tasks = 0
+
+    def is_empty(self):
+        return not self._inflight_read_tasks and \
+            not self._inflight_write_tasks
 
     def _filename(self, data_id: FlexTrainDataID):
         return os.path.join(self.swap_dir, str(data_id))
@@ -100,11 +104,11 @@ class AsyncNVMeSwapper:
         self._init_swapper()
 
         filenames = list(map(self._filename, data_ids))
-        swap_out_tensors(self._aio_read_handle, mem_srcs, filenames)
+        swap_out_tensors(self._aio_write_handle, mem_srcs, filenames)
         if async_op:
-            return AsyncIOHandle(self._aio_read_handle)
+            self._inflight_write_tasks += len(filenames)
         else:
-            assert self._aio_read_handle.wait() == len(filenames)
+            assert self._aio_write_handle.wait() == len(filenames)
 
     def swap_in(
         self,
@@ -120,11 +124,21 @@ class AsyncNVMeSwapper:
             return
 
         filenames = list(map(self._filename, data_ids))
-        swap_in_tensors(self._aio_write_handle, mem_dsts, filenames)
+        swap_in_tensors(self._aio_read_handle, mem_dsts, filenames)
         if async_op:
-            return AsyncIOHandle(self._aio_write_handle)
+            self._inflight_read_tasks += len(filenames)
         else:
-            assert self._aio_write_handle.wait() == len(filenames)
+            assert self._aio_read_handle.wait() == len(filenames)
+
+    def synchronize(self):
+        # Synchronize inflight read tasks if needed.
+        if self._inflight_read_tasks:
+            self._aio_read_handle.wait() == self._inflight_read_tasks
+            self._inflight_read_tasks = 0
+        # Synchronize inflight write tasks if needed.
+        if self._inflight_write_tasks:
+            self._aio_write_handle.wait() == self._inflight_write_tasks
+            self._inflight_write_tasks = 0
 
 
 _NVME_SWAPPER = AsyncNVMeSwapper()
@@ -156,9 +170,9 @@ class NVMeGroup:
         tensor: Tensor,
         index: int,
         async_op: bool = False
-    ) -> Waitable:
+    ):
         assert tensor.numel() == self._numels[index]
-        return self._nvme_swapper.swap_out(
+        self._nvme_swapper.swap_out(
             self._rename(prefix, index), tensor, async_op
         )
 
@@ -167,7 +181,7 @@ class NVMeGroup:
         prefix: FlexTrainDataID,
         tensors: Tensor | Iterable[Tensor],
         async_op: bool = False
-    ) -> Waitable:
+    ):
         if isinstance(tensors, Tensor):
             assert tensors.numel() == self._group_numel, (
                 f"Expected numel={self._group_numel}, "
@@ -178,7 +192,7 @@ class NVMeGroup:
         for tensor, numel in zip(tensors, self._numels):
             assert tensor.numel() == numel
 
-        return self._nvme_swapper.swap_out(
+        self._nvme_swapper.swap_out(
             [self._rename(prefix, i) for i in range(len(tensors))],
             tensors, async_op
         )
@@ -189,9 +203,9 @@ class NVMeGroup:
         tensor: Tensor,
         index: int,
         async_op: bool = False
-    ) -> Waitable:
+    ):
         assert tensor.numel() == self._numels[index]
-        return self._nvme_swapper.swap_in(
+        self._nvme_swapper.swap_in(
             self._rename(prefix, index), tensor, async_op
         )
 
@@ -200,7 +214,7 @@ class NVMeGroup:
         prefix: FlexTrainDataID,
         tensors: Tensor | Iterable[Tensor],
         async_op: bool = False
-    ) -> Waitable:
+    ):
         if isinstance(tensors, Tensor):
             assert tensors.numel() == self._group_numel
             tensors = torch.split(tensors, self._numels)
@@ -208,7 +222,7 @@ class NVMeGroup:
         for tensor, numel in zip(tensors, self._numels):
             assert tensor.numel() == numel
 
-        return self._nvme_swapper.swap_in(
+        self._nvme_swapper.swap_in(
             [self._rename(prefix, i) for i in range(len(tensors))],
             tensors, async_op
         )

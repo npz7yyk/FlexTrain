@@ -7,6 +7,7 @@ from .interlayer import (                       # noqa: F401
 from .optimizer import get_opts_coordinator
 
 from flextrain.memory import get_data_stream
+from flextrain.memory.nvme_swapper import get_nvme_swapper
 from flextrain.scheduler import (
     LLMTask,
     GreedySnakeBlockScheduler
@@ -19,6 +20,7 @@ def warmup_forward_pipeline(scheduler: GreedySnakeBlockScheduler):
     """
     para = get_para_coordinator()
     opts = get_opts_coordinator()
+    nvme_swapper = get_nvme_swapper()
     data_stream = get_data_stream()
     micro_batch_per_rank = para._micro_batch_per_rank
 
@@ -31,6 +33,7 @@ def warmup_forward_pipeline(scheduler: GreedySnakeBlockScheduler):
         next_task: LLMTask = next(tasks)
 
         # Synchronize inflight tasks.
+        nvme_swapper.synchronize()
         data_stream.synchronize()
         opts._sync_inflight_operations()
 
@@ -44,6 +47,7 @@ def warmup_forward_pipeline(scheduler: GreedySnakeBlockScheduler):
     # Ensure the availability of the first unit.
     para._async_load_nvme_paras(0, micro_batch_per_rank - 1)
     for i in reversed(range(micro_batch_per_rank)):
+        nvme_swapper.synchronize()
         data_stream.synchronize()
         para._sync_nvme_operations(0, i)
         opts._sync_inflight_operations()

@@ -25,6 +25,7 @@ from flextrain.memory.coordinator import (
     warmup_backward_pipeline,
     clear_backward_pipeline
 )
+from flextrain.memory.nvme_swapper import get_nvme_swapper
 from flextrain.optimizer import FlexTrainOptimizer
 from flextrain.scheduler import LLMTask, GreedySnakeBlockScheduler
 
@@ -63,6 +64,7 @@ class FlexTrainEngine(object):
         self.optimizer = optimizer
 
         # Link to parameter, interlayer and optimizer coordinator.
+        self.nvme_swapper = get_nvme_swapper()
         self.data_stream = get_data_stream()
         self.para_coordinator = get_para_coordinator()
         self.interlayer_coordinator = get_interlayer_coordinator()
@@ -159,6 +161,9 @@ class FlexTrainEngine(object):
     def _conduct_forward(self, task: LLMTask):
         config = get_flextrain_config()
         scheduler = self.scheduler
+
+        # Wait for all in-flight async IO operations.
+        self.nvme_swapper.synchronize()
 
         # Submit prefetching and offloading tasks
         # 1. Prefetch the next passed_down and offload the last passed_down
@@ -271,7 +276,10 @@ class FlexTrainEngine(object):
     def _conduct_backward(self, task: LLMTask):
         scheduler = self.scheduler
 
-        # Submit prefetching the next passed_down
+        # Wait for all in-flight async IO operations.
+        self.nvme_swapper.synchronize()
+
+        # 1. Submit prefetching the next passed_down
         next_task = self.scheduler.next_task
         ckpt_prefetch = InterLayerTask(
             next_task.unit - 1, next_task.micro_batch
@@ -385,6 +393,7 @@ class FlexTrainEngine(object):
 
     def train_iteration(self):
         # 1. Conduct reset
+        assert self.nvme_swapper.is_empty()
         assert self.data_stream.is_empty()
         self._reset_context()
 
@@ -399,7 +408,7 @@ class FlexTrainEngine(object):
             torch.cuda.nvtx.range_push(f"Forward unit {task.unit}")
             t_start = time.time()
             self._conduct_forward(task)
-            dist.print_rank0(f"Finished forward task: {task}")
+            # dist.print_rank0(f"Finished forward task: {task}")
             t_end = time.time()
             times_fwd.append(t_end - t_start)
             torch.cuda.nvtx.range_pop()
@@ -413,7 +422,7 @@ class FlexTrainEngine(object):
             torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
             t_start = time.time()
             self._conduct_backward(task)
-            dist.print_rank0(f"Finished backward task: {task}")
+            # dist.print_rank0(f"Finished backward task: {task}")
             t_end = time.time()
             times_bwd.append(t_end - t_start)
             torch.cuda.nvtx.range_pop()
