@@ -24,6 +24,19 @@ def warmup_forward_pipeline(scheduler: GreedySnakeBlockScheduler):
     data_stream = get_data_stream()
     micro_batch_per_rank = para._micro_batch_per_rank
 
+    # Load the first unit parameters to CPU.
+    para._async_load_nvme_paras(0)
+    nvme_swapper.synchronize()
+    para._nvme_prefetch_buffer.rotate()
+
+    # Launch the first unit forward.
+    para._async_load_nvme_paras(1)
+    for mb in range(micro_batch_per_rank):
+        para._async_load_gpu_paras(0, mb)
+    data_stream.execute()
+
+    return
+
     # Reset the scheduler to the beginning and enter the warmup stage.
     scheduler.enter_warmup_stage()
     tasks = iter(scheduler)

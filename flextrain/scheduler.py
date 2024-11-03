@@ -58,19 +58,11 @@ class GreedySnakeBlockScheduler:
 
         # Calculate the current micro batch
         cur_micro_batch = cur_task_num % self._num_micro_batch
-        if (cur_unit + self._in_warmup) & 1:
+        if cur_unit & 1:
             cur_micro_batch = self._num_micro_batch - 1 - cur_micro_batch
         else:
             cur_micro_batch = cur_micro_batch
         return LLMTask(cur_unit, cur_micro_batch)
-
-    def enter_warmup_stage(self):
-        self.cur_task_num = 0
-        self._in_warmup = True
-
-    def exit_warmup_stage(self):
-        self.cur_task_num = 0
-        self._in_warmup = False
 
     @property
     def new_unit_entered(self):

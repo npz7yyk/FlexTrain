@@ -162,9 +162,6 @@ class FlexTrainEngine(object):
         config = get_flextrain_config()
         scheduler = self.scheduler
 
-        # Wait for all in-flight async IO operations.
-        self.nvme_swapper.synchronize()
-
         # Submit prefetching and offloading tasks
         # 1. Prefetch the next passed_down and offload the last passed_down
         next_task = self.scheduler.next_task
@@ -179,10 +176,12 @@ class FlexTrainEngine(object):
             task, self.scheduler.kth_next_forward_task(k=3)
         )
         # 3. Prefetch the parameter of the next unit
-        self.para_coordinator.pre_micro_batch_forward(task, next_task)
+        self.para_coordinator.pre_micro_batch_forward(task)
         # Link parameters to memory (prefetch NVMe parameters if needed)
         # Conduct NVMe parameter updating
         if scheduler.new_unit_entered:
+            # Wait for all in-flight async IO operations.
+            self.nvme_swapper.synchronize()
             self.para_coordinator.pre_unit_forward(task.unit)
             self.opts_coordinator.pre_unit_forward(task.unit)
         # End of submit prefetching and offloading tasks
@@ -276,9 +275,6 @@ class FlexTrainEngine(object):
     def _conduct_backward(self, task: LLMTask):
         scheduler = self.scheduler
 
-        # Wait for all in-flight async IO operations.
-        self.nvme_swapper.synchronize()
-
         # 1. Submit prefetching the next passed_down
         next_task = self.scheduler.next_task
         ckpt_prefetch = InterLayerTask(
@@ -292,10 +288,12 @@ class FlexTrainEngine(object):
         # End of submit prefetching the next passed_down
 
         # 2. Prefetch the parameter of the next unit
-        self.para_coordinator.pre_micro_batch_backward(task, next_task)
+        self.para_coordinator.pre_micro_batch_backward(task)
         self.opts_coordinator.pre_micro_batch_backward(task)
         # Link parameters to memory (prefetch NVMe parameters if needed)
         if scheduler.new_unit_entered:
+            # Wait for all in-flight async IO operations.
+            self.nvme_swapper.synchronize()
             self.para_coordinator.pre_unit_backward(task.unit)
             self.opts_coordinator.pre_unit_backward(task.unit)
         # End of submit prefetching and offloading tasks

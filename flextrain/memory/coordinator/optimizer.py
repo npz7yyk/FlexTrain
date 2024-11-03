@@ -352,6 +352,7 @@ class FlexTrainOptsCoordinator:
             range(self._num_units), desc="FlexTrain Opt. Init."
         ) if dist.get_rank() == 0 else range(self._num_units)
         for unit in units:
+            break
             for micro_batch in range(self._micro_batch_per_rank):
                 gpu_src = gpu_base[unit][micro_batch]
                 gpu_fwd_src, gpu_bwd_src = torch.split(
