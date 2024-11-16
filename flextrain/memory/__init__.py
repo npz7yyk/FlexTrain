@@ -26,12 +26,10 @@ class FlexTrainDataID:
     def __init__(
         self,
         data_type: FlexTrainDataType,
-        unit_index: int,
-        micro_batch_index: int = None
+        unit_index: int
     ):
         self.data_type = data_type
         self.unit_index = unit_index
-        self.micro_batch_index = micro_batch_index
 
     def __str__(self):
         checkpoint_interval = get_flextrain_config().checkpoint_interval
@@ -39,13 +37,10 @@ class FlexTrainDataID:
         end = start + checkpoint_interval - 1
         layer_index = f"{start}-{end}" \
             if checkpoint_interval > 1 else f"{start}"
-        micro_batch_index = f"_mb{self.micro_batch_index}" \
-            if self.micro_batch_index is not None else ""
         return (
             f"rank{get_rank()}_"
             f"{self.data_type.name}_"
-            f"layer{layer_index}"
-            f"{micro_batch_index}.swp"
+            f"layer{layer_index}.swp"
         )
 
 

@@ -139,12 +139,10 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
             opt_target.exp_avg.data, opt_target.exp_avg_sq.data
         )
 
-    def submit_micro_batch_step(
-        self, unit_index: int, micro_batch_index: int,
-        para: torch.Tensor, grad: torch.Tensor,
+    def submit_step(
+        self, unit_index: int, para: torch.Tensor, grad: torch.Tensor,
         exp_avg: torch.Tensor, exp_avg_sq: torch.Tensor
     ):
-        return self._submit_micro_batch_step(
-            unit_index, micro_batch_index,
-            AdamOptTarget(para, grad, exp_avg, exp_avg_sq)
+        return self._submit_step(
+            unit_index, AdamOptTarget(para, grad, exp_avg, exp_avg_sq)
         )

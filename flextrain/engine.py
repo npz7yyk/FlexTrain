@@ -172,9 +172,7 @@ class FlexTrainEngine(object):
             ckpt_prefetch, self.ckpt_offload
         )
         # 2. Submit forwarding part of the optimizer step
-        self.opts_coordinator.pre_micro_batch_forward(
-            task, self.scheduler.kth_next_forward_task(k=3)
-        )
+        self.opts_coordinator.pre_micro_batch_forward(task)
         # 3. Prefetch the parameter of the next unit
         self.para_coordinator.pre_micro_batch_forward(task)
         # Link parameters to memory (prefetch NVMe parameters if needed)
@@ -296,6 +294,13 @@ class FlexTrainEngine(object):
             self.nvme_swapper.synchronize()
             self.para_coordinator.pre_unit_backward(task.unit)
             self.opts_coordinator.pre_unit_backward(task.unit)
+            # if not hasattr(self, 'test_buffer1'):
+            #     self.test_buffer1 = torch.empty(113236992)
+            #     self.test_buffer2 = torch.empty(113236992)
+            # def test_name(unit):
+            #     return f"rank{dist.get_rank()}_test_unit{unit}"
+            # get_nvme_swapper().swap_in(test_name(task.unit), self.test_buffer1, async_op=True)
+            # get_nvme_swapper().swap_out(test_name(task.unit + 1), self.test_buffer2, async_op=True)
         # End of submit prefetching and offloading tasks
 
         # Wait for all in-flight operations
@@ -426,6 +431,7 @@ class FlexTrainEngine(object):
             torch.cuda.nvtx.range_pop()
 
         clear_backward_pipeline(self.scheduler)
+        # get_nvme_swapper().synchronize()
         self.opts_coordinator._calculate_global_grad_norm()
 
         times = sorted(times_fwd, reverse=True)
@@ -452,7 +458,7 @@ class FlexTrainEngine(object):
         if not hasattr(self, 'count'):
             self.count = 0
         self.count += 1
-        if self.count % 10 == 0:
+        if self.count % 4 == 0:
             exit()
 
         return loss_rsts

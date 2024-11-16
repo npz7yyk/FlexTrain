@@ -81,6 +81,10 @@ class AsyncNVMeSwapper:
         self._inflight_write_tasks = 0
 
     def is_empty(self):
+        # If not initialized, return True.
+        if not self._initialized:
+            return True
+        # Otherwise, return if there are no inflight read or write tasks.
         return not self._inflight_read_tasks and \
             not self._inflight_write_tasks
 
@@ -131,6 +135,9 @@ class AsyncNVMeSwapper:
             assert self._aio_read_handle.wait() == len(filenames)
 
     def synchronize(self):
+        # If not initialized, return.
+        if not self._initialized:
+            return
         # Synchronize inflight read tasks if needed.
         if self._inflight_read_tasks:
             self._aio_read_handle.wait() == self._inflight_read_tasks
