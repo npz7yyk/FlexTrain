@@ -44,8 +44,7 @@ class FlexTrainEngine(object):
     def __init__(
         self,
         model: Module,
-        optimizer: FlexTrainOptimizer,
-        lr_scheduler: LRScheduler = None
+        optimizer: FlexTrainOptimizer
     ):
         super().__init__()
 
@@ -87,9 +86,6 @@ class FlexTrainEngine(object):
         # Link / Create loss scaler
         self.custom_loss_scaler = False
         self.loss_scaler = create_loss_scaler()
-
-        # Link to lr_scheduler
-        self.lr_scheduler = lr_scheduler
 
         # Post-forward / pre-backward functions
         self.delayed_functions: List[Callable] = []
@@ -163,6 +159,13 @@ class FlexTrainEngine(object):
         scheduler = self.scheduler
 
         # Submit prefetching and offloading tasks
+        # Link parameters to memory (prefetch NVMe parameters if needed)
+        # Conduct NVMe parameter updating
+        if scheduler.new_unit_entered:
+            # Wait for all in-flight async IO operations.
+            self.nvme_swapper.synchronize()
+            self.para_coordinator.pre_unit_forward(task.unit)
+            self.opts_coordinator.pre_unit_forward(task.unit)
         # 1. Prefetch the next passed_down and offload the last passed_down
         next_task = self.scheduler.next_task
         # If the next task is in the same micro batch, prefetch is not needed
@@ -175,14 +178,6 @@ class FlexTrainEngine(object):
         self.opts_coordinator.pre_micro_batch_forward(task)
         # 3. Prefetch the parameter of the next unit
         self.para_coordinator.pre_micro_batch_forward(task)
-        # Link parameters to memory (prefetch NVMe parameters if needed)
-        # Conduct NVMe parameter updating
-        if scheduler.new_unit_entered:
-            # Wait for all in-flight async IO operations.
-            self.nvme_swapper.synchronize()
-            self.para_coordinator.pre_unit_forward(task.unit)
-            self.opts_coordinator.pre_unit_forward(task.unit)
-        # End of submit prefetching and offloading tasks
 
         # Wait for all in-flight operations
         self.data_stream.synchronize()
@@ -273,6 +268,13 @@ class FlexTrainEngine(object):
     def _conduct_backward(self, task: LLMTask):
         scheduler = self.scheduler
 
+        # Link parameters to memory (prefetch NVMe parameters if needed)
+        if scheduler.new_unit_entered:
+            # Wait for all in-flight async IO operations.
+            self.nvme_swapper.synchronize()
+            self.para_coordinator.pre_unit_backward(task.unit)
+            self.opts_coordinator.pre_unit_backward(task.unit)
+
         # 1. Submit prefetching the next passed_down
         next_task = self.scheduler.next_task
         ckpt_prefetch = InterLayerTask(
@@ -288,20 +290,6 @@ class FlexTrainEngine(object):
         # 2. Prefetch the parameter of the next unit
         self.para_coordinator.pre_micro_batch_backward(task)
         self.opts_coordinator.pre_micro_batch_backward(task)
-        # Link parameters to memory (prefetch NVMe parameters if needed)
-        if scheduler.new_unit_entered:
-            # Wait for all in-flight async IO operations.
-            self.nvme_swapper.synchronize()
-            self.para_coordinator.pre_unit_backward(task.unit)
-            self.opts_coordinator.pre_unit_backward(task.unit)
-            # if not hasattr(self, 'test_buffer1'):
-            #     self.test_buffer1 = torch.empty(113236992)
-            #     self.test_buffer2 = torch.empty(113236992)
-            # def test_name(unit):
-            #     return f"rank{dist.get_rank()}_test_unit{unit}"
-            # get_nvme_swapper().swap_in(test_name(task.unit), self.test_buffer1, async_op=True)
-            # get_nvme_swapper().swap_out(test_name(task.unit + 1), self.test_buffer2, async_op=True)
-        # End of submit prefetching and offloading tasks
 
         # Wait for all in-flight operations
         self.data_stream.synchronize()
@@ -361,26 +349,16 @@ class FlexTrainEngine(object):
     def dynamic_loss_scaling(self):
         return self.loss_scaler.dynamic
 
-    def step(
-        self, *,  # Enforce keyword-only arguments
-        lr_kwargs: Dict = None
-    ):
-        # Conduct on the spot tasks
+    def step(self, *args, **kwargs):
         pass
-        # End of on the spot tasks
 
-        # Submit delayed tasks
-        def _update_lr():
-            if self.lr_scheduler is not None and lr_kwargs is not None:
-                self.lr_scheduler.step(**lr_kwargs)
+    def register_post_step_function(self, func: Callable):
+        self.delayed_functions.append(func)
 
-        self.delayed_functions.append(_update_lr)
-        self.delayed_functions.append(self.optimizer.update_state)
-        # End of submit delayed tasks
+    def _update_engine(self):
+        # Update the optimizer state for the backward pass
+        self.optimizer.update_state()
 
-        return
-
-    def _dalayed_step(self):
         # Conduct delayed tasks
         for func in self.delayed_functions:
             func()
@@ -416,8 +394,8 @@ class FlexTrainEngine(object):
             times_fwd.append(t_end - t_start)
             torch.cuda.nvtx.range_pop()
 
-        # Conduct delayed step
-        self._dalayed_step()
+        # Update the engine for the backward pass
+        self._update_engine()
 
         # Backward
         warmup_backward_pipeline(self.scheduler)

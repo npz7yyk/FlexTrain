@@ -1,6 +1,7 @@
 import gc
 import torch
 
+from collections import deque
 from enum import Enum
 from math import ceil
 from torch import Tensor
@@ -226,13 +227,13 @@ class FusedHandle(Waitable):
 
 class RotateContainer:
     def __init__(self, items: Tuple):
-        self._items = list(items)
+        self._items = deque(items)
 
     def __getitem__(self, index: SupportsIndex):
         return self._items[index]
 
     def rotate(self):
-        self._items.append(self._items.pop(0))
+        self._items.rotate(1)
 
 
 def allocate_memory_chunks(

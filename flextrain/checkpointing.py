@@ -314,16 +314,16 @@ def retrieve_tensor_grads(
     return rst if not unwrap_tensors else rst[0]
 
 
-# Function to run before the backward pass.
+# Function to run after recomputation.
 # Typically used for communication.
-def _PRE_BACKWARD_FUNCTION():
+def _POST_RECOMPUTATION_FUNCTION():
     pass
 
 
-def set_pre_backward_function(func: Callable):
+def set_post_recomputation_function(func: Callable):
     """Set the function to run for the backward pass."""
-    global _PRE_BACKWARD_FUNCTION
-    _PRE_BACKWARD_FUNCTION = func
+    global _POST_RECOMPUTATION_FUNCTION
+    _POST_RECOMPUTATION_FUNCTION = func
 
 
 def checkpointed_backward(fwd_ctx: FWDContext, *grads):
@@ -369,7 +369,7 @@ def checkpointed_backward(fwd_ctx: FWDContext, *grads):
             grad_tensors.append(grad)
 
     # Run the pre-backward function.
-    _PRE_BACKWARD_FUNCTION()
+    _POST_RECOMPUTATION_FUNCTION()
 
     # Run the backward pass.
     torch.autograd.backward(output_tensors, grad_tensors)

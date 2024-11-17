@@ -335,7 +335,7 @@ class FlexTrainParaCoordinator:
             "\n\n> "
             f"FlexTrain parameter coordinator initialized with configurations:"
             f"\n"
-            f"  - number of ranks: {dist.get_world_size()}\n"
+            f"  - number of workers: {dist.get_world_size()}\n"
             f"  - number of micro-batches per rank: "
             f"{self._micro_batch_per_rank}\n"
             f"  - device dtype: {self._device_dtype}\n"

@@ -51,7 +51,6 @@ def add_config_arguments(parser: ArgumentParser) -> ArgumentParser:
 def initialize(
     model: torch.nn.Module,
     optimizer: FlexTrainOptimizer,
-    lr_scheduler: LRScheduler = None,
     config: dict = None,
     dist_init_required=False,
     dist_backend=TORCH_DISTRIBUTED_BACKEND_DEFAULT,
@@ -77,8 +76,7 @@ def initialize(
     # Wrap the model with FlexTrainEngine
     model = FlexTrainEngine(
         model=model,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler
+        optimizer=optimizer
     )
 
     return model

@@ -8,10 +8,11 @@ from torch import Tensor
 from tqdm import tqdm
 from typing import Set, Dict
 
-from flextrain.checkpointing import set_pre_backward_function
+from flextrain.checkpointing import set_post_recomputation_function
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
     Waitable,
+    DummyHandle,
     FunctionHandle,
     FlexTrainDataType as Dtype,
     FlexTrainDataID,
@@ -168,14 +169,9 @@ class FlexTrainOptsCoordinator:
         return micro_batch_index < 0 or \
             micro_batch_index >= self._micro_batch_per_rank
 
-    def _is_invalid_task_(self, unit_index: int, micro_batch_index: int):
+    def _is_invalid_task(self, unit_index: int, micro_batch_index: int):
         return self._is_invalid_unit(unit_index) or \
             self._is_invalid_micro_batch(micro_batch_index)
-
-    def _is_invalid_task(self, task: LLMTask):
-        return task is None or \
-            self._is_invalid_unit(task.unit) or \
-            self._is_invalid_micro_batch(task.micro_batch)
 
     def initialize(
         self,
@@ -192,6 +188,7 @@ class FlexTrainOptsCoordinator:
 
         # Link the optimizer to the coordinator.
         self._optimizer = cpu_optimizer
+        self._inflight_optimizer_step = DummyHandle()
 
         # Use the same data stream as the parameter & inter-layer coordinator.
         self._data_stream = get_data_stream()
@@ -291,22 +288,23 @@ class FlexTrainOptsCoordinator:
         ]
 
         # How to split the forward optimizer states across devices.
-        self._unit_fwd_opt_splits = get_split_numels(
-            self._unit_fwd_opt_numel,
+        self._mb_fwd_opt_splits = get_split_numels(
+            self._mb_fwd_opt_numel,
             opts_cpu_nvme_ratio, num_levels=2
         )
+        self._unit_fwd_opt_splits = [
+            numel * self._micro_batch_per_rank
+            for numel in self._mb_fwd_opt_splits
+        ]
         # How to split the backward optimizer states across devices.
-        self._unit_bwd_opt_splits = get_split_numels(
-            self._unit_bwd_opt_numel,
+        self._mb_bwd_opt_splits = get_split_numels(
+            self._mb_bwd_opt_numel,
             opts_cpu_nvme_ratio, num_levels=2
         )
-
-        dist.print_rank0(
-            "\n"
-            "\nself._unit_fwd_opt_splits", self._unit_fwd_opt_splits,
-            "\nself._unit_bwd_opt_splits", self._unit_bwd_opt_splits,
-            "\n"
-        )
+        self._unit_bwd_opt_splits = [
+            numel * self._micro_batch_per_rank
+            for numel in self._mb_bwd_opt_splits
+        ]
 
         # NVMe group for optimizer.
         self._opt_nvme_group = NVMeGroup([
@@ -635,13 +633,11 @@ class FlexTrainOptsCoordinator:
         # Link the gradients.
         unit_paras.link_grad_to(grad_buffer)
 
-    def _submit_transfer_grad(
-        self, unit_index: int, micro_batch_index: int
-    ):
+    def _submit_transfer_grad(self, unit_index: int, micro_batch_index: int):
         """ Launch the async IO operation to transfer gradients. """
         # Return if the task is invalid.
-        if self._is_invalid_task_(unit_index, micro_batch_index):
-            return
+        if self._is_invalid_task(unit_index, micro_batch_index):
+            return lambda: None
 
         # Get the default stream.
         default_stream = torch.cuda.current_stream()
@@ -697,237 +693,127 @@ class FlexTrainOptsCoordinator:
 
             self._grad_partition[unit_index][micro_batch_index].copy_(mem_partition)
 
-        # Submit the task to the data stream.
-        self._data_stream.submit(transfer_grads)
+        # Return the task, will be submitted to the data stream.
+        return transfer_grads
 
-    def _submit_recover_grad(self):
-        """ Launch the async IO operation to recover forward gradients. """
-        # Locate and unpack the task.
-        task = self._inflight_task_queue[self.RECOVER_GRAD]
-        # Return if no task to conduct.
-        if task is None:
+    def _submit_transfer_opts(self, unit_index: int, forward: bool):
+        """ Launch the async IO operation to transfer CPU optimizer states. """
+        # Return if the task is invalid.
+        if self._is_invalid_unit(unit_index):
             return
-        # dist.print_rank0("Recover grads:", task)
-        return
 
-        # Copy the forward gradients from borrowed memory into working buffer.
-        # 1. Locate the source memory.
-        cpu_src1 = self._cpu_grad_buffer1[unit_index][micro_batch_index]
-        cpu_src2 = self._cpu_grad_buffer2[unit_index][micro_batch_index]
-        gpu_src1 = self._gpu_grad_buffer1[unit_index][micro_batch_index]
-        gpu_src2 = self._gpu_grad_buffer2[unit_index][micro_batch_index]
-
-        # 2. Locate the target memory.
-        cpu_tar1, cpu_tar2, gpu_tar1, gpu_tar2, nvme_tar = torch.split(
-            self._cpu_opt_receive_grads[:self._forward_numel],
-            self._forward_mem_splits
-        )
-
-        # 3. Copy the source memory to the target memory.
-        def recover_grads():
-            cpu_tar1.copy_(cpu_src1, non_blocking=True)
-            cpu_tar2.copy_(cpu_src2, non_blocking=True)
-            gpu_tar1.copy_(gpu_src1, non_blocking=True)
-            gpu_tar2.copy_(gpu_src2, non_blocking=True)
-
-        handle = _nvme_reload(
-            FlexTrainDataID(unit_index, Dtype.GRAD),
-            nvme_tar, async_op=True
-        )
-
-        # 4. Submit the task to the data stream.
-        self._data_stream.submit(recover_grads)
-
-    def _submit_transfer_opts(self):
-        """ Launch the async IO operation to transfer optimizer states. """
-        # Locate and unpack the task.
-        task = self._inflight_task_queue[self.TRANSFER_OPTS]
-        # Return if no task to conduct.
-        if task is None:
-            return
-        # dist.print_rank0("Transfer opts:", task)
-        return
-
-        # dist.print_rank0(f"Submitting transfer opts unit {unit_index} micro_batch {micro_batch_index}")
         # 1. Locate the source memory.
         cpu_src = self._cpu_opt_fwd_base if forward else self._cpu_opt_bwd_base
-        cpu_src = cpu_src[unit_index][micro_batch_index]
+        cpu_src = cpu_src[unit_index]
 
         # 2. Locate the target memory.
         receive_buffer = self._cpu_opt_receive_states
-        clip_numel = self._forward_opt_numel \
-            if forward else self._backward_opt_numel
+        clip_numel = self._unit_fwd_opt_numel \
+            if forward else self._unit_bwd_opt_numel
         receive_buffer = receive_buffer[:clip_numel]
-        cpu_tar, nvme_tar = torch.split(
-            receive_buffer,
-            self._forward_opt_splits if forward else self._backward_opt_splits
-        )
+        split_numel = self._unit_fwd_opt_splits \
+            if forward else self._unit_bwd_opt_splits
+        cpu_tar = torch.split(receive_buffer, split_numel)[0]
 
         # 3. Copy the source memory to the target memory.
         cpu_tar.copy_(cpu_src, non_blocking=True)
-        return self._opt_nvme_group.single_reload(
-            FlexTrainDataID(unit_index, micro_batch_index, Dtype.OPTS),
-            nvme_tar, index=0 if forward else 1, async_op=True
+
+    def _submit_optimizer_step(self, unit_index: int, forward: bool):
+        """ Launch the async IO operation to update CPU optimizer states. """
+        # Return if the task is invalid.
+        if self._is_invalid_unit(unit_index):
+            return lambda: None
+
+        # 1. Locate the optimizer states.
+        opts_mem = self._cpu_opt_available_states
+        clip_numel = self._unit_fwd_opt_numel \
+            if forward else self._unit_bwd_opt_numel
+        opts_mem = opts_mem[:clip_numel]
+        optimizer_states = torch.chunk(opts_mem, self._opt_state_per_element)
+
+        # 2. Locate the gradient memory.
+        grad_mem = self._cpu_opt_available_grads
+        clip_numel = self._unit_fwd_numel if forward else self._unit_bwd_numel
+        gradients = grad_mem[:clip_numel]
+
+        # TEMP:
+        gradients.zero_()
+
+        # # 3. Submit the optimizer step.
+        self._optimizer.submit_step(
+            unit_index, optimizer_states[0], gradients, *optimizer_states[1:]
         )
 
-    def _submit_optimizer_step(self):
-        """ Launch the async optimizer step operation. """
-        # Locate and unpack the task.
-        task = self._inflight_task_queue[self.OPTIMIZER_STEP]
-        # Return if no task to conduct.
-        if task is None:
+    def _submit_update_opts(self, unit_index: int, forward: bool):
+        """ Launch the async IO operation to update CPU optimizer states. """
+        # Return if the task is invalid.
+        if self._is_invalid_unit(unit_index):
             return
-        # dist.print_rank0("Optimizer step:", task)
-        return
 
-        # 1. Locate the parameters / gradients / optimizer states.
-        clip_numel = self._forward_opt_numel \
-            if forward else self._backward_opt_numel
-        cpu_states = torch.chunk(
-            self._cpu_opt_available_states[:clip_numel],
-            self._opt_state_per_element
-        )
-        cpu_paras = cpu_states[0]
-        cpu_grads = self._cpu_opt_available_grads
-        cpu_states = cpu_states[1:]
-
-        # 2. Submit the optimizer step task.
-        handle = self._optimizer.submit_micro_batch_step(
-            unit_index, micro_batch_index,
-            cpu_paras, cpu_grads, *cpu_states
-        )
-
-    def _submit_offload_grad(self):
-        """ Launch the async IO operation to offload forward gradients. """
-        # Locate and unpack the task.
-        task = self._inflight_task_queue[self.OFFLOAD_GRAD]
-        # Return if no task to conduct.
-        if task is None:
-            return
-        # dist.print_rank0("Offload grads:", task)
-        return
-
-        # 1. Submit the optimizer step task.
-        handle = self._grad_nvme_group.single_offload(
-            FlexTrainDataID(unit_index, Dtype.GRAD),
-            self._nvme_grad_offload_buffer,
-            index=micro_batch_index, async_op=True
-        )
-
-    def _submit_update_opts(self):
-        """ Launch the async IO operation to update optimizer states. """
-        # Locate and unpack the task.
-        task = self._inflight_task_queue[self.UPDATE_OPTS]
-        # Return if no task to conduct.
-        if task is None:
-            return
-        # dist.print_rank0("Update opts:", task)
-        return
-
-        # First, write back the optimizer states.
         # 1. Locate the source memory.
         writeback_buffer = self._cpu_opt_transfer_states
-        clip_numel = self._forward_opt_numel \
-            if forward else self._backward_opt_numel
+        clip_numel = self._unit_fwd_opt_numel \
+            if forward else self._unit_bwd_opt_numel
         writeback_buffer = writeback_buffer[:clip_numel]
-        cpu_src, nvme_src = torch.split(
-            writeback_buffer,
-            self._forward_opt_splits if forward else self._backward_opt_splits
-        )
+        split_numel = self._unit_fwd_opt_splits \
+            if forward else self._unit_bwd_opt_splits
+        cpu_src = torch.split(writeback_buffer, split_numel)[0]
 
         # 2. Locate the target memory.
         cpu_tar = self._cpu_opt_fwd_base if forward else self._cpu_opt_bwd_base
-        cpu_tar = cpu_tar[unit_index][micro_batch_index]
+        cpu_tar = cpu_tar[unit_index]
 
         # 3. Copy the source memory to the target memory.
         cpu_tar.copy_(cpu_src, non_blocking=True)
-        handle1 = self._opt_nvme_group.single_offload(
-            FlexTrainDataID(unit_index, Dtype.OPTS),
-            nvme_src, index=0 if forward else 1, async_op=True
-        )
 
-        # Second, update the parameters.
-        # 1. Locate the source memory.
-        updated_para = torch.chunk(
-            writeback_buffer, self._opt_state_per_element
-        )[0]
-
-        # 2. Locate the target memory.
-        cpu_para = self._para._cpu_para_base[unit_index][micro_batch_index]
-        cpu_fwd_tar, cpu_bwd_tar = torch.split(
-            cpu_para, self._mb_cpu_para_alpha_splits
-        )
-        gpu_para = self._para._gpu_para_base[unit_index][micro_batch_index]
-        gpu_fwd_tar, gpu_bwd_tar = torch.split(
-            gpu_para, self._mb_gpu_para_alpha_splits
-        )
-
-        if forward:
-            # 1. Locate the source memory.
-            cpu_src, gpu_src, nvme_src = torch.split(
-                updated_para, self._forward_para_splits
-            )
-            cpu_fwd_tar.copy()
-        else:
-            # 1. Locate the source memory.
-            _, cpu_src, _, gpu_src, _ = torch.split(
-                updated_para, self._cpu_opt_para_update_splits
-            )
-
-    def _submit_update_para(self):
+    def _submit_update_para(
+        self,
+        unit_index: int,
+        micro_batch_index: int,
+        forward: bool
+    ):
         """ Launch the async IO operation to update parameters. """
-        # Locate and unpack the task.
-        task = self._inflight_task_queue[self.UPDATE_PARA]
-        # Return if no task to conduct.
-        if task is None:
-            return
-        # dist.print_rank0("Update para:", task)
-        return
+        # Return if the task is invalid.
+        if self._is_invalid_task(unit_index, micro_batch_index):
+            return lambda: None
 
         # 1. Locate the source memory.
         updated_para = self._cpu_opt_transfer_states
-        clip_numel = self._forward_numel if forward else self._backward_numel
+        clip_numel = self._unit_fwd_numel if forward else self._unit_bwd_numel
         updated_para = updated_para[:clip_numel]
-        cpu_src, gpu_src, nvme_src = torch.split(
-            updated_para, self._forward_para_splits
-        )
+        updated_para = torch.chunk(
+            updated_para, self._micro_batch_per_rank
+        )[micro_batch_index]
+        split_numel = self._mb_fwd_para_splits \
+            if forward else self._mb_bwd_para_splits
+        cpu_src, gpu_src, nvme_src = torch.split(updated_para, split_numel)
 
         # 2. Locate the target memory.
         cpu_para = self._para._cpu_para_base[unit_index][micro_batch_index]
         cpu_fwd_tar, cpu_bwd_tar = torch.split(
             cpu_para, self._mb_cpu_para_alpha_splits
         )
+        cpu_tar = cpu_fwd_tar if forward else cpu_bwd_tar
         gpu_para = self._para._gpu_para_base[unit_index][micro_batch_index]
         gpu_fwd_tar, gpu_bwd_tar = torch.split(
             gpu_para, self._mb_gpu_para_alpha_splits
         )
-        nvme_para = self._para._nvme_available_paras
+        gpu_tar = gpu_fwd_tar if forward else gpu_bwd_tar
+        nvme_para = self._para.nvme_forward_update_paras \
+            if forward else self._nvme_para_receive_buffer
+        nvme_tar = torch.chunk(
+            nvme_para, self._micro_batch_per_rank
+        )[micro_batch_index]
 
         # 3. Copy the source memory to the target memory.
-        cpu_fwd_tar.copy_(cpu_src, non_blocking=True)
-        gpu_fwd_tar.copy_(gpu_src, non_blocking=True)
-        nvme_para.copy_(nvme_src, non_blocking=True)
+        cpu_tar.copy_(cpu_src, non_blocking=True)
+        nvme_tar.copy_(nvme_src, non_blocking=True)
 
-    def _submit_offload_para(self):
-        """ Launch the async IO operation to offload parameters. """
-        # Locate and unpack the task.
-        task = self._inflight_task_queue[self.OFFLOAD_PARA]
-        # Return if no task to conduct.
-        if task is None:
-            return
-        # dist.print_rank0("Para offload:", task)
-        return
+        def _update_gpu_para():
+            gpu_tar.copy_(gpu_src, non_blocking=True)
 
-        # 1. Locate the source memory.
-        src_mem = self._nvme_para_offload_buffer
-        clip_numel = self._forward_numel if forward else self._backward_numel
-        src_mem = src_mem[:clip_numel]
-
-        # 2. Submit the offload task.
-        handle = self._para_nvme_group.single_offload(
-            FlexTrainDataID(unit_index, micro_batch_index, Dtype.PARA),
-            src_mem, index=0 if forward else 1, async_op=True
-        )
+        # 4. Return the task, will be submitted to the data stream.
+        return _update_gpu_para
 
     def pre_micro_batch_forward(self, curr_task: LLMTask):
         # For the first iteration, the optimizer is not ready.
@@ -943,12 +829,20 @@ class FlexTrainOptsCoordinator:
         # Unpack the task.
         unit_index, micro_batch_index = curr_task.unit, curr_task.micro_batch
 
-        # Trick: execute gradient reduce-scatter after recomputation.
-        # For the first unit, submit the task directly.
-        def _grad_reduce_scatter():
-            self._submit_transfer_grad(unit_index + 1, micro_batch_index)
+        # Trick: execute CUDA stream operations after recomputation.
+        transfer_grad = self._submit_transfer_grad(
+            unit_index + 1, micro_batch_index
+        )
+        update_para = self._submit_update_para(
+            unit_index + 3, micro_batch_index, forward=False
+        )
+
+        # Submit CUDA stream tasks to the post-recomputation function.
+        def _pre_micro_batch_tasks():
+            transfer_grad()
+            update_para()
             self._data_stream.execute()
-        set_pre_backward_function(_grad_reduce_scatter)
+        set_post_recomputation_function(_pre_micro_batch_tasks)
 
     def post_micro_batch_backward(self, curr_task: LLMTask):
         """ Conduct post-processing after the backward of the micro-batch. """
@@ -959,7 +853,15 @@ class FlexTrainOptsCoordinator:
             gradacc_buffer += self._gpu_bwd_extra_grads
 
     def pre_unit_forward(self, unit_index: int):
-        pass
+        # If the optimizer is not initialized, return.
+        if not self.is_initialized:
+            return
+
+        # Rotate the buffers.
+        self._cpu_opt_grad_buffers.rotate()
+        self._cpu_opt_work_buffers.rotate()
+        self._nvme_grad_buffers.rotate()
+        self._nvme_para_buffers.rotate()
 
     def pre_unit_backward(self, unit_index: int):
         """ Prepare the unit for backward pass.
@@ -977,8 +879,21 @@ class FlexTrainOptsCoordinator:
         if self._is_invalid_unit(unit_index):
             return
 
-        # Prepare the gradient buffer.
+        # Synchrnoize the inflight optimizer step.
+        self._inflight_optimizer_step.wait()
+
+        # Rotate the buffers.
         self._gpu_bwd_grad_buffers.rotate()
+        self._cpu_opt_grad_buffers.rotate()
+        self._cpu_opt_work_buffers.rotate()
+        self._nvme_grad_buffers.rotate()
+        self._nvme_para_buffers.rotate()
+
+        self._submit_transfer_opts(unit_index + 1, forward=False)
+        self._submit_optimizer_step(unit_index + 2, forward=False)
+        self._submit_update_opts(unit_index + 3, forward=False)
+
+        # Prepare the gradient buffer.
         self._prepare_unit_grads(unit_index)
 
     def warmup_backward_pipeline(self):
@@ -998,7 +913,7 @@ class FlexTrainOptsCoordinator:
 
         # Conduct the optimizer step of the first unit.
         for mb in reversed(range(self._micro_batch_per_rank)):
-            self._submit_transfer_grad(0, mb)
+            self._submit_transfer_grad(0, mb)()
         self._data_stream.execute()
         self._data_stream.synchronize()
 
