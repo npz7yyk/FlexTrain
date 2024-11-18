@@ -190,6 +190,8 @@ class FlexTrainOptsCoordinator:
         self._optimizer = cpu_optimizer
         self._inflight_optimizer_step = DummyHandle()
 
+        # Link to the same NVMe swapper as the parameter coordinator.
+        self._nvme_swapper = para._nvme_swapper
         # Use the same data stream as the parameter & inter-layer coordinator.
         self._data_stream = get_data_stream()
 
@@ -603,6 +605,13 @@ class FlexTrainOptsCoordinator:
         dist.print_rank0(global_grad_norm.item())
         return global_grad_norm.item()
 
+    def _rotate_buffers(self):
+        self._gpu_bwd_grad_buffers.rotate()
+        self._cpu_opt_grad_buffers.rotate()
+        self._cpu_opt_work_buffers.rotate()
+        self._nvme_grad_buffers.rotate()
+        self._nvme_para_buffers.rotate()
+
     def _prepare_unit_grads(self, unit_index: int):
         """
         Prepare the gradients for the unit.
@@ -839,8 +848,8 @@ class FlexTrainOptsCoordinator:
 
         # Submit CUDA stream tasks to the post-recomputation function.
         def _pre_micro_batch_tasks():
-            transfer_grad()
-            update_para()
+            self._data_stream.submit(transfer_grad)
+            self._data_stream.submit(update_para)
             self._data_stream.execute()
         set_post_recomputation_function(_pre_micro_batch_tasks)
 
@@ -858,10 +867,7 @@ class FlexTrainOptsCoordinator:
             return
 
         # Rotate the buffers.
-        self._cpu_opt_grad_buffers.rotate()
-        self._cpu_opt_work_buffers.rotate()
-        self._nvme_grad_buffers.rotate()
-        self._nvme_para_buffers.rotate()
+        self._rotate_buffers()
 
     def pre_unit_backward(self, unit_index: int):
         """ Prepare the unit for backward pass.
@@ -883,11 +889,7 @@ class FlexTrainOptsCoordinator:
         self._inflight_optimizer_step.wait()
 
         # Rotate the buffers.
-        self._gpu_bwd_grad_buffers.rotate()
-        self._cpu_opt_grad_buffers.rotate()
-        self._cpu_opt_work_buffers.rotate()
-        self._nvme_grad_buffers.rotate()
-        self._nvme_para_buffers.rotate()
+        self._rotate_buffers()
 
         self._submit_transfer_opts(unit_index + 1, forward=False)
         self._submit_optimizer_step(unit_index + 2, forward=False)
@@ -906,10 +908,13 @@ class FlexTrainOptsCoordinator:
         """
         Cleanup the backward pipeline.
         """
-        # Move the gradient of the first unit to transfer_buffer.
-        self._gpu_bwd_grad_buffers.rotate()
-
+        # Synchronize the inflight tasks.
+        self._inflight_optimizer_step.wait()
+        self._nvme_swapper.synchronize()
         self._data_stream.synchronize()
+
+        # Rotate the buffers.
+        self._rotate_buffers()
 
         # Conduct the optimizer step of the first unit.
         for mb in reversed(range(self._micro_batch_per_rank)):
