@@ -293,19 +293,29 @@ class FlexTrainDataStream:
 
     def __init__(self):
         self._stream = torch.cuda.Stream()
-        self._tasks: List[Callable] = []
+        self._stream_tasks: List[Callable] = []
+        self._normal_tasks: List[Callable] = []
 
     def is_empty(self):
-        return len(self._tasks) == 0
+        return len(self._stream_tasks) == 0 \
+            and len(self._normal_tasks) == 0
 
-    def submit(self, task):
-        self._tasks.append(task)
+    def submit(self, task, stream_execution=True):
+        if stream_execution:
+            self._stream_tasks.append(task)
+        else:
+            self._normal_tasks.append(task)
 
     def execute(self):
+        # Execute the stream tasks in the stream.
         with torch.cuda.stream(self._stream):
-            for task in self._tasks:
+            for task in self._stream_tasks:
                 task()
-        self._tasks.clear()
+        self._stream_tasks.clear()
+        # Execute the normal tasks.
+        for task in self._normal_tasks:
+            task()
+        self._normal_tasks.clear()
 
     def synchronize(self):
         torch.cuda.synchronize()

@@ -174,7 +174,9 @@ class FlexTrainInterLayerCoordinator:
         return grad_mem.view(self._tensor_shape)
 
     def _sync_pre_micro_batch_forward(self):
-        self._inflight_handle.wait()
+        self._data_stream.submit(
+            self._inflight_handle.wait, stream_execution=False
+        )
         self._gpu_full_ckpts.rotate()
 
     def _prefetch_ckpt(self, task: InterLayerTask):
@@ -234,7 +236,9 @@ class FlexTrainInterLayerCoordinator:
         self._submit_pre_micro_batch_forward(ckpt_prefetch, ckpt_offload)
 
     def _sync_pre_micro_batch_backward(self):
-        self._inflight_handle.wait()
+        self._data_stream.submit(
+            self._inflight_handle.wait, stream_execution=False
+        )
         self._gpu_full_ckpts.rotate()
         self._gpu_full_grads.rotate()
 

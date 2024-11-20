@@ -618,7 +618,11 @@ class FlexTrainOptsCoordinator:
             grad_buffer = self._gpu_bwd_receive_grads
 
         # Zero the receive buffer.
-        torch.zero_(self._gpu_bwd_receive_grads)
+        # IMPORTANT: This is delayed after torch.cuda.synchronize().
+        self._data_stream.submit(
+            lambda: torch.zero_(self._gpu_bwd_receive_grads),
+            stream_execution=False
+        )
 
         # Link the gradients.
         unit_paras.link_grad_to(grad_buffer)
@@ -629,9 +633,6 @@ class FlexTrainOptsCoordinator:
         if self._is_invalid_task(unit_index, micro_batch_index):
             return lambda: None
 
-        # Get the default stream.
-        default_stream = torch.cuda.current_stream()
-
         def transfer_grads():
             # Locate the target memory.
             src_full_grads = torch.chunk(
@@ -640,11 +641,6 @@ class FlexTrainOptsCoordinator:
             mem_partition = torch.chunk(
                 src_full_grads, dist.get_world_size()
             )[dist.get_rank()]
-
-            # Synchronize with the default stream for the first unit.
-            # Because there is no torch.cuda.synchronize() before.
-            if unit_index == 0:
-                default_stream.synchronize()
 
             # All-reduce the gradients.
             dist.reduce_scatter(
@@ -703,10 +699,14 @@ class FlexTrainOptsCoordinator:
         receive_buffer = receive_buffer[:clip_numel]
         split_numel = self._unit_fwd_opt_splits \
             if forward else self._unit_bwd_opt_splits
-        cpu_tar = torch.split(receive_buffer, split_numel)[0]
+        cpu_tar, nvme_tar = torch.split(receive_buffer, split_numel)
 
         # 3. Copy the source memory to the target memory.
         cpu_tar.copy_(cpu_src, non_blocking=True)
+        self._opt_nvme_group.single_reload(
+            FlexTrainDataID(Dtype.OPTS, unit_index),
+            nvme_tar, index=0 if forward else 1, async_op=True
+        )
 
     def _submit_optimizer_step(self, unit_index: int, forward: bool):
         """ Launch the async IO operation to update CPU optimizer states. """
@@ -748,7 +748,7 @@ class FlexTrainOptsCoordinator:
         writeback_buffer = writeback_buffer[:clip_numel]
         split_numel = self._unit_fwd_opt_splits \
             if forward else self._unit_bwd_opt_splits
-        cpu_src = torch.split(writeback_buffer, split_numel)[0]
+        cpu_src, nvme_src = torch.split(writeback_buffer, split_numel)
 
         # 2. Locate the target memory.
         cpu_tar = self._cpu_opt_fwd_base if forward else self._cpu_opt_bwd_base
@@ -756,6 +756,10 @@ class FlexTrainOptsCoordinator:
 
         # 3. Copy the source memory to the target memory.
         cpu_tar.copy_(cpu_src, non_blocking=True)
+        self._opt_nvme_group.single_offload(
+            FlexTrainDataID(Dtype.OPTS, unit_index),
+            nvme_src, index=0 if forward else 1, async_op=True
+        )
 
     def _submit_update_para(
         self,
@@ -884,7 +888,7 @@ class FlexTrainOptsCoordinator:
         # Complete the initialization.
         self._initialize_alpha_split()
         # Inform the parameter coordinator that future updates are coming.
-        self._para.parameter_updated = True
+        # self._para.parameter_updated = True
 
     def clear_backward_pipeline(self):
         """
