@@ -36,8 +36,7 @@ class FlexTrainDataID:
         checkpoint_interval = get_flextrain_config().checkpoint_interval
         start = self.unit_index * checkpoint_interval
         end = start + checkpoint_interval - 1
-        layer_index = f"{start}-{end}" \
-            if checkpoint_interval > 1 else f"{start}"
+        layer_index = f"{start}-{end}" if checkpoint_interval > 1 else start
         return (
             f"rank{get_rank()}_"
             f"{self.data_type.name}_"
