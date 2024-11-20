@@ -240,16 +240,6 @@ class FlexTrainOptsCoordinator:
 
         max_numel = max(self._unit_fwd_numel, self._unit_bwd_numel)
 
-        dist.print_rank0(
-            "\n"
-            "\nself._mb_fwd_numel", self._mb_fwd_numel,
-            "\nself._mb_bwd_numel", self._mb_bwd_numel,
-            "\nself._unit_fwd_numel", self._unit_fwd_numel,
-            "\nself._unit_bwd_numel", self._unit_bwd_numel,
-            "\nmax_numel", max_numel,
-            "\n"
-        )
-
         # Calculate the numel of forward and backward optimizer states.
         self._mb_fwd_opt_numel = self._mb_fwd_numel * \
             self._opt_state_per_element
@@ -260,15 +250,6 @@ class FlexTrainOptsCoordinator:
             self._opt_state_per_element
         self._unit_bwd_opt_numel = self._unit_bwd_numel * \
             self._opt_state_per_element
-
-        dist.print_rank0(
-            "\n"
-            "\nself._mb_fwd_opt_numel", self._mb_fwd_opt_numel,
-            "\nself._mb_bwd_opt_numel", self._mb_bwd_opt_numel,
-            "\nself._unit_fwd_opt_numel", self._unit_fwd_opt_numel,
-            "\nself._unit_bwd_opt_numel", self._unit_bwd_opt_numel,
-            "\n"
-        )
 
         # How to split the micro-batch parameters.
         self._mb_para_splits = [
@@ -746,11 +727,12 @@ class FlexTrainOptsCoordinator:
         gradients = grad_mem[:clip_numel]
 
         # TEMP:
-        gradients.zero_()
+        if not hasattr(self, "_zeros"):
+            self._zeros = torch.zeros_like(gradients)
 
-        # # 3. Submit the optimizer step.
-        self._optimizer.submit_step(
-            unit_index, optimizer_states[0], gradients, *optimizer_states[1:]
+        # 3. Submit the optimizer step.
+        self._inflight_optimizer_step = self._optimizer.submit_step(
+            unit_index, optimizer_states[0], self._zeros, *optimizer_states[1:]
         )
 
     def _submit_update_opts(self, unit_index: int, forward: bool):
