@@ -436,8 +436,6 @@ class FlexTrainParaCoordinator:
             f"actual unit index: {unit_index}."
         )
 
-        # TODO: Validate the inflight NVMe offload.
-
     def _async_load_gpu_paras(self, unit_index: int, micro_batch_index: int):
         """
         Prepare the GPU parameters for the unit.
@@ -446,7 +444,7 @@ class FlexTrainParaCoordinator:
         """
         # 0. Check if the unit is valid.
         if self._is_invalid_unit(unit_index):
-            return
+            return lambda: None
 
         def load_gpu_para_task():
             # Basic memory partition.
@@ -486,8 +484,8 @@ class FlexTrainParaCoordinator:
             nvme_backward_tar.copy_(nvme_backward_src, non_blocking=True)
             dist.all_gather(micro_batch_mem, rank_mem, async_op=True)
 
-        # Submit the task to the data stream.
-        self._data_stream.submit(load_gpu_para_task)
+        # 4. Return the task, will be submitted to the data stream.
+        return load_gpu_para_task
 
     def pre_micro_batch_forward(self, curr_task: LLMTask):
         """
@@ -508,7 +506,9 @@ class FlexTrainParaCoordinator:
             return
 
         # Submit the preparation of parameters for the next unit.
-        self._async_load_gpu_paras(unit_index + 1, micro_batch_index)
+        self._data_stream.submit(
+            self._async_load_gpu_paras(unit_index + 1, micro_batch_index)
+        )
 
     def pre_micro_batch_backward(self, curr_task: LLMTask):
         """
@@ -529,7 +529,9 @@ class FlexTrainParaCoordinator:
             return
 
         # Submit the preparation of parameters for the next unit.
-        self._async_load_gpu_paras(unit_index - 1, micro_batch_index)
+        self._data_stream.submit(
+            self._async_load_gpu_paras(unit_index - 1, micro_batch_index)
+        )
 
     def pre_unit_forward(self, unit_index: int):
         """
@@ -607,6 +609,23 @@ class FlexTrainParaCoordinator:
 
         # Link the parameters to the unit.
         self._link_unit_parameters(unit_index, self._gpu_available_paras)
+
+    def warmup_forward_pipeline(self):
+        # If parameters are updated, warm-up will be managed by optimizer.
+        # Therefore, return directly.
+        if self.parameter_updated:
+            return
+
+        # Load the first unit parameters to CPU.
+        self._async_load_nvme_paras(0)
+        self._nvme_swapper.synchronize()
+        self._nvme_prefetch_buffer.rotate()
+
+        # Launch the first unit forward.
+        self._async_load_nvme_paras(1)
+        for mb in range(self._micro_batch_per_rank):
+            self._async_load_gpu_paras(0, mb)()
+        self._data_stream.execute()
 
     def warmup_backward_pipeline(self):
         """

@@ -20,10 +20,7 @@ from flextrain.memory.coordinator import (
     get_opts_coordinator,
     get_interlayer_coordinator,
     InterLayerTask,
-    retrieve_tensor,
-    warmup_forward_pipeline,
-    warmup_backward_pipeline,
-    clear_backward_pipeline
+    retrieve_tensor
 )
 from flextrain.memory.nvme_swapper import get_nvme_swapper
 from flextrain.optimizer import FlexTrainOptimizer
@@ -383,13 +380,14 @@ class FlexTrainEngine(object):
         times_bwd = []
 
         # 2. Conduct all tasks assigned by the scheduler
-        # Forward
-        warmup_forward_pipeline(self.scheduler)
+        # Warmup the forward pipeline
+        self.para_coordinator.warmup_forward_pipeline()
+        self.opts_coordinator.warmup_forward_pipeline()
+        # Conduct forward
         for task in self.scheduler:
             torch.cuda.nvtx.range_push(f"Forward unit {task.unit}")
             t_start = time.time()
             self._conduct_forward(task)
-            # dist.print_rank0(f"Finished forward task: {task}")
             t_end = time.time()
             times_fwd.append(t_end - t_start)
             torch.cuda.nvtx.range_pop()
@@ -397,19 +395,21 @@ class FlexTrainEngine(object):
         # Update the engine for the backward pass
         self._update_engine()
 
-        # Backward
-        warmup_backward_pipeline(self.scheduler)
+        # Warmup the backward pipeline
+        self.para_coordinator.warmup_backward_pipeline()
+        self.opts_coordinator.warmup_backward_pipeline()
+        # Conduct backward
         for task in self.scheduler:
             torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
             t_start = time.time()
             self._conduct_backward(task)
-            # dist.print_rank0(f"Finished backward task: {task}")
             t_end = time.time()
             times_bwd.append(t_end - t_start)
             torch.cuda.nvtx.range_pop()
 
-        clear_backward_pipeline(self.scheduler)
-        # get_nvme_swapper().synchronize()
+        # Clear the backward pipeline
+        self.para_coordinator.clear_backward_pipeline()
+        self.opts_coordinator.clear_backward_pipeline()
         self.opts_coordinator._calculate_global_grad_norm()
 
         times = sorted(times_fwd, reverse=True)

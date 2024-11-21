@@ -708,7 +708,9 @@ class FlexTrainOptsCoordinator:
             nvme_tar, index=0 if forward else 1, async_op=True
         )
 
-    def _submit_optimizer_step(self, unit_index: int, forward: bool):
+    def _submit_optimizer_step(
+        self, unit_index: int, forward: bool, delay: bool = False
+    ):
         """ Launch the async IO operation to update CPU optimizer states. """
         # Return if the task is invalid.
         if self._is_invalid_unit(unit_index):
@@ -726,14 +728,18 @@ class FlexTrainOptsCoordinator:
         clip_numel = self._unit_fwd_numel if forward else self._unit_bwd_numel
         gradients = grad_mem[:clip_numel]
 
-        # TEMP:
-        if not hasattr(self, "_zeros"):
-            self._zeros = torch.zeros_like(gradients)
-
         # 3. Submit the optimizer step.
-        self._inflight_optimizer_step = self._optimizer.submit_step(
-            unit_index, optimizer_states[0], self._zeros, *optimizer_states[1:]
-        )
+        # Delay the optimizer step until the gradients are ready.
+        # I.e. after the torch.cuda.synchronize().
+        def _submit_step():
+            self._inflight_optimizer_step = self._optimizer.submit_step(
+                unit_index, optimizer_states[0],
+                gradients, *optimizer_states[1:]
+            )
+        if delay:
+            self._data_stream.submit(_submit_step)
+        else:
+            _submit_step()
 
     def _submit_update_opts(self, unit_index: int, forward: bool):
         """ Launch the async IO operation to update CPU optimizer states. """
@@ -810,10 +816,36 @@ class FlexTrainOptsCoordinator:
         # 4. Return the task, will be submitted to the data stream.
         return _update_gpu_para
 
+    def _submit_offload_para(self, unit_index: int):
+        """ Launch the async IO operation to offload parameters. """
+        # Return if the task is invalid.
+        if self._is_invalid_unit(unit_index):
+            return lambda: None
+
+        # 1. Locate the source memory.
+        cpu_src = self._nvme_para_offload_buffer
+
+        # 2. Offload the parameters.
+        self._para_nvme_group.single_offload(
+            FlexTrainDataID(Dtype.PARA, unit_index),
+            cpu_src, index=1, async_op=True
+        )
+
     def pre_micro_batch_forward(self, curr_task: LLMTask):
+        """ Submit tasks for the given micro-batch in forward pass. """
         # For the first iteration, the optimizer is not ready.
         if not self.is_initialized:
             return
+
+        # Unpack the task.
+        unit_index, micro_batch_index = curr_task.unit, curr_task.micro_batch
+
+        update_para = self._submit_update_para(
+            unit_index + 2, micro_batch_index, forward=True
+        )
+
+        # Submit update_para to the data stream.
+        self._data_stream.submit(update_para)
 
     def pre_micro_batch_backward(self, curr_task: LLMTask):
         """ Submit tasks for the given micro-batch in backward pass. """
@@ -855,6 +887,10 @@ class FlexTrainOptsCoordinator:
         # Rotate the buffers.
         self._rotate_buffers()
 
+        self._submit_transfer_opts(unit_index + 4, forward=True)
+        self._submit_optimizer_step(unit_index + 3, forward=True, delay=True)
+        self._submit_update_opts(unit_index + 2, forward=True)
+
     def pre_unit_backward(self, unit_index: int):
         """ Prepare the unit for backward pass.
 
@@ -867,10 +903,6 @@ class FlexTrainOptsCoordinator:
         Returns:
             None
         """
-        # Check if the unit is valid.
-        if self._is_invalid_unit(unit_index):
-            return
-
         # Synchrnoize the inflight optimizer step.
         self._inflight_optimizer_step.wait()
 
@@ -878,34 +910,120 @@ class FlexTrainOptsCoordinator:
         self._rotate_buffers()
 
         self._submit_transfer_opts(unit_index + 1, forward=False)
-        self._submit_optimizer_step(unit_index + 2, forward=False)
+        self._submit_optimizer_step(unit_index + 2, forward=False, delay=True)
         self._submit_update_opts(unit_index + 3, forward=False)
+        self._submit_offload_para(unit_index + 4)
 
         # Prepare the gradient buffer.
         self._prepare_unit_grads(unit_index)
+
+    def warmup_forward_pipeline(self):
+        # If the optimizer is not initialized, return.
+        if not self.is_initialized:
+            return
+
+        # Load the first unit NVMe parameters to CPU.
+        self._para._async_load_nvme_paras(0)
+
+        # Synchronize the inflight tasks.
+        self._nvme_swapper.synchronize()
+        self._inflight_optimizer_step.wait()
+
+        # Rotate the buffers.
+        self._para._nvme_prefetch_buffer.rotate()
+        self._rotate_buffers()
+
+        # Conduct the pre-unit tasks for the first unit.
+        self._submit_transfer_opts(3, forward=True)
+        self._submit_optimizer_step(2, forward=True)
+        self._submit_update_opts(1, forward=True)
+
+        # Get the first unit parameters ready.
+        # Prepare the second unit parameters.
+        self._para._async_load_nvme_paras(1)
+        for mb in range(self._micro_batch_per_rank):
+            self._para._async_load_gpu_paras(0, mb)()
+            self._submit_update_para(1, mb, forward=True)()
+        self._data_stream.execute()
 
     def warmup_backward_pipeline(self):
         # Complete the initialization.
         self._initialize_alpha_split()
         # Inform the parameter coordinator that future updates are coming.
-        # self._para.parameter_updated = True
+        self._para.parameter_updated = True
 
     def clear_backward_pipeline(self):
         """
         Cleanup the backward pipeline.
         """
         # Synchronize the inflight tasks.
-        self._inflight_optimizer_step.wait()
         self._nvme_swapper.synchronize()
         self._data_stream.synchronize()
+        self._inflight_optimizer_step.wait()
 
         # Rotate the buffers.
         self._rotate_buffers()
 
-        # Conduct the optimizer step of the first unit.
-        for mb in reversed(range(self._micro_batch_per_rank)):
+        # Conduct the last backward pre-unit task.
+        self._submit_transfer_opts(0, forward=False)
+        self._submit_optimizer_step(1, forward=False)
+        self._submit_update_opts(2, forward=False)
+        self._submit_offload_para(3)
+        # Conduct the last backward pre-micro-batch tasks.
+        for mb in range(self._micro_batch_per_rank):
             self._submit_transfer_grad(0, mb)()
-        self._data_stream.execute()
+            self._submit_update_para(2, mb, forward=False)()
+
+        # Synchronize the inflight tasks.
+        self._nvme_swapper.synchronize()
+        self._inflight_optimizer_step.wait()
+
+        # Rotate the buffers.
+        self._rotate_buffers()
+
+        # Conduct the last backward pre-unit task.
+        self._submit_transfer_opts(0, forward=True)
+        self._submit_optimizer_step(0, forward=False)
+        self._submit_update_opts(1, forward=False)
+        self._submit_offload_para(2)
+        # Conduct the last backward pre-micro-batch tasks.
+        for mb in range(self._micro_batch_per_rank):
+            self._submit_update_para(1, mb, forward=False)()
+
+        # Synchronize the inflight tasks.
+        self._nvme_swapper.synchronize()
+        self._inflight_optimizer_step.wait()
+
+        # Rotate the buffers.
+        self._rotate_buffers()
+
+        # Conduct the last backward pre-unit task.
+        self._submit_transfer_opts(1, forward=True)
+        self._submit_optimizer_step(0, forward=True)
+        self._submit_update_opts(0, forward=False)
+        self._submit_offload_para(1)
+        # Conduct the last backward pre-micro-batch tasks.
+        for mb in range(self._micro_batch_per_rank):
+            self._submit_update_para(0, mb, forward=False)()
+
+        # Synchronize the inflight tasks.
+        self._nvme_swapper.synchronize()
+        self._inflight_optimizer_step.wait()
+
+        # Rotate the buffers.
+        self._rotate_buffers()
+
+        # Conduct the last backward pre-unit task.
+        self._submit_transfer_opts(2, forward=True)
+        self._submit_optimizer_step(1, forward=True)
+        self._submit_update_opts(0, forward=True)
+        self._submit_offload_para(0)
+        # Conduct the last backward pre-micro-batch tasks.
+        for mb in range(self._micro_batch_per_rank):
+            self._submit_update_para(0, mb, forward=True)()
+
+        # Synchronize the inflight tasks.
+        self._nvme_swapper.synchronize()
         self._data_stream.synchronize()
 
 
