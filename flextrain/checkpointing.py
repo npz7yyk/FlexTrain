@@ -370,6 +370,8 @@ def checkpointed_backward(fwd_ctx: FWDContext, *grads):
 
     # Run the pre-backward function.
     _POST_RECOMPUTATION_FUNCTION()
+    # Reset the post-recomputation function.
+    set_post_recomputation_function(lambda: None)
 
     # Run the backward pass.
     torch.autograd.backward(output_tensors, grad_tensors)

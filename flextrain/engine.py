@@ -27,11 +27,6 @@ from flextrain.optimizer import FlexTrainOptimizer
 from flextrain.scheduler import LLMTask, GreedySnakeBlockScheduler
 
 
-class LRScheduler:
-    def step(self, **kwargs):
-        pass
-
-
 class FlexTrainEngine(object):
     """
     FlexTrainEngine is designed to maximize the training throughput.
@@ -163,7 +158,8 @@ class FlexTrainEngine(object):
             self.nvme_swapper.synchronize()
             self.para_coordinator.pre_unit_forward(task.unit)
             self.opts_coordinator.pre_unit_forward(task.unit)
-        # 1. Prefetch the next passed_down and offload the last passed_down
+
+        # Prefetch the next passed_down and offload the last passed_down
         next_task = self.scheduler.next_task
         # If the next task is in the same micro batch, prefetch is not needed
         ckpt_prefetch = None if next_task.micro_batch == task.micro_batch \
@@ -171,9 +167,9 @@ class FlexTrainEngine(object):
         self.interlayer_coordinator.pre_micro_batch_forward(
             ckpt_prefetch, self.ckpt_offload
         )
-        # 2. Submit forwarding part of the optimizer step
+        # Submit forwarding part of the optimizer step
         self.opts_coordinator.pre_micro_batch_forward(task)
-        # 3. Prefetch the parameter of the next unit
+        # Prefetch the parameter of the next unit
         self.para_coordinator.pre_micro_batch_forward(task)
 
         # Wait for all in-flight operations
@@ -272,7 +268,7 @@ class FlexTrainEngine(object):
             self.para_coordinator.pre_unit_backward(task.unit)
             self.opts_coordinator.pre_unit_backward(task.unit)
 
-        # 1. Submit prefetching the next passed_down
+        # Submit prefetching the next passed_down
         next_task = self.scheduler.next_task
         ckpt_prefetch = InterLayerTask(
             next_task.unit - 1, next_task.micro_batch
@@ -284,7 +280,7 @@ class FlexTrainEngine(object):
         )
         # End of submit prefetching the next passed_down
 
-        # 2. Prefetch the parameter of the next unit
+        # Prefetch the parameter of the next unit
         self.para_coordinator.pre_micro_batch_backward(task)
         self.opts_coordinator.pre_micro_batch_backward(task)
 
@@ -375,68 +371,31 @@ class FlexTrainEngine(object):
         assert self.data_stream.is_empty()
         self._reset_context()
 
-        import time
-        times_fwd = []
-        times_bwd = []
-
         # 2. Conduct all tasks assigned by the scheduler
         # Warmup the forward pipeline
         self.para_coordinator.warmup_forward_pipeline()
         self.opts_coordinator.warmup_forward_pipeline()
         # Conduct forward
         for task in self.scheduler:
-            torch.cuda.nvtx.range_push(f"Forward unit {task.unit}")
-            t_start = time.time()
             self._conduct_forward(task)
-            t_end = time.time()
-            times_fwd.append(t_end - t_start)
-            torch.cuda.nvtx.range_pop()
-
         # Update the engine for the backward pass
         self._update_engine()
-
         # Warmup the backward pipeline
         self.para_coordinator.warmup_backward_pipeline()
         self.opts_coordinator.warmup_backward_pipeline()
         # Conduct backward
         for task in self.scheduler:
-            torch.cuda.nvtx.range_push(f"Backward unit {task.unit}")
-            t_start = time.time()
             self._conduct_backward(task)
-            t_end = time.time()
-            times_bwd.append(t_end - t_start)
-            torch.cuda.nvtx.range_pop()
-
         # Clear the backward pipeline
         self.para_coordinator.clear_backward_pipeline()
         self.opts_coordinator.clear_backward_pipeline()
-        self.opts_coordinator._calculate_global_grad_norm()
 
-        times = sorted(times_fwd, reverse=True)
-        times = times[5:]
-        avg_time = sum(times) / len(times)
-        dist.print_rank_by_rank(avg_time * 1000)
-
-        times = sorted(times_bwd, reverse=True)
-        times = times[5:]
-        avg_time = sum(times) / len(times)
-        dist.print_rank_by_rank(avg_time * 1000)
-
-        for p in self.optimizer.non_layerwise_params:
-            dist.print_rank0(p.grad.flatten()[:10])
-
-        # 4. Conduct optimizer step
+        # 3. Conduct optimizer step (for GPU parameters)
         self.optimizer.step()
 
-        # 5. Return the loss results
+        # 4. Conduct the loss scaling update
         loss_rsts = []
         for i in range(self.micro_batch_per_batch):
             loss_rsts.append(self.micro_batch_loss_rsts[i])
-
-        if not hasattr(self, 'count'):
-            self.count = 0
-        self.count += 1
-        if self.count % 4 == 0:
-            exit()
 
         return loss_rsts

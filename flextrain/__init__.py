@@ -10,7 +10,7 @@ from .defaults import (
     TORCH_DISTRIBUTED_INIT_METHOD_DEFAULT,
     PROCESS_GROUP_TIMEOUT_DEFAULT
 )
-from .engine import LRScheduler, FlexTrainEngine
+from .engine import FlexTrainEngine
 from .llm_func import set_llm_func, LLMFunc         # noqa: F401
 from .memory.initializer import Init                # noqa: F401
 from .optimizer import FlexTrainOptimizer

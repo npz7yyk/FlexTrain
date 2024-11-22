@@ -1,12 +1,12 @@
 import torch
 
 from abc import ABC, abstractmethod
-from collections import defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from torch import Tensor
 from tqdm import tqdm
-from typing import Set, Dict
+from typing import Dict
 
 from flextrain.checkpointing import set_post_recomputation_function
 from flextrain.config import get_flextrain_config
@@ -95,20 +95,7 @@ def _convert_dtype_view(
     return tensor.view(target_dtype)
 
 
-@dataclass
-class MicroBatchTask(LLMTask):
-    forward: bool
-
-
 class FlexTrainOptsCoordinator:
-    TRANSFER_OPTS = 0
-    RECOVER_GRAD = 0
-    TRANSFER_GRAD = 0
-    OPTIMIZER_STEP = 1
-    OFFLOAD_GRAD = 1
-    UPDATE_OPTS = 2
-    UPDATE_PARA = 2
-    OFFLOAD_PARA = 3
 
     def __init__(self):
         # Lazy initialization of optimizer coordinator.
@@ -153,14 +140,6 @@ class FlexTrainOptsCoordinator:
     @property
     def _nvme_para_offload_buffer(self):
         return self._nvme_para_buffers[1]
-
-    @property
-    def _nvme_grad_receive_buffer(self):
-        return self._nvme_grad_buffers[0]
-
-    @property
-    def _nvme_grad_offload_buffer(self):
-        return self._nvme_grad_buffers[1]
 
     def _is_invalid_unit(self, unit_index: int):
         return unit_index < 0 or unit_index >= self._num_units
@@ -498,8 +477,6 @@ class FlexTrainOptsCoordinator:
         ratio = gradacc_itemsize // device_itemsize
 
         # Assign memory buffers and update plans.
-        # Followings are the most complicated part of this repository.
-
         # cvtd = converted
         cvtd_cpu_grad_buffer_numel = cpu_grad_buffer_numel // ratio
         cvtd_gpu_grad_buffer_numel = gpu_grad_buffer_numel // ratio
@@ -508,15 +485,16 @@ class FlexTrainOptsCoordinator:
         if forward_grad_numel < sum(numels[:1]):
             cpu_buffer_needed_numel = forward_grad_numel - sum(numels[:0])
             gpu_buffer_needed_numel = 0
-            nvme_numel = 0
         elif forward_grad_numel < sum(numels[:2]):
             cpu_buffer_needed_numel = cvtd_cpu_grad_buffer_numel
             gpu_buffer_needed_numel = forward_grad_numel - sum(numels[:1])
-            nvme_numel = 0
         else:
-            cpu_buffer_needed_numel = cvtd_cpu_grad_buffer_numel
-            gpu_buffer_needed_numel = cvtd_gpu_grad_buffer_numel
-            nvme_numel = forward_grad_numel - sum(numels[:2])
+            raise NotImplementedError(
+                "The forward gradient numel is too large to fit into the "
+                "gradient buffers, consider either:\n"
+                "  - Increase the checkpoint buffer numel, or\n"
+                "  - Reduce the alpha split ratio."
+            )
 
         def _create_view(tensor: Tensor, numel: int, dtype: torch.dtype):
             return _convert_dtype_view(tensor, dtype)[..., :numel]
@@ -533,16 +511,8 @@ class FlexTrainOptsCoordinator:
 
         # How to reconstruct the forward gradients.
         self._forward_grad_splits = [
-            cpu_buffer_needed_numel, gpu_buffer_needed_numel, nvme_numel
+            cpu_buffer_needed_numel, gpu_buffer_needed_numel
         ]
-
-        # NVMe gradient buffers.
-        self._nvme_grad_buffers = RotateContainer(
-            allocate_memory_chunks(
-                nvme_numel * self._micro_batch_per_rank, 2,
-                config.mixed_precision.gradacc_dtype, torch.device('cpu')
-            )
-        )
         # End of assignment. Incredible!!!
 
         # Log the configuration.
@@ -566,31 +536,14 @@ class FlexTrainOptsCoordinator:
             f"  - Gradient dtype itemsize / device dtype itemsize: {ratio}\n"
             f"  - Checkpoint borrowable numels (CPU, GPU): "
             f"({cvtd_cpu_grad_buffer_numel}, {cvtd_gpu_grad_buffer_numel})\n"
-            f"  - Gradient buffer numels (CPU, GPU, NVMe): "
+            f"  - Gradient buffer numels (CPU, GPU): "
             f"{self._forward_grad_splits}\n"
         )
-
-        self._grad_partition = allocate_memory_chunks(
-            self._mb_fwd_numel + self._mb_bwd_numel, (self._num_units, self._micro_batch_per_rank),
-            config.mixed_precision.gradacc_dtype, torch.cuda.current_device()
-        )
-
-    def _calculate_global_grad_norm(self):
-        # Calculate the global gradient norm.
-        global_grad_norm = torch.tensor([0.], device=torch.cuda.current_device())
-        for unit in reversed(range(self._num_units)):
-            global_grad_norm += self._grad_partition[unit].norm() ** 2
-            dist.print_rank0(f"Rank {dist.get_rank()} layer {unit} grad norm: {global_grad_norm.item()}")
-        # torch.save(self._grad_partition, f"/shared_ssd_storage/yikang/FlexTrain/logs/grad2/grad_norm_{dist.get_rank()}.pt")
-        dist.all_reduce(global_grad_norm, op=dist.ReduceOp.SUM)
-        dist.print_rank0(global_grad_norm.item())
-        return global_grad_norm.item()
 
     def _rotate_buffers(self):
         self._gpu_bwd_grad_buffers.rotate()
         self._cpu_opt_grad_buffers.rotate()
         self._cpu_opt_work_buffers.rotate()
-        self._nvme_grad_buffers.rotate()
         self._nvme_para_buffers.rotate()
 
     def _prepare_unit_grads(self, unit_index: int):
@@ -657,11 +610,7 @@ class FlexTrainOptsCoordinator:
                 [fwd_cpu, fwd_gpu, fwd_nvme],
                 [
                     self._cpu_grad_buffer[unit_index][micro_batch_index],
-                    self._gpu_grad_buffer[unit_index][micro_batch_index],
-                    torch.chunk(
-                        self._nvme_grad_receive_buffer,
-                        self._micro_batch_per_rank
-                    )[micro_batch_index]
+                    self._gpu_grad_buffer[unit_index][micro_batch_index]
                 ]
             )
 
@@ -677,10 +626,33 @@ class FlexTrainOptsCoordinator:
             bwd_gpu_tar.copy_(bwd_gpu, non_blocking=True)
             bwd_nvme_tar.copy_(bwd_nvme, non_blocking=True)
 
-            self._grad_partition[unit_index][micro_batch_index].copy_(mem_partition)
-
         # Return the task, will be submitted to the data stream.
         return transfer_grads
+
+    def _submit_recover_grad(self, unit_index: int, micro_batch_index: int):
+        """ Launch the async IO operation to recover gradients. """
+        # Return if the task is invalid.
+        if self._is_invalid_task(unit_index, micro_batch_index):
+            return lambda: None
+
+        def recover_grads():
+            # Locate the target memory.
+            opt_grad_tar = torch.chunk(
+                self._cpu_opt_receive_grads[:self._unit_fwd_numel],
+                self._micro_batch_per_rank
+            )[micro_batch_index]
+
+            # Copy the forward gradients.
+            copy_segments(
+                [
+                    self._cpu_grad_buffer[unit_index][micro_batch_index],
+                    self._gpu_grad_buffer[unit_index][micro_batch_index]
+                ],
+                [opt_grad_tar]
+            )
+
+        # Return the task, will be submitted to the data stream.
+        return recover_grads
 
     def _submit_transfer_opts(self, unit_index: int, forward: bool):
         """ Launch the async IO operation to transfer CPU optimizer states. """
@@ -843,9 +815,13 @@ class FlexTrainOptsCoordinator:
         update_para = self._submit_update_para(
             unit_index + 2, micro_batch_index, forward=True
         )
+        recover_grad = self._submit_recover_grad(
+            unit_index + 4, micro_batch_index
+        )
 
-        # Submit update_para to the data stream.
+        # Submit CUDA stream tasks.
         self._data_stream.submit(update_para)
+        self._data_stream.submit(recover_grad)
 
     def pre_micro_batch_backward(self, curr_task: LLMTask):
         """ Submit tasks for the given micro-batch in backward pass. """
@@ -943,6 +919,7 @@ class FlexTrainOptsCoordinator:
         self._para._async_load_nvme_paras(1)
         for mb in range(self._micro_batch_per_rank):
             self._para._async_load_gpu_paras(0, mb)()
+            self._submit_recover_grad(3, mb)()
             self._submit_update_para(1, mb, forward=True)()
         self._data_stream.execute()
 
@@ -988,6 +965,7 @@ class FlexTrainOptsCoordinator:
         self._submit_offload_para(2)
         # Conduct the last backward pre-micro-batch tasks.
         for mb in range(self._micro_batch_per_rank):
+            self._submit_recover_grad(0, mb)()
             self._submit_update_para(1, mb, forward=False)()
 
         # Synchronize the inflight tasks.
@@ -1004,6 +982,7 @@ class FlexTrainOptsCoordinator:
         self._submit_offload_para(1)
         # Conduct the last backward pre-micro-batch tasks.
         for mb in range(self._micro_batch_per_rank):
+            self._submit_recover_grad(1, mb)()
             self._submit_update_para(0, mb, forward=False)()
 
         # Synchronize the inflight tasks.
@@ -1020,6 +999,7 @@ class FlexTrainOptsCoordinator:
         self._submit_offload_para(0)
         # Conduct the last backward pre-micro-batch tasks.
         for mb in range(self._micro_batch_per_rank):
+            self._submit_recover_grad(2, mb)()
             self._submit_update_para(0, mb, forward=True)()
 
         # Synchronize the inflight tasks.
