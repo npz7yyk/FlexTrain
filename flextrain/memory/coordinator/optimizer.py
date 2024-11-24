@@ -903,6 +903,7 @@ class FlexTrainOptsCoordinator:
 
         # Synchronize the inflight tasks.
         self._nvme_swapper.synchronize()
+        self._data_stream.synchronize()
         self._inflight_optimizer_step.wait()
 
         # Rotate the buffers.
@@ -921,7 +922,6 @@ class FlexTrainOptsCoordinator:
             self._para._async_load_gpu_paras(0, mb)()
             self._submit_recover_grad(3, mb)()
             self._submit_update_para(1, mb, forward=True)()
-        self._data_stream.execute()
 
     def warmup_backward_pipeline(self):
         # Complete the initialization.
@@ -953,6 +953,7 @@ class FlexTrainOptsCoordinator:
 
         # Synchronize the inflight tasks.
         self._nvme_swapper.synchronize()
+        self._data_stream.synchronize()
         self._inflight_optimizer_step.wait()
 
         # Rotate the buffers.
@@ -970,6 +971,7 @@ class FlexTrainOptsCoordinator:
 
         # Synchronize the inflight tasks.
         self._nvme_swapper.synchronize()
+        self._data_stream.synchronize()
         self._inflight_optimizer_step.wait()
 
         # Rotate the buffers.
@@ -987,6 +989,7 @@ class FlexTrainOptsCoordinator:
 
         # Synchronize the inflight tasks.
         self._nvme_swapper.synchronize()
+        self._data_stream.synchronize()
         self._inflight_optimizer_step.wait()
 
         # Rotate the buffers.
@@ -1005,6 +1008,7 @@ class FlexTrainOptsCoordinator:
         # Synchronize the inflight tasks.
         self._nvme_swapper.synchronize()
         self._data_stream.synchronize()
+        self._inflight_optimizer_step.wait()
 
 
 _OPTS_COORDINATOR = FlexTrainOptsCoordinator()
