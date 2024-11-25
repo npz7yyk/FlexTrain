@@ -104,23 +104,15 @@ class FlexTrainParaCoordinator:
         self._micro_batch_para_splits = get_split_numels(
             self._aligned_micro_batch_numel, config.split_ratio.parameter
         )
-        # Important!!!
-        # We twist the order of the parameters to:
-        # (GPU, CPU, NVMe) -> (CPU, GPU, NVMe)
-        self._micro_batch_para_splits = (
-            self._micro_batch_para_splits[1],
-            self._micro_batch_para_splits[0],
-            self._micro_batch_para_splits[2]
-        )
 
-        # How to split the CPU parameters at micro-batch level.
-        self._micro_batch_cpu_alpha_splits = get_split_numels(
+        # How to split the GPU parameters at micro-batch level.
+        self._micro_batch_gpu_alpha_splits = get_split_numels(
             self._micro_batch_para_splits[0],
             config.split_ratio.alpha, num_levels=2
         )
 
-        # How to split the GPU parameters at micro-batch level.
-        self._micro_batch_gpu_alpha_splits = get_split_numels(
+        # How to split the CPU parameters at micro-batch level.
+        self._micro_batch_cpu_alpha_splits = get_split_numels(
             self._micro_batch_para_splits[1],
             config.split_ratio.alpha, num_levels=2
         )
@@ -283,13 +275,13 @@ class FlexTrainParaCoordinator:
             return
 
         # Allocate parameter bases
-        self._cpu_para_base.append(allocate_memory_chunks(
-            self._micro_batch_para_splits[0], self._micro_batch_per_rank,
-            self._device_dtype, torch.device('cpu')
-        ))
         self._gpu_para_base.append(allocate_memory_chunks(
-            self._micro_batch_para_splits[1], self._micro_batch_per_rank,
+            self._micro_batch_para_splits[0], self._micro_batch_per_rank,
             self._device_dtype, torch.cuda.current_device()
+        ))
+        self._cpu_para_base.append(allocate_memory_chunks(
+            self._micro_batch_para_splits[1], self._micro_batch_per_rank,
+            self._device_dtype, torch.device('cpu')
         ))
 
         # Partition parameters.
@@ -310,7 +302,7 @@ class FlexTrainParaCoordinator:
         for mb, para in enumerate(micro_batch_partitioned_paras):
             # Locate the memory for each rank.
             tar_mem = torch.chunk(para, dist.get_world_size())[dist.get_rank()]
-            cpu_view, gpu_view, nvme_view = torch.split(
+            gpu_view, cpu_view, nvme_view = torch.split(
                 tar_mem, self._micro_batch_para_splits
             )
             # Store the views.
@@ -349,7 +341,7 @@ class FlexTrainParaCoordinator:
             f"  - numel per unit: {self._original_unit_numel}\n"
             f"  - numel per unit aligned: {self._aligned_unit_numel}\n"
             f"  - numel per micro-batch: {self._aligned_micro_batch_numel}\n"
-            f"  - micro-batch split numels (CPU, GPU, NVMe): "
+            f"  - micro-batch split numels (GPU, CPU, NVMe): "
             f"{self._micro_batch_para_splits}\n"
         )
 
@@ -461,7 +453,7 @@ class FlexTrainParaCoordinator:
             )[dist.get_rank()]
 
             # Locate the destination memory.
-            cpu_tar, gpu_tar, nvme_tar = torch.split(
+            gpu_tar, cpu_tar, nvme_tar = torch.split(
                 rank_mem, self._micro_batch_para_splits
             )
             nvme_forward_tar, nvme_backward_tar = torch.split(

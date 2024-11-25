@@ -232,20 +232,20 @@ class FlexTrainOptsCoordinator:
 
         # How to split the micro-batch parameters.
         self._mb_para_splits = [
-            *self._mb_cpu_para_alpha_splits,
             *self._mb_gpu_para_alpha_splits,
+            *self._mb_cpu_para_alpha_splits,
             *self._mb_nvme_para_alpha_splits
         ]
         # How to split the forward part of the micro-batch parameters.
         self._mb_fwd_para_splits = [
-            self._mb_cpu_para_alpha_splits[0],
             self._mb_gpu_para_alpha_splits[0],
+            self._mb_cpu_para_alpha_splits[0],
             self._mb_nvme_para_alpha_splits[0]
         ]
         # How to split the backward part of the micro-batch parameters.
         self._mb_bwd_para_splits = [
-            self._mb_cpu_para_alpha_splits[1],
             self._mb_gpu_para_alpha_splits[1],
+            self._mb_cpu_para_alpha_splits[1],
             self._mb_nvme_para_alpha_splits[1]
         ]
 
@@ -370,7 +370,7 @@ class FlexTrainOptsCoordinator:
 
                 # Locate the target memory.
                 fwd_tar = fwd_tars[micro_batch]
-                cpu_fwd_tar, gpu_fwd_tar, nvme_fwd_tar = torch.split(
+                gpu_fwd_tar, cpu_fwd_tar, nvme_fwd_tar = torch.split(
                     fwd_tar, self._mb_fwd_para_splits
                 )
 
@@ -418,7 +418,7 @@ class FlexTrainOptsCoordinator:
 
                 # Locate the target memory.
                 bwd_tar = bwd_tars[micro_batch]
-                cpu_bwd_tar, gpu_bwd_tar, nvme_bwd_tar = torch.split(
+                gpu_bwd_tar, cpu_bwd_tar, nvme_bwd_tar = torch.split(
                     bwd_tar, self._mb_bwd_para_splits
                 )
 
@@ -525,11 +525,11 @@ class FlexTrainOptsCoordinator:
             f"  - Parameter alpha split numels (forward, backward): "
             f"({self._mb_fwd_numel}, {self._mb_bwd_numel})\n"
             f"  - Micro-batch forward parameter split numels "
-            f"(CPU, GPU, NVMe): {self._mb_fwd_para_splits}\n"
+            f"(GPU, CPU, NVMe): {self._mb_fwd_para_splits}\n"
             f"  - Unit forward optimizer split numels (CPU, NVMe): "
             f"{self._unit_fwd_opt_splits}\n"
             f"  - Micro-batch backward parameter split numels "
-            f"(CPU, GPU, NVMe): {self._mb_bwd_para_splits}\n"
+            f"(GPU, CPU, NVMe): {self._mb_bwd_para_splits}\n"
             f"  - Unit backward optimizer split numels (CPU, NVMe): "
             f"{self._unit_bwd_opt_splits}\n"
             f"  - Forward gradient numel: {forward_grad_numel}\n"
@@ -602,12 +602,12 @@ class FlexTrainOptsCoordinator:
             )
 
             # Split the mem_partition.
-            fwd_cpu, bwd_cpu, fwd_gpu, bwd_gpu, fwd_nvme, bwd_nvme = \
+            fwd_gpu, bwd_gpu, fwd_cpu, bwd_cpu, fwd_nvme, bwd_nvme = \
                 torch.split(mem_partition, self._mb_para_splits)
 
             # Store forward gradients into buffers.
             copy_segments(
-                [fwd_cpu, fwd_gpu, fwd_nvme],
+                [fwd_gpu, fwd_cpu, fwd_nvme],
                 [
                     self._cpu_grad_buffer[unit_index][micro_batch_index],
                     self._gpu_grad_buffer[unit_index][micro_batch_index]
@@ -619,11 +619,11 @@ class FlexTrainOptsCoordinator:
                 self._cpu_opt_receive_grads[:self._unit_bwd_numel],
                 self._micro_batch_per_rank
             )[micro_batch_index]
-            bwd_cpu_tar, bwd_gpu_tar, bwd_nvme_tar = torch.split(
+            bwd_gpu_tar, bwd_cpu_tar, bwd_nvme_tar = torch.split(
                 opt_grad_tar, self._mb_bwd_para_splits
             )
-            bwd_cpu_tar.copy_(bwd_cpu, non_blocking=True)
             bwd_gpu_tar.copy_(bwd_gpu, non_blocking=True)
+            bwd_cpu_tar.copy_(bwd_cpu, non_blocking=True)
             bwd_nvme_tar.copy_(bwd_nvme, non_blocking=True)
 
         # Return the task, will be submitted to the data stream.
@@ -759,19 +759,19 @@ class FlexTrainOptsCoordinator:
         )[micro_batch_index]
         split_numel = self._mb_fwd_para_splits \
             if forward else self._mb_bwd_para_splits
-        cpu_src, gpu_src, nvme_src = torch.split(updated_para, split_numel)
+        gpu_src, cpu_src, nvme_src = torch.split(updated_para, split_numel)
 
         # 2. Locate the target memory.
-        cpu_para = self._para._cpu_para_base[unit_index][micro_batch_index]
-        cpu_fwd_tar, cpu_bwd_tar = torch.split(
-            cpu_para, self._mb_cpu_para_alpha_splits
-        )
-        cpu_tar = cpu_fwd_tar if forward else cpu_bwd_tar
         gpu_para = self._para._gpu_para_base[unit_index][micro_batch_index]
         gpu_fwd_tar, gpu_bwd_tar = torch.split(
             gpu_para, self._mb_gpu_para_alpha_splits
         )
         gpu_tar = gpu_fwd_tar if forward else gpu_bwd_tar
+        cpu_para = self._para._cpu_para_base[unit_index][micro_batch_index]
+        cpu_fwd_tar, cpu_bwd_tar = torch.split(
+            cpu_para, self._mb_cpu_para_alpha_splits
+        )
+        cpu_tar = cpu_fwd_tar if forward else cpu_bwd_tar
         nvme_para = self._para.nvme_forward_update_paras \
             if forward else self._nvme_para_receive_buffer
         nvme_tar = torch.chunk(
@@ -779,11 +779,10 @@ class FlexTrainOptsCoordinator:
         )[micro_batch_index]
 
         # 3. Copy the source memory to the target memory.
-        cpu_tar.copy_(cpu_src, non_blocking=True)
-        nvme_tar.copy_(nvme_src, non_blocking=True)
-
         def _update_gpu_para():
             gpu_tar.copy_(gpu_src, non_blocking=True)
+        cpu_tar.copy_(cpu_src, non_blocking=True)
+        nvme_tar.copy_(nvme_src, non_blocking=True)
 
         # 4. Return the task, will be submitted to the data stream.
         return _update_gpu_para
