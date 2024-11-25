@@ -1,4 +1,3 @@
-import time
 import torch
 
 from torch.nn import Module
@@ -49,7 +48,7 @@ class FlexTrainEngine(object):
         # Logically move the model to GPU and set the dtype
         self.model = model.cuda().to(dtype=config.mixed_precision.device_dtype)
 
-        # Exit if benchmark is enabled
+        # Return if benchmark is enabled
         if get_flextrain_config().benchmark:
             return
 
@@ -162,6 +161,7 @@ class FlexTrainEngine(object):
         if scheduler.new_unit_entered:
             # Wait for all in-flight async IO operations.
             self.nvme_swapper.synchronize()
+            self.interlayer_coordinator.pre_unit_forward(task.unit)
             self.para_coordinator.pre_unit_forward(task.unit)
             self.opts_coordinator.pre_unit_forward(task.unit)
 
@@ -269,6 +269,7 @@ class FlexTrainEngine(object):
         if scheduler.new_unit_entered:
             # Wait for all in-flight async IO operations.
             self.nvme_swapper.synchronize()
+            self.interlayer_coordinator.pre_unit_backward(task.unit)
             self.para_coordinator.pre_unit_backward(task.unit)
             self.opts_coordinator.pre_unit_backward(task.unit)
 

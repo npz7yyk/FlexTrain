@@ -269,7 +269,7 @@ def get_split_numels(
     num_levels: int = 3,
     aligned_numel: int = 4096
 ):
-    # Ensure the number of levels is 2.
+    # Ensure the number of levels is num_levels - 1.
     if len(ratios) == num_levels:
         ratios = ratios[:num_levels - 1]
 

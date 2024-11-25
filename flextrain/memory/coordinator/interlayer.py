@@ -6,6 +6,8 @@ from torch import Tensor
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
     RotateContainer,
+    FlexTrainDataType as Dtype,
+    FlexTrainDataID,
     Waitable,
     DummyHandle,
     FunctionHandle,
@@ -15,6 +17,7 @@ from flextrain.memory import (
     get_data_stream
 )
 from flextrain.memory.coordinator import get_para_coordinator
+from flextrain.memory.nvme_swapper import get_nvme_swapper
 from flextrain.scheduler import LLMTask
 from flextrain.utils import dist
 from flextrain.utils.logging import rank0_logger
@@ -47,6 +50,8 @@ class FlexTrainInterLayerCoordinator:
         # Record the tensor shape.
         self._tensor_shape = tensor.shape
 
+        # Async IO NVMe swapper.
+        self._nvme_swapper = get_nvme_swapper()
         # CUDA streams for async IO operations.
         self._data_stream = get_data_stream()
         # Last task handle.
@@ -60,9 +65,11 @@ class FlexTrainInterLayerCoordinator:
 
         # How to split the checkpoint tensor.
         self._ckpt_numels = get_split_numels(
-            tensor.numel(), config.split_ratio.checkpoint, num_levels=2
+            tensor.numel(), config.split_ratio.checkpoint
         )
         # How to split the gradient tensor.
+        assert sum(config.split_ratio.gradient) == 1.0, \
+            "Gradient split ratio must sum to 1.0."
         self._grad_numels = get_split_numels(
             tensor.numel(), config.split_ratio.gradient, num_levels=2
         )
@@ -77,6 +84,12 @@ class FlexTrainInterLayerCoordinator:
         self.cpu_ckpt_base = allocate_memory_chunks(
             self._ckpt_numels[1],
             (self._num_units, self._micro_batch_per_rank),
+            config.mixed_precision.device_dtype,
+            torch.device('cpu')
+        )
+        self.nvme_margin_base = allocate_memory_chunks(
+            self._ckpt_numels[2],
+            (self._num_units, min(self._micro_batch_per_rank, 4)),
             config.mixed_precision.device_dtype,
             torch.device('cpu')
         )
@@ -111,13 +124,23 @@ class FlexTrainInterLayerCoordinator:
                 torch.cuda.current_device()
             )
         )
+        # Allocate memory for NVMe checkpoint prefetching.
+        self._nvme_unit_ckpt_buffers = RotateContainer(
+            allocate_memory_chunks(
+                self._ckpt_numels[2],
+                (2, max(self._micro_batch_per_rank - 4, 0)),
+                config.mixed_precision.device_dtype,
+                torch.device('cpu')
+            )
+        )
 
         # Log the configuration.
         rank0_logger.info(
             "\n\n> "
             f"FlexTrain inter-layer coordinator initialized "
             f"with configurations:\n"
-            f"  - checkpoint split numels (GPU, CPU): {self._ckpt_numels}\n"
+            f"  - checkpoint split numels (GPU, CPU, NVMe): "
+            f"{self._ckpt_numels}\n"
             f"  - gradient split numels (GPU, CPU): {self._grad_numels}\n"
         )
 
@@ -132,6 +155,16 @@ class FlexTrainInterLayerCoordinator:
             return None
         else:
             return task
+
+    def _in_margin(self, micro_batch: int):
+        return micro_batch < 2 \
+            or micro_batch >= self._micro_batch_per_rank - 2
+
+    def _index_in_margin(self, micro_batch: int):
+        if self._micro_batch_per_rank <= 4 or micro_batch < 2:
+            return micro_batch
+        else:
+            return micro_batch - (self._micro_batch_per_rank - 4)
 
     @property
     def inflight_layer_ckpt(self):
@@ -151,6 +184,14 @@ class FlexTrainInterLayerCoordinator:
         grad_mem: Tensor = self._gpu_full_grads[1]
         return grad_mem.view(self._tensor_shape)
 
+    @property
+    def _nvme_inflight_ckpts(self):
+        return self._nvme_unit_ckpt_buffers[0]
+
+    @property
+    def _nvme_available_ckpts(self):
+        return self._nvme_unit_ckpt_buffers[1]
+
     def _sync_pre_micro_batch_forward(self):
         self._data_stream.submit(
             self._inflight_handle.wait, stream_execution=False
@@ -158,20 +199,34 @@ class FlexTrainInterLayerCoordinator:
         self._gpu_full_ckpts.rotate()
 
     def _prefetch_ckpt(self, task: InterLayerTask):
+        unit, micro_batch = task.unit, task.micro_batch
         tar = self.inflight_layer_ckpt
-        gpu_tar, cpu_tar = tar.split(self._ckpt_numels)
-        gpu_src = self.gpu_ckpt_base[task.unit][task.micro_batch]
-        cpu_src = self.cpu_ckpt_base[task.unit][task.micro_batch]
+        gpu_tar, cpu_tar, nvme_tar = tar.split(self._ckpt_numels)
+        gpu_src = self.gpu_ckpt_base[unit][micro_batch]
+        cpu_src = self.cpu_ckpt_base[unit][micro_batch]
+        if self._in_margin(micro_batch):
+            margin_index = self._index_in_margin(micro_batch)
+            nvme_src = self.nvme_margin_base[unit][margin_index]
+        else:
+            nvme_src = self._nvme_available_ckpts[micro_batch - 2]
         gpu_tar.copy_(gpu_src, non_blocking=True)
         cpu_tar.copy_(cpu_src, non_blocking=True)
+        nvme_tar.copy_(nvme_src, non_blocking=True)
 
     def _offload_ckpt(self, task: InterLayerTask):
+        unit, micro_batch = task.unit, task.micro_batch
         src = task.tensor.flatten()
-        gpu_src, cpu_src = src.split(self._ckpt_numels)
-        gpu_tar = self.gpu_ckpt_base[task.unit][task.micro_batch]
-        cpu_tar = self.cpu_ckpt_base[task.unit][task.micro_batch]
+        gpu_src, cpu_src, nvme_src = src.split(self._ckpt_numels)
+        gpu_tar = self.gpu_ckpt_base[unit][micro_batch]
+        cpu_tar = self.cpu_ckpt_base[unit][micro_batch]
+        if self._in_margin(micro_batch):
+            margin_index = self._index_in_margin(micro_batch)
+            nvme_tar = self.nvme_margin_base[unit][margin_index]
+        else:
+            nvme_tar = self._nvme_inflight_ckpts[micro_batch - 2]
         gpu_tar.copy_(gpu_src, non_blocking=True)
         cpu_tar.copy_(cpu_src, non_blocking=True)
+        nvme_tar.copy_(nvme_src, non_blocking=True)
 
     def _submit_pre_micro_batch_forward(
         self,
@@ -272,6 +327,34 @@ class FlexTrainInterLayerCoordinator:
         self._sync_pre_micro_batch_backward()
         self._submit_pre_micro_batch_backward(
             ckpt_prefetch, grad_prefetch, grad_offload
+        )
+
+    def pre_unit_forward(self, unit_index: int):
+        # If not initialized, return.
+        if not self._initialized:
+            return
+
+        # Rotate the NVMe prefetch buffer.
+        self._nvme_unit_ckpt_buffers.rotate()
+
+        # Offload the checkpoint to NVMe.
+        if unit_index == 0:
+            return
+        self._nvme_swapper.swap_out(
+            FlexTrainDataID(Dtype.CKPT, unit_index),
+            self._nvme_available_ckpts, async_op=True
+        )
+
+    def pre_unit_backward(self, unit_index: int):
+        # Rotate the NVMe prefetch buffer.
+        self._nvme_unit_ckpt_buffers.rotate()
+
+        # Prefetch the checkpoint from NVMe.
+        if unit_index <= 1 or unit_index == self._num_units - 1:
+            return
+        self._nvme_swapper.swap_in(
+            FlexTrainDataID(Dtype.CKPT, unit_index - 1),
+            self._nvme_inflight_ckpts, async_op=True
         )
 
 

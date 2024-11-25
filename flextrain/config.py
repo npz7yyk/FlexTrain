@@ -36,19 +36,19 @@ class SplitRatioConfig:
     Hyperparameters for data split ratio.
     """
 
-    checkpoint: float
+    checkpoint: Tuple[float, float]
     """
     How to split the checkpointed activations among the memory hierarchy.
-    Ratio = GPU, CPU = 1 - GPU.
-    Defaults to 1.0 if not provided.
+    Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
+    Defaults to (1.0, 0.0) if not provided.
     """
 
-    gradient: float
+    gradient: Tuple[float, float]
     """
     How to split the gradients of activations among the memory hierarchy.
     Note: These gradients are NOT those of the model parameters.
-    Ratio = GPU, CPU = 1 - GPU.
-    Defaults to 1.0 if not provided.
+    Ratio = (GPU, CPU), GPU + CPU = 1.0 is required.
+    Defaults to (1.0, 0.0) if not provided.
     """
 
     parameter: Tuple[float, float]
@@ -79,8 +79,8 @@ class SplitRatioConfig:
             "Split ratio configuration must be provided as a dictionary."
 
         # Set split ratio.
-        self.checkpoint = [split_ratio.get(CHECKPOINT, CHECKPOINT_DEFAULT)]
-        self.gradient = [split_ratio.get(GRADIENT, GRADIENT_DEFAULT)]
+        self.checkpoint = split_ratio.get(CHECKPOINT, CHECKPOINT_DEFAULT)
+        self.gradient = split_ratio.get(GRADIENT, GRADIENT_DEFAULT)
         self.parameter = split_ratio.get(PARAMETER, PARAMETER_DEFAULT)
         self.optimizer = split_ratio.get(OPTIMIZER, OPTIMIZER_DEFAULT)
         self.alpha = [split_ratio.get(ALPHA, ALPHA_DEFAULT)]

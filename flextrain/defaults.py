@@ -25,12 +25,12 @@ SPLIT_RATIO = "split_ratio"
 # Name of the checkpoint split ratio configuration
 CHECKPOINT = "checkpoint"
 # Default checkpoint split ratio
-CHECKPOINT_DEFAULT = 1.0
+CHECKPOINT_DEFAULT = (1.0, 0.0)
 
 # Name of the gradient split ratio configuration
 GRADIENT = "gradient"
 # Default gradient split ratio
-GRADIENT_DEFAULT = 1.0
+GRADIENT_DEFAULT = (1.0, 0.0)
 
 # Name of the parameter split ratio configuration
 PARAMETER = "parameter"
