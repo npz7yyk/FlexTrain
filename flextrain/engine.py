@@ -1,14 +1,17 @@
+import time
 import torch
 
 from torch.nn import Module
 from typing import Any, Callable, Sequence, Tuple, List, Dict
 
 from flextrain import distributed as dist
+from flextrain.benchmark import system_benchmark
 from flextrain.checkpointing import (
     FWDContext,
     detach_variable,
     checkpointed_forward,
     checkpointed_backward,
+    retrieve_tensor,
     retrieve_tensor_grads
 )
 from flextrain.config import get_flextrain_config
@@ -19,8 +22,7 @@ from flextrain.memory.coordinator import (
     get_para_coordinator,
     get_opts_coordinator,
     get_interlayer_coordinator,
-    InterLayerTask,
-    retrieve_tensor
+    InterLayerTask
 )
 from flextrain.memory.nvme_swapper import get_nvme_swapper
 from flextrain.optimizer import FlexTrainOptimizer
@@ -46,6 +48,10 @@ class FlexTrainEngine(object):
         # Link to model
         # Logically move the model to GPU and set the dtype
         self.model = model.cuda().to(dtype=config.mixed_precision.device_dtype)
+
+        # Exit if benchmark is enabled
+        if get_flextrain_config().benchmark:
+            return
 
         # Link to optimizer
         assert isinstance(optimizer, FlexTrainOptimizer), (
@@ -243,8 +249,6 @@ class FlexTrainEngine(object):
         )
         self.micro_batch_loss_rsts[task.micro_batch] = llm_loss_rst
 
-        dist.print_rank_by_rank(f"Loss: {llm_loss_rst}")
-
         # 4. Scale the loss
         loss = retrieve_llm_loss(llm_loss_rst)
         loss = loss.float() * self.loss_scale / self.micro_batch_per_batch
@@ -366,6 +370,10 @@ class FlexTrainEngine(object):
         self.model.eval()
 
     def train_iteration(self):
+        # 0. Enter benchmark mode if enabled
+        if get_flextrain_config().benchmark:
+            system_benchmark()
+
         # 1. Conduct reset
         assert self.nvme_swapper.is_empty()
         assert self.data_stream.is_empty()

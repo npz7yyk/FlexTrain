@@ -6,6 +6,12 @@ from datetime import timedelta
 # --- flextrain configuration defaults ---
 
 # # --- general configuration defaults ---
+
+# Name of the system benchmarking configuration
+BENCHMARK = "benchmark"
+# Default whether to benchmark the system
+BENCHMARK_DEFAULT = False
+
 # Name of the checkpoint interval configuration
 CHECKPOINT_INTERVAL = "checkpoint_interval"
 # Default checkpoint interval
@@ -42,6 +48,20 @@ ALPHA = "alpha"
 ALPHA_DEFAULT = 0.25
 
 # # --- end of split ratio configuration defaults ---
+
+
+# # --- Benchmark configuration defaults ---
+
+# Number of iterations to run the benchmark
+BENCHMARK_ITERATIONS = 100
+
+# Size of the data blocks to test
+BENCHMARK_BLOCK_SIZE = 2 ** 30
+
+# Number of data blocks to test
+BENCHMARK_NUM_BLOCKS = 4
+
+# # --- end of Benchmark configuration defaults ---
 
 
 # # --- NVMe swap configuration defaults ---

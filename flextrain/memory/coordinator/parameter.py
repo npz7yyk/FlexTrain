@@ -266,17 +266,6 @@ class FlexTrainParaCoordinator:
         self._num_layers += num_layers
         # Update the number of units.
         self._num_units += 1
-
-        # Allocate parameter bases
-        self._cpu_para_base.append(allocate_memory_chunks(
-            self._micro_batch_para_splits[0], self._micro_batch_per_rank,
-            self._device_dtype, torch.device('cpu')
-        ))
-        self._gpu_para_base.append(allocate_memory_chunks(
-            self._micro_batch_para_splits[1], self._micro_batch_per_rank,
-            self._device_dtype, torch.cuda.current_device()
-        ))
-
         # Track the unit parameters.
         self._unit_parameters[unit_index] = ContiguousParaGroup(unit_paras)
 
@@ -287,6 +276,21 @@ class FlexTrainParaCoordinator:
 
         # Move parameters into contiguous memory.
         move_into_contiguous(unit_paras, temp_gpu_buffer)
+
+        # Enter system benchmark mode.
+        if get_flextrain_config().benchmark:
+            self._gpu_full_paras.rotate()
+            return
+
+        # Allocate parameter bases
+        self._cpu_para_base.append(allocate_memory_chunks(
+            self._micro_batch_para_splits[0], self._micro_batch_per_rank,
+            self._device_dtype, torch.device('cpu')
+        ))
+        self._gpu_para_base.append(allocate_memory_chunks(
+            self._micro_batch_para_splits[1], self._micro_batch_per_rank,
+            self._device_dtype, torch.cuda.current_device()
+        ))
 
         # Partition parameters.
         micro_batch_partitioned_paras = torch.chunk(

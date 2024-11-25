@@ -2,6 +2,7 @@ import torch
 from typing import Tuple
 
 from flextrain.defaults import (
+    BENCHMARK, BENCHMARK_DEFAULT,
     CHECKPOINT_INTERVAL, CHECKPOINT_INTERVAL_DEFAULT,
     SPLIT_RATIO,
     CHECKPOINT, CHECKPOINT_DEFAULT,
@@ -306,6 +307,11 @@ class FlexTrainConfig:
     """
     Hyperparameters for FlexTrain optimizations.
     """
+    benchmark: bool
+    """
+    Whether to benchmark system performance.
+    Defaults to False if not provided.
+    """
 
     batch_size: int
     """
@@ -359,6 +365,9 @@ class FlexTrainConfig:
         self.micro_batch_size = config_dict["micro_batch_size"]
 
         # Set remaining keys.
+        self.benchmark = config_dict.get(
+            BENCHMARK, BENCHMARK_DEFAULT
+        )
         self.checkpoint_interval = config_dict.get(
             CHECKPOINT_INTERVAL, CHECKPOINT_INTERVAL_DEFAULT
         )

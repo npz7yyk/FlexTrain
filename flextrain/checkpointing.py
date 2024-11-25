@@ -287,6 +287,29 @@ def checkpointed_forward(run_function, *args):
     return outputs, fwd_ctx
 
 
+def retrieve_tensor(
+    interlayer: torch.Tensor | Tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    # If interlayer is a single tensor, return it.
+    if isinstance(interlayer, torch.Tensor):
+        return interlayer
+
+    # Unpack the tuple.
+    # Currently, only one tensor is supported.
+    tar = None
+    for tensor in interlayer:
+        if isinstance(tensor, torch.Tensor):
+            assert tar is None, (
+                "Currently, only one tensor is supported for FlexTrain "
+                "checkpointing. You may consider manually place all "
+                "inter-layer results into a single tensor."
+            )
+            tar = tensor
+
+    assert tar is not None, "No tensor can be found in inter-layer results."
+    return tar
+
+
 def retrieve_tensor_grads(
     tensors: Iterable[Any | torch.Tensor] | Any | torch.Tensor
 ):

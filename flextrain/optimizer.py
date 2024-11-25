@@ -71,6 +71,10 @@ class FlexTrainOptimizer:
         self.unit_group_map: Dict[int, Dict] = {}
         self.non_layerwise_params = set(self.param_group_map.keys())
 
+        # Return if running in benchmark mode.
+        if get_flextrain_config().benchmark:
+            return
+
         for i, unit_paras in unit_parameter_map.items():
             params = unit_paras.paras
             group = None

@@ -2,7 +2,6 @@ import torch
 
 from dataclasses import dataclass
 from torch import Tensor
-from typing import Tuple
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
@@ -24,27 +23,6 @@ from flextrain.utils.logging import rank0_logger
 @dataclass
 class InterLayerTask(LLMTask):
     tensor: Tensor = None
-
-
-def retrieve_tensor(interlayer: Tensor | Tuple[Tensor, ...]) -> Tensor:
-    # If interlayer is a single tensor, return it.
-    if isinstance(interlayer, Tensor):
-        return interlayer
-
-    # Unpack the tuple.
-    # Currently, only one tensor is supported.
-    tar = None
-    for tensor in interlayer:
-        if isinstance(tensor, Tensor):
-            assert tar is None, (
-                "Currently, only one tensor is supported for FlexTrain "
-                "checkpointing. You may consider manually place all "
-                "inter-layer results into a single tensor."
-            )
-            tar = tensor
-
-    assert tar is not None, "No tensor can be found in inter-layer results."
-    return tar
 
 
 class FlexTrainInterLayerCoordinator:
