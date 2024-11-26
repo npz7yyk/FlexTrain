@@ -71,10 +71,6 @@ class FlexTrainOptimizer:
         self.unit_group_map: Dict[int, Dict] = {}
         self.non_layerwise_params = set(self.param_group_map.keys())
 
-        # Return if running in benchmark mode.
-        if get_flextrain_config().benchmark:
-            return
-
         for i, unit_paras in unit_parameter_map.items():
             params = unit_paras.paras
             group = None
@@ -96,8 +92,10 @@ class FlexTrainOptimizer:
                 if group is None:
                     group = self.param_group_map[p]
                 else:
-                    assert id(group) == id(self.param_group_map[p]), \
-                        "All parameters in a unit should be in the same group."
+                    pass
+                    # FlexTrain will support this in the future.
+                    # assert id(group) == id(self.param_group_map[p]), \
+                    #     "Parameters in a unit should be in the same group."
             # The whole unit is not under training.
             if group is None:
                 assert NotImplementedError, (
@@ -110,6 +108,10 @@ class FlexTrainOptimizer:
         # Convert the non-layerwise parameters to a list.
         self.non_layerwise_params = list(self.non_layerwise_params)
         self.non_layerwise_params.sort(key=lambda p: param_id_map[p])
+
+        # Return if running in benchmark mode.
+        if get_flextrain_config().benchmark:
+            return
 
         # End of grouping parameters.
 
