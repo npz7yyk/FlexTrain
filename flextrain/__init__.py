@@ -3,6 +3,7 @@ import torch
 from argparse import ArgumentParser
 
 import flextrain.utils.distributed as distributed
+from flextrain.ops import op_builder                # noqa: F401
 
 from .config import init_flextrain_config
 from .defaults import (
