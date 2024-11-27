@@ -3,7 +3,6 @@ from typing import List, Dict
 from flextrain.optimizer import FlexTrainOptimizer
 
 from .cpu_adam import FlexTrainCPUAdam
-from .fused_adam import FusedAdam as FlexTrainGPUAdam
 
 
 class FlexTrainAdam(FlexTrainOptimizer):
@@ -30,22 +29,11 @@ class FlexTrainAdam(FlexTrainOptimizer):
             opt_state_per_element=FlexTrainAdam.opt_state_per_element
         )
 
-        # 2. Initialize GPU Adam optimizer.
-        self.gpu_optimizer = FlexTrainGPUAdam(
-            self.param_groups,
-            lr=lr,
-            bias_correction=bias_correction,
-            betas=betas,
-            eps=eps,
-            adam_w_mode=adamw_mode,
-            weight_decay=weight_decay,
-            amsgrad=amsgrad,
-            set_grad_none=set_grad_none
-        )
-
-        # 3. Initialize CPU Adam optimizer.
+        # 2. Initialize CPU Adam optimizer.
         self.cpu_optimizer = FlexTrainCPUAdam(
             self.unit_group_map,
+            self.non_layerwise_master_params,
+            self.non_layerwise_param_groups,
             self.param_groups,
             lr=lr,
             bias_correction=bias_correction,

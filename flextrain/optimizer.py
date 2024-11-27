@@ -4,6 +4,7 @@ from torch import Tensor
 from typing import List, Dict
 
 from flextrain.config import get_flextrain_config
+from flextrain.memory import move_into_contiguous
 from flextrain.memory.coordinator import get_para_coordinator
 from flextrain.memory.coordinator.optimizer import (  # noqa: F401
     OptTarget,
@@ -108,6 +109,9 @@ class FlexTrainOptimizer:
         # Convert the non-layerwise parameters to a list.
         self.non_layerwise_params = list(self.non_layerwise_params)
         self.non_layerwise_params.sort(key=lambda p: param_id_map[p])
+        self.non_layerwise_param_groups = [
+            self.param_group_map[p] for p in self.non_layerwise_params
+        ]
 
         # Return if running in benchmark mode.
         if get_flextrain_config().benchmark:
@@ -123,35 +127,53 @@ class FlexTrainOptimizer:
 
         # Allocate gradient buffers & create / link the master parameters.
         total_numel = sum(p.numel() for p in self.non_layerwise_params)
-        self._device_grads = torch.zeros(
+        self._device_para = torch.zeros(
             total_numel, dtype=device_dtype, device=torch.cuda.current_device()
         )
-        self._master_grads = torch.zeros(
-            total_numel, dtype=master_dtype, device=torch.cuda.current_device()
+        self._device_grad = torch.zeros(
+            total_numel, dtype=device_dtype, device=torch.cuda.current_device()
         )
+        self._master_para = torch.zeros(
+            total_numel, dtype=master_dtype, pin_memory=True
+        )
+        self._master_grad = torch.zeros(
+            total_numel, dtype=master_dtype, pin_memory=True
+        )
+        move_into_contiguous(self.non_layerwise_params, self._device_para)
+        self._master_para.copy_(self._device_para)
 
         # Create / link the master parameters.
         offset = 0
+        self.non_layerwise_master_params = []
         for param in self.non_layerwise_params:
-            param.data = param.data.to(
-                device=torch.cuda.current_device(), dtype=device_dtype
-            )
-            master_param = torch.nn.Parameter(param.to(master_dtype))
             end = offset + param.numel()
-            param.grad = self._device_grads[offset:end].view_as(param)
-            master_param.grad = self._master_grads[offset:end].view_as(param)
-            offset = offset + param.numel()
-        # End of allocating GPU memory for non-layerwise gradients.
+            # Create the master parameter.
+            master_param = torch.nn.Parameter(self._master_para[offset:end])
+            self.non_layerwise_master_params.append(master_param)
+
+            # Link the gradient buffers.
+            param.grad = self._device_grad[offset:end].view_as(param)
+            master_param.grad = self._master_grad[offset:end]
+            offset = end
 
     def step(self, closure=None):
         # Perform the optimization step of non-layerwise parameters.
 
         # 1. Conduct all-reduce for the gradients of non-layerwise parameters.
-        dist.all_reduce(self._device_grads, op=dist.ReduceOp.AVG)
+        dist.all_reduce(self._device_grad, op=dist.ReduceOp.AVG)
+        # Will supports master_dtype gradient accumulation in the future.
 
-        # 2. Conduct the optimization step for the non-layerwise parameters.
-        self.gpu_optimizer.step(closure)
-        self.gpu_optimizer.zero_grad(set_to_none=False)
+        # 2. Copy the gradients to the master gradients.
+        self._master_grad.copy_(self._device_grad, non_blocking=True)
+        torch.cuda.synchronize()
+
+        # 3. Conduct the optimization step for the non-layerwise parameters.
+        self.cpu_optimizer.step(closure)
+        self._device_grad.zero_()
+
+        # 4. Copy the updated master parameters back to the device.
+        assert self._master_para.is_pinned()
+        self._device_para.copy_(self._master_para, non_blocking=True)
 
     def update_state(self):
         self.cpu_optimizer.update_state()

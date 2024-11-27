@@ -1,12 +1,11 @@
 import torch
 
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from torch import Tensor
 from tqdm import tqdm
-from typing import Dict
+from typing import List, Dict
 
 from flextrain.checkpointing import set_post_recomputation_function
 from flextrain.config import get_flextrain_config
@@ -45,23 +44,36 @@ class FlexTrainCPUOptimizer(ABC):
     FWD_INDEX = 0
     BWD_INDEX = 1
 
-    def __init__(self, unit_group_map: Dict[int, Dict]):
+    def __init__(
+        self,
+        unit_group_map: Dict[int, Dict],
+        non_layerwise_params: List[Tensor],
+        non_layerwise_param_groups: List[Dict]
+    ):
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._unit_group_map = unit_group_map
+        self._non_layerwise_params = non_layerwise_params
+        self._non_layerwise_param_groups = non_layerwise_param_groups
 
-        # Initialize the state for each unit.
-        if not hasattr(self, "state"):
-            self.state = defaultdict(dict)
-        for unit in unit_group_map:
-            self.state[unit] = {STEP_KEY: 0}
+    @abstractmethod
+    def step(self, closure=None):
+        pass
 
     @abstractmethod
     def _step(self, step: int, args: Dict, opt_target: OptTarget):
         pass
 
     def update_state(self):
-        for unit in self._unit_group_map:
-            self.state[unit][STEP_KEY] += 1
+        # Update the step count for each unit group.
+        seen_group_ids = set()
+        for group in self._non_layerwise_param_groups:
+            # Ensure that the group is not visited before.
+            if id(group) not in seen_group_ids:
+                if STEP_KEY not in group:
+                    group[STEP_KEY] = 0
+                group[STEP_KEY] += 1
+                # Mark the group as visited.
+                seen_group_ids.add(id(group))
 
     def _submit_step(self, unit_index: int, opt_target: OptTarget):
         assert unit_index in self._unit_group_map, (
@@ -71,7 +83,7 @@ class FlexTrainCPUOptimizer(ABC):
         # Submit the step function to the executor.
         future = self._executor.submit(
             self._step,
-            self.state[unit_index][STEP_KEY],
+            self._unit_group_map[unit_index][STEP_KEY],
             self._unit_group_map[unit_index],
             opt_target
         )

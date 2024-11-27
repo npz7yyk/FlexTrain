@@ -8,7 +8,7 @@
 import torch
 from cpuinfo import get_cpu_info
 from dataclasses import dataclass
-from typing import Dict
+from typing import List, Dict
 
 from flextrain.config import get_flextrain_config
 from flextrain.optimizer import (
@@ -31,6 +31,8 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
     def __init__(
         self,
         unit_group_map: Dict[int, Dict],
+        non_layerwise_params: List[torch.Tensor],
+        non_layerwise_param_groups: List[Dict],
         model_params,
         lr=1e-3,
         bias_correction=True,
@@ -97,7 +99,12 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
         # model_params, default_args for torch.optim.Optimizer
         # unit_group_map for FlexTrainCPUOptimizer
         torch.optim.Optimizer.__init__(self, model_params, default_args)
-        FlexTrainCPUOptimizer.__init__(self, unit_group_map)
+        FlexTrainCPUOptimizer.__init__(
+            self,
+            unit_group_map=unit_group_map,
+            non_layerwise_params=non_layerwise_params,
+            non_layerwise_param_groups=non_layerwise_param_groups
+        )
 
         cpu_info = get_cpu_info()
         self.cpu_vendor = cpu_info["vendor_id_raw"].lower() \
@@ -138,6 +145,46 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
             opt_target.para.data, opt_target.grad.data,
             opt_target.exp_avg.data, opt_target.exp_avg_sq.data
         )
+
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for p, g in zip(
+            self._non_layerwise_params, self._non_layerwise_param_groups
+        ):
+            if p.grad is None:
+                continue
+            if p.numel() == 0:
+                continue
+            if p.grad.data.is_sparse:
+                raise RuntimeError(
+                    'CPUAdam does not support sparse gradients, '
+                    'please consider SparseAdam instead'
+                )
+
+            state = self.state[p]
+            # State initialization
+            if len(state) == 0:
+                assert 'step' in g, "step should be in the group"
+                # Exponential moving average of gradient values
+                state['exp_avg'] = torch.zeros_like(p.data)
+                # Exponential moving average of squared gradient values
+                state['exp_avg_sq'] = torch.zeros_like(p.data)
+
+            self._step(g['step'], g, AdamOptTarget(
+                p.data, p.grad.data,
+                state['exp_avg'].data, state['exp_avg_sq'].data
+            ))
+
+        return loss
 
     def submit_step(
         self, unit_index: int, para: torch.Tensor, grad: torch.Tensor,
