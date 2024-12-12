@@ -146,6 +146,21 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
             opt_target.exp_avg.data, opt_target.exp_avg_sq.data
         )
 
+    @torch.no_grad()
+    def profile_step(self, numel: int, dtype: torch.dtype):
+        if not hasattr(self, 'curr_step'):
+            self.curr_step = 0
+            self.para = torch.empty(numel, dtype=dtype, pin_memory=True)
+            self.grad = torch.empty(numel, dtype=dtype, pin_memory=True)
+            self.exp_avg = torch.zeros_like(self.para, pin_memory=True)
+            self.exp_avg_sq = torch.zeros_like(self.para, pin_memory=True)
+        self.curr_step += 1
+        self.cpu_adam.adam_update(
+            self.opt_id, self.curr_step, 1e-3, 0.9, 0.999, 1e-8, 0.01, True,
+            self.para.data, self.grad.data,
+            self.exp_avg.data, self.exp_avg_sq.data
+        )
+
     def step(self, closure=None):
         """Performs a single optimization step.
 

@@ -7,10 +7,10 @@ from datetime import timedelta
 
 # # --- general configuration defaults ---
 
-# Name of the system benchmarking configuration
-BENCHMARK = "benchmark"
-# Default whether to benchmark the system
-BENCHMARK_DEFAULT = False
+# Name of the system auto-config option
+AUTO_CONFIG = "auto_config"
+# Default whether to auto-configure the system
+AUTO_CONFIG_DEFAULT = False
 
 # Name of the checkpoint interval configuration
 CHECKPOINT_INTERVAL = "checkpoint_interval"
@@ -52,8 +52,17 @@ ALPHA_DEFAULT = 0.25
 
 # # --- Benchmark configuration defaults ---
 
-# Number of iterations to run the benchmark
-BENCHMARK_ITERATIONS = 100
+# Number of iterations to run GPU related benchmarks
+BENCHMARK_GPU_ITERATIONS = 100
+
+# Number of iterations to run PCIe related benchmarks
+BENCHMARK_PCIE_ITERATIONS = 200
+
+# Number of iterations to run NVMe related benchmarks
+BENCHMARK_NVME_ITERATIONS = 50
+
+# Number of iterations to run CPU related benchmarks
+BENCHMARK_CPU_ITERATIONS = 50
 
 # Size of the data blocks to test
 BENCHMARK_BLOCK_SIZE = 2 ** 30
@@ -62,6 +71,17 @@ BENCHMARK_BLOCK_SIZE = 2 ** 30
 BENCHMARK_NUM_BLOCKS = 4
 
 # # --- end of Benchmark configuration defaults ---
+
+
+# # --- Auto-config configuration defaults ---
+
+# Ratio of the accessible GPU memory to the total GPU memory
+ACCESSIBLE_GPU_MEMORY_RATIO = 0.95
+
+# Ratio of the accessible CPU memory to the total CPU memory
+ACCESSIBLE_CPU_MEMORY_RATIO = 0.90
+
+# # --- end of Auto-config configuration defaults ---
 
 
 # # --- NVMe swap configuration defaults ---

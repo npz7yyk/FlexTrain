@@ -4,7 +4,7 @@ from torch.nn import Module
 from typing import Any, Callable, Sequence, Tuple, List, Dict
 
 from flextrain import distributed as dist
-from flextrain.benchmark import system_benchmark
+from flextrain.auto_config import system_auto_config
 from flextrain.checkpointing import (
     FWDContext,
     detach_variable,
@@ -47,10 +47,6 @@ class FlexTrainEngine(object):
         # Link to model
         # Logically move the model to GPU and set the dtype
         self.model = model.cuda().to(dtype=config.mixed_precision.device_dtype)
-
-        # Return if benchmark is enabled
-        if get_flextrain_config().benchmark:
-            return
 
         # Link to optimizer
         assert isinstance(optimizer, FlexTrainOptimizer), (
@@ -371,10 +367,6 @@ class FlexTrainEngine(object):
         self.model.eval()
 
     def train_iteration(self):
-        # 0. Enter benchmark mode if enabled
-        if get_flextrain_config().benchmark:
-            system_benchmark()
-
         # 1. Conduct reset
         assert self.nvme_swapper.is_empty()
         assert self.data_stream.is_empty()
@@ -392,6 +384,7 @@ class FlexTrainEngine(object):
         # Warmup the backward pipeline
         self.para_coordinator.warmup_backward_pipeline()
         self.opts_coordinator.warmup_backward_pipeline()
+        torch.cuda.empty_cache()
         # Conduct backward
         for task in self.scheduler:
             self._conduct_backward(task)
@@ -399,10 +392,14 @@ class FlexTrainEngine(object):
         self.para_coordinator.clear_backward_pipeline()
         self.opts_coordinator.clear_backward_pipeline()
 
-        # 3. Conduct optimizer step (for GPU parameters)
+        # 3. Enter auto-configuration if needed
+        if get_flextrain_config().auto_config:
+            system_auto_config()
+
+        # 4. Conduct optimizer step (for GPU parameters)
         self.optimizer.step()
 
-        # 4. Conduct the loss scaling update
+        # 5. Conduct the loss scaling update
         loss_rsts = []
         for i in range(self.micro_batch_per_batch):
             loss_rsts.append(self.micro_batch_loss_rsts[i])

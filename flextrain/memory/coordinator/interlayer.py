@@ -47,7 +47,8 @@ class FlexTrainInterLayerCoordinator:
         # Memory lazy allocation.
         self._mem_allocated = False
 
-        # Record the tensor shape.
+        # Record the tensor numel and shape.
+        self._tensor_numel = tensor.numel()
         self._tensor_shape = tensor.shape
 
         # Async IO NVMe swapper.
@@ -72,6 +73,23 @@ class FlexTrainInterLayerCoordinator:
             "Gradient split ratio must sum to 1.0."
         self._grad_numels = get_split_numels(
             tensor.numel(), config.split_ratio.gradient, num_levels=2
+        )
+
+        # Allocate memory for GPU checkpoint buffer.
+        self._gpu_full_ckpts = RotateContainer(
+            allocate_memory_chunks(
+                tensor.numel(), 2,
+                config.mixed_precision.device_dtype,
+                torch.cuda.current_device()
+            )
+        )
+        # Allocate memory for GPU gradient buffer.
+        self._gpu_full_grads = RotateContainer(
+            allocate_memory_chunks(
+                tensor.numel(), 2,
+                config.mixed_precision.device_dtype,
+                torch.cuda.current_device()
+            )
         )
 
         # Allocate memory for checkpoint.
@@ -108,22 +126,6 @@ class FlexTrainInterLayerCoordinator:
             torch.device('cpu')
         )
 
-        # Allocate memory for GPU checkpoint buffer.
-        self._gpu_full_ckpts = RotateContainer(
-            allocate_memory_chunks(
-                tensor.numel(), 2,
-                config.mixed_precision.device_dtype,
-                torch.cuda.current_device()
-            )
-        )
-        # Allocate memory for GPU gradient buffer.
-        self._gpu_full_grads = RotateContainer(
-            allocate_memory_chunks(
-                tensor.numel(), 2,
-                config.mixed_precision.device_dtype,
-                torch.cuda.current_device()
-            )
-        )
         # Allocate memory for NVMe checkpoint prefetching.
         self._nvme_unit_ckpt_buffers = RotateContainer(
             allocate_memory_chunks(

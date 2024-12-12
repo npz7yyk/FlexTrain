@@ -2,7 +2,7 @@ import torch
 from typing import Tuple
 
 from flextrain.defaults import (
-    BENCHMARK, BENCHMARK_DEFAULT,
+    AUTO_CONFIG, AUTO_CONFIG_DEFAULT,
     CHECKPOINT_INTERVAL, CHECKPOINT_INTERVAL_DEFAULT,
     SPLIT_RATIO,
     CHECKPOINT, CHECKPOINT_DEFAULT,
@@ -307,9 +307,9 @@ class FlexTrainConfig:
     """
     Hyperparameters for FlexTrain optimizations.
     """
-    benchmark: bool
+    auto_config: bool
     """
-    Whether to benchmark system performance.
+    Whether to automatically configure FlexTrain optimizations.
     Defaults to False if not provided.
     """
 
@@ -365,8 +365,8 @@ class FlexTrainConfig:
         self.micro_batch_size = config_dict["micro_batch_size"]
 
         # Set remaining keys.
-        self.benchmark = config_dict.get(
-            BENCHMARK, BENCHMARK_DEFAULT
+        self.auto_config = config_dict.get(
+            AUTO_CONFIG, AUTO_CONFIG_DEFAULT
         )
         self.checkpoint_interval = config_dict.get(
             CHECKPOINT_INTERVAL, CHECKPOINT_INTERVAL_DEFAULT
@@ -387,20 +387,30 @@ class FlexTrainConfig:
             mixed_precision=config_dict.get(MIXED_PRECISION, {})
         )
 
-        # Log FlexTrain configuration.
-        rank0_logger.info(self.to_log())
-
-    def to_log(self):
-        return (
-            f"\n> FlexTrain configuration: {LEFT_BRACE}\n"
-            f"\t\"batch_size\": {self.batch_size},\n"
-            f"\t\"micro_batch_size\": {self.micro_batch_size},\n"
-            f"\t\"{CHECKPOINT_INTERVAL}\": {self.checkpoint_interval},\n"
-            f"{self.split_ratio.to_log(indent=1)},\n"
-            f"{self.nvme_swap.to_log(indent=1)},\n"
-            f"{self.mixed_precision.to_log(indent=1)}\n"
-            f"{RIGHT_BRACE}"
-        )
+        if self.auto_config:
+            # Log FlexTrain configuration for auto-config mode.
+            rank0_logger.info(
+                f"\n\n> FlexTrain conducting auto-configuration ...\n"
+                f"Test configuration: {LEFT_BRACE}\n"
+                f"\t\"batch_size\": {self.batch_size},\n"
+                f"\t\"micro_batch_size\": {self.micro_batch_size},\n"
+                f"\t\"{CHECKPOINT_INTERVAL}\": {self.checkpoint_interval},\n"
+                f"{self.nvme_swap.to_log(indent=1)},\n"
+                f"{self.mixed_precision.to_log(indent=1)}\n"
+                f"{RIGHT_BRACE}\n"
+            )
+        else:
+            # Log FlexTrain configuration.
+            rank0_logger.info(
+                f"\n\n> FlexTrain configuration: {LEFT_BRACE}\n"
+                f"\t\"batch_size\": {self.batch_size},\n"
+                f"\t\"micro_batch_size\": {self.micro_batch_size},\n"
+                f"\t\"{CHECKPOINT_INTERVAL}\": {self.checkpoint_interval},\n"
+                f"{self.split_ratio.to_log(indent=1)},\n"
+                f"{self.nvme_swap.to_log(indent=1)},\n"
+                f"{self.mixed_precision.to_log(indent=1)}\n"
+                f"{RIGHT_BRACE}\n"
+            )
 
 
 _CONFIG = None

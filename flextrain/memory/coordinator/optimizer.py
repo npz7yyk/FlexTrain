@@ -63,6 +63,10 @@ class FlexTrainCPUOptimizer(ABC):
     def _step(self, step: int, args: Dict, opt_target: OptTarget):
         pass
 
+    @abstractmethod
+    def profile_step(self, numel: int, dtype: torch.dtype):
+        pass
+
     def update_state(self):
         # Update the step count for each unit group.
         seen_group_ids = set()
@@ -303,6 +307,10 @@ class FlexTrainOptsCoordinator:
                 self._unit_numel, dtype=device_dtype,
                 device=torch.cuda.current_device()
             )
+
+        # Return if running in auto-config mode
+        if get_flextrain_config().auto_config:
+            return
 
         # Used for receiving gradients / working with optimizer.
         self._cpu_opt_grad_buffers = RotateContainer(
@@ -816,6 +824,10 @@ class FlexTrainOptsCoordinator:
 
     def pre_micro_batch_forward(self, curr_task: LLMTask):
         """ Submit tasks for the given micro-batch in forward pass. """
+        # If running in auto-config mode, return.
+        if get_flextrain_config().auto_config:
+            return
+
         # For the first iteration, the optimizer is not ready.
         if not self.is_initialized:
             return
@@ -836,6 +848,10 @@ class FlexTrainOptsCoordinator:
 
     def pre_micro_batch_backward(self, curr_task: LLMTask):
         """ Submit tasks for the given micro-batch in backward pass. """
+        # If running in auto-config mode, return.
+        if get_flextrain_config().auto_config:
+            return
+
         # Zero the extra buffer if necessary.
         if self._gradacc_dtype_incompatible:
             torch.zero_(self._gpu_bwd_extra_grads)
@@ -860,6 +876,10 @@ class FlexTrainOptsCoordinator:
 
     def post_micro_batch_backward(self, curr_task: LLMTask):
         """ Conduct post-processing after the backward of the micro-batch. """
+        # If running in auto-config mode, return.
+        if get_flextrain_config().auto_config:
+            return
+
         # If the gradients are not compatible with the device dtype,
         # we need explicitly accumulate the gradients.
         if self._gradacc_dtype_incompatible:
@@ -867,6 +887,10 @@ class FlexTrainOptsCoordinator:
             gradacc_buffer += self._gpu_bwd_extra_grads
 
     def pre_unit_forward(self, unit_index: int):
+        # If running in auto-config mode, return.
+        if get_flextrain_config().auto_config:
+            return
+
         # If the optimizer is not initialized, return.
         if not self.is_initialized:
             return
@@ -890,6 +914,12 @@ class FlexTrainOptsCoordinator:
         Returns:
             None
         """
+        # Return if running in auto-config mode
+        if get_flextrain_config().auto_config:
+            # Just ensure gradients are pre-allocated.
+            self._prepare_unit_grads(unit_index)
+            return
+
         # Synchrnoize the inflight optimizer step.
         self._inflight_optimizer_step.wait()
 
@@ -905,6 +935,10 @@ class FlexTrainOptsCoordinator:
         self._prepare_unit_grads(unit_index)
 
     def warmup_forward_pipeline(self):
+        # If running in auto-config mode, return.
+        if get_flextrain_config().auto_config:
+            return
+
         # If the optimizer is not initialized, return.
         if not self.is_initialized:
             return
@@ -935,6 +969,10 @@ class FlexTrainOptsCoordinator:
             self._submit_update_para(1, mb, forward=True)()
 
     def warmup_backward_pipeline(self):
+        # If running in auto-config mode, return.
+        if get_flextrain_config().auto_config:
+            return
+
         # Complete the initialization.
         self._initialize_alpha_split()
         # Inform the parameter coordinator that future updates are coming.
@@ -944,6 +982,10 @@ class FlexTrainOptsCoordinator:
         """
         Cleanup the backward pipeline.
         """
+        # If running in auto-config mode, return.
+        if get_flextrain_config().auto_config:
+            return
+
         # Synchronize the inflight tasks.
         self._nvme_swapper.synchronize()
         self._data_stream.synchronize()

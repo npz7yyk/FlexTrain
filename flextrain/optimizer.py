@@ -113,10 +113,6 @@ class FlexTrainOptimizer:
             self.param_group_map[p] for p in self.non_layerwise_params
         ]
 
-        # Return if running in benchmark mode.
-        if get_flextrain_config().benchmark:
-            return
-
         # End of grouping parameters.
 
         # 3. Allocate GPU memory for:
@@ -172,7 +168,6 @@ class FlexTrainOptimizer:
         self._device_grad.zero_()
 
         # 4. Copy the updated master parameters back to the device.
-        assert self._master_para.is_pinned()
         self._device_para.copy_(self._master_para, non_blocking=True)
 
     def update_state(self):
