@@ -95,6 +95,7 @@ class FlexTrainOptimizer:
                 else:
                     pass
                     # FlexTrain will support this in the future.
+                    # Plan: rewrite the CPU optimizer.
                     # assert id(group) == id(self.param_group_map[p]), \
                     #     "Parameters in a unit should be in the same group."
             # The whole unit is not under training.
@@ -120,6 +121,8 @@ class FlexTrainOptimizer:
         config = get_flextrain_config()
         device_dtype = config.mixed_precision.device_dtype
         master_dtype = config.mixed_precision.master_dtype
+        gradacc_dtype = config.mixed_precision.gradacc_dtype
+        self._gradacc_dtype_incompatible = device_dtype != gradacc_dtype
 
         # Allocate gradient buffers & create / link the master parameters.
         total_numel = sum(p.numel() for p in self.non_layerwise_params)
@@ -129,6 +132,11 @@ class FlexTrainOptimizer:
         self._device_grad = torch.zeros(
             total_numel, dtype=device_dtype, device=torch.cuda.current_device()
         )
+        if self._gradacc_dtype_incompatible:
+            self._device_acc_grad = torch.zeros(
+                total_numel, dtype=gradacc_dtype,
+                device=torch.cuda.current_device()
+            )
         self._master_para = torch.zeros(
             total_numel, dtype=master_dtype, pin_memory=True
         )
@@ -141,7 +149,14 @@ class FlexTrainOptimizer:
         # Create / link the master parameters.
         offset = 0
         self.non_layerwise_master_params = []
-        for param in self.non_layerwise_params:
+        non_layerwise_master_grads: List[Tensor] = []
+
+        def gradacc_hook_producer(i: int):
+            def hook(grad: Tensor):
+                non_layerwise_master_grads[i] += grad.flatten()
+            return hook
+
+        for i, param in enumerate(self.non_layerwise_params):
             end = offset + param.numel()
             # Create the master parameter.
             master_param = torch.nn.Parameter(self._master_para[offset:end])
@@ -150,22 +165,29 @@ class FlexTrainOptimizer:
             # Link the gradient buffers.
             param.grad = self._device_grad[offset:end].view_as(param)
             master_param.grad = self._master_grad[offset:end]
+            if self._gradacc_dtype_incompatible:
+                device_master_grad = self._device_acc_grad[offset:end]
+                non_layerwise_master_grads.append(device_master_grad)
+                param.register_hook(gradacc_hook_producer(i))
             offset = end
 
     def step(self, closure=None):
         # Perform the optimization step of non-layerwise parameters.
+        device_grad_buffer = self._device_acc_grad \
+            if self._gradacc_dtype_incompatible else self._device_grad
 
         # 1. Conduct all-reduce for the gradients of non-layerwise parameters.
-        dist.all_reduce(self._device_grad, op=dist.ReduceOp.AVG)
-        # Will supports master_dtype gradient accumulation in the future.
+        dist.all_reduce(device_grad_buffer, op=dist.ReduceOp.AVG)
 
         # 2. Copy the gradients to the master gradients.
-        self._master_grad.copy_(self._device_grad, non_blocking=True)
+        self._master_grad.copy_(device_grad_buffer, non_blocking=True)
         torch.cuda.synchronize()
 
         # 3. Conduct the optimization step for the non-layerwise parameters.
         self.cpu_optimizer.step(closure)
         self._device_grad.zero_()
+        if self._gradacc_dtype_incompatible:
+            self._device_acc_grad.zero_()
 
         # 4. Copy the updated master parameters back to the device.
         self._device_para.copy_(self._master_para, non_blocking=True)
