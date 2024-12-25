@@ -6,33 +6,22 @@
 # License: Apache-2.0
 
 import torch
+
 from cpuinfo import get_cpu_info
-from dataclasses import dataclass
-from typing import List, Dict
+from torch import Tensor
+from typing import Dict
 
 from flextrain.config import get_flextrain_config
-from flextrain.optimizer import (
-    OptTarget,
-    FlexTrainCPUOptimizer
-)
+from flextrain.optimizer import FlexTrainCPUOptimizer
 from flextrain.ops.op_builder import CPUAdamBuilder
 from flextrain.utils import rank0_logger
 
 
-@dataclass
-class AdamOptTarget(OptTarget):
-    exp_avg: torch.Tensor
-    exp_avg_sq: torch.Tensor
-
-
-class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
+class FlexTrainCPUAdam(FlexTrainCPUOptimizer, torch.optim.Optimizer):
     optimizer_id = 0
 
     def __init__(
         self,
-        unit_group_map: Dict[int, Dict],
-        non_layerwise_params: List[torch.Tensor],
-        non_layerwise_param_groups: List[Dict],
         model_params,
         lr=1e-3,
         bias_correction=True,
@@ -41,7 +30,7 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
         weight_decay=0.01,
         amsgrad=False,
         adamw_mode=True,
-        fp32_optimizer_states=True
+        *args, **kwargs
     ):
         """
         Vectorized implementation of two variations of Adam optimizer on CPU.
@@ -82,12 +71,9 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
                 (default: False) NOT SUPPORTED in DeepSpeed CPUAdam!
             adamw_mode: \
                 select between Adam and AdamW implementations (default: AdamW)
-            fp32_optimizer_states: \
-                creates momentum and variance in full precision \
-                regardless of the precision of the parameters (default: True)
         """
 
-        default_args = dict(
+        self.default_args = dict(
             lr=lr,
             betas=betas,
             eps=eps,
@@ -96,15 +82,8 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
             amsgrad=amsgrad
         )
         # Initialize the optimizer
-        # model_params, default_args for torch.optim.Optimizer
-        # unit_group_map for FlexTrainCPUOptimizer
-        torch.optim.Optimizer.__init__(self, model_params, default_args)
-        FlexTrainCPUOptimizer.__init__(
-            self,
-            unit_group_map=unit_group_map,
-            non_layerwise_params=non_layerwise_params,
-            non_layerwise_param_groups=non_layerwise_param_groups
-        )
+        FlexTrainCPUOptimizer.__init__(self)
+        torch.optim.Optimizer.__init__(self, model_params, self.default_args)
 
         cpu_info = get_cpu_info()
         self.cpu_vendor = cpu_info["vendor_id_raw"].lower() \
@@ -116,7 +95,6 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
         self.opt_id = FlexTrainCPUAdam.optimizer_id
         FlexTrainCPUAdam.optimizer_id += 1
         self.adam_w_mode = adamw_mode
-        self.fp32_optimizer_states = fp32_optimizer_states
         self.cpu_adam = CPUAdamBuilder().load()
 
         self.cpu_adam.create_adam(
@@ -135,76 +113,32 @@ class FlexTrainCPUAdam(torch.optim.Optimizer, FlexTrainCPUOptimizer):
         for group in self.param_groups:
             group.setdefault('amsgrad', False)
 
-    @torch.no_grad()
-    def _step(self, step: int, args: Dict, opt_target: AdamOptTarget):
-        beta1, beta2 = args['betas']
-        self.cpu_adam.adam_update(
-            self.opt_id, step, args['lr'],
-            beta1, beta2, args['eps'],
-            args['weight_decay'], args['bias_correction'],
-            opt_target.para.data, opt_target.grad.data,
-            opt_target.exp_avg.data, opt_target.exp_avg_sq.data
+    def _set_defaults_args(self, group_args: Dict):
+        for k, v in self.default_args.items():
+            if k not in group_args:
+                group_args[k] = v
+
+    def _init_optimizer_states(self, numel: int, dtype: torch.dtype):
+        # Create exp_avg and exp_avg_sq
+        return (
+            torch.zeros(numel, dtype=dtype),
+            torch.zeros(numel, dtype=dtype)
         )
 
-    @torch.no_grad()
-    def profile_step(self, numel: int, dtype: torch.dtype):
-        if not hasattr(self, 'curr_step'):
-            self.curr_step = 0
-            self.para = torch.empty(numel, dtype=dtype, pin_memory=True)
-            self.grad = torch.empty(numel, dtype=dtype, pin_memory=True)
-            self.exp_avg = torch.zeros_like(self.para, pin_memory=True)
-            self.exp_avg_sq = torch.zeros_like(self.para, pin_memory=True)
-        self.curr_step += 1
-        self.cpu_adam.adam_update(
-            self.opt_id, self.curr_step, 1e-3, 0.9, 0.999, 1e-8, 0.01, True,
-            self.para.data, self.grad.data,
-            self.exp_avg.data, self.exp_avg_sq.data
-        )
-
-    def step(self, closure=None):
-        """Performs a single optimization step.
-
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for p, g in zip(
-            self._non_layerwise_params, self._non_layerwise_param_groups
-        ):
-            if p.grad is None:
-                continue
-            if p.numel() == 0:
-                continue
-            if p.grad.data.is_sparse:
-                raise RuntimeError(
-                    'CPUAdam does not support sparse gradients, '
-                    'please consider SparseAdam instead'
-                )
-
-            state = self.state[p]
-            # State initialization
-            if len(state) == 0:
-                assert 'step' in g, "step should be in the group"
-                # Exponential moving average of gradient values
-                state['exp_avg'] = torch.zeros_like(p.data)
-                # Exponential moving average of squared gradient values
-                state['exp_avg_sq'] = torch.zeros_like(p.data)
-
-            self._step(g['step'], g, AdamOptTarget(
-                p.data, p.grad.data,
-                state['exp_avg'].data, state['exp_avg_sq'].data
-            ))
-
-        return loss
-
-    def submit_step(
-        self, unit_index: int, para: torch.Tensor, grad: torch.Tensor,
-        exp_avg: torch.Tensor, exp_avg_sq: torch.Tensor
+    def _step(
+        self, group_args: Dict,
+        parameter: Tensor, gradient: Tensor, *optimizer_states: Tensor
     ):
-        return self._submit_step(
-            unit_index, AdamOptTarget(para, grad, exp_avg, exp_avg_sq)
+        # Ensure that the step key is present in the group arguments
+        STEP_KEY = "step"
+        assert STEP_KEY in group_args, \
+            f"Key '{STEP_KEY}' not found in parameter group arguments."
+        # Set default values for the group arguments if not present
+        self._set_defaults_args(group_args)
+        # Perform the Adam update
+        self.cpu_adam.adam_update(
+            self.opt_id, group_args["step"], group_args["lr"],
+            *group_args["betas"], group_args["eps"],
+            group_args["weight_decay"], group_args["bias_correction"],
+            parameter, gradient, *optimizer_states
         )

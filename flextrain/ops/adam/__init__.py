@@ -31,9 +31,6 @@ class FlexTrainAdam(FlexTrainOptimizer):
 
         # 2. Initialize CPU Adam optimizer.
         self.cpu_optimizer = FlexTrainCPUAdam(
-            self.unit_group_map,
-            self.non_layerwise_master_params,
-            self.non_layerwise_param_groups,
             self.param_groups,
             lr=lr,
             bias_correction=bias_correction,

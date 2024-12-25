@@ -1,7 +1,7 @@
 import gc
 import torch
 
-from collections import deque
+from collections import deque, defaultdict
 from enum import Enum
 from math import ceil
 from torch import Tensor
@@ -140,9 +140,21 @@ class ContiguousParaGroup:
 
     Args:
         paras: Iterable[Parameter]: The parameters to be managed.
+        param_grouping_mask: Iterable[int]: The mask for parameter grouping.
     """
-    def __init__(self, paras: Iterable[Parameter]):
-        self.paras = list(paras)
+    def __init__(
+        self,
+        paras: Iterable[Parameter],
+        param_grouping_mask: Iterable[int] = None
+    ):
+        # Coalesce the parameters with the potential grouping mask.
+        param_groups = defaultdict(list)
+        for mask, para in zip(param_grouping_mask, paras):
+            param_groups[mask].append(para)
+        self.paras: List[Parameter] = []
+        for group in param_groups.values():
+            self.paras.extend(group)
+
         self.numels = [para.numel() for para in self.paras]
         self.shapes = [para.shape for para in self.paras]
 
@@ -235,6 +247,9 @@ class RotateContainer:
         self._items.rotate(1)
 
 
+_ALLOCATED_DRAM_SIZE = 0
+
+
 def allocate_memory_chunks(
     numel: int,
     chunks: int | Tuple[int, ...],
@@ -254,6 +269,8 @@ def allocate_memory_chunks(
     device = torch.device(device)
     if device.type == 'cpu':
         gc.collect()
+        global _ALLOCATED_DRAM_SIZE
+        _ALLOCATED_DRAM_SIZE += total_numel * dtype.itemsize
     else:
         torch.cuda.empty_cache()
 
@@ -261,6 +278,10 @@ def allocate_memory_chunks(
         total_numel, dtype=dtype, device=device,
         pin_memory=True if device.type == 'cpu' else False
     ).reshape(*chunks, numel)
+
+
+def get_allocated_dram_size():
+    return _ALLOCATED_DRAM_SIZE
 
 
 def get_split_numels(

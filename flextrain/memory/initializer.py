@@ -1,7 +1,7 @@
 import functools
 
 from torch.nn import Parameter, Module
-from typing import List
+from typing import Callable, List
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory.coordinator import get_para_coordinator
@@ -33,9 +33,28 @@ def restore_init_context():
 
 class Init(object):
 
-    def __init__(self, layer_class: type, enabled=True):
+    def __init__(
+        self,
+        layer_class: type,
+        enabled=True,
+        param_grouping_func: Callable[[str, Parameter], int] = lambda x, y: 0
+    ):
+        """ FlexTrain Model Initializer.
+        This context manager is used to manage the memory of the model
+        by grouping the parameters into units based on the layer class.
+
+        Arguments:
+            layer_class: Layer class to be managed.
+            enabled: Enable the model initializer or not.
+            param_grouping_func: Function to group the parameters. It takes \
+                the parameter's name and the parameter itself as input, \
+                returns group index of the parameter. Given the grouping \
+                information, the efficiency of CPU optimizer can be improved. \
+                Default is grouping all parameters into group 0.
+        """
         self._enabled = enabled
         self._layer_class = layer_class
+        self._param_grouping_func = param_grouping_func
 
         # Init related configurations
         self._layer_per_unit = get_flextrain_config().checkpoint_interval
@@ -89,12 +108,20 @@ class Init(object):
 
         # Collect all the parameters in the unit
         unit_paras: List[Parameter] = []
+        param_grouping_mask: List[int] = []
         for layer in self._unit_layers:
             unit_paras.extend(list(layer.parameters()))
+            param_grouping_mask.extend(
+                map(
+                    self._param_grouping_func,
+                    *zip(*layer.named_parameters())
+                )
+            )
 
         # Manage the unit memory by the parameter coordinator
         get_para_coordinator().init_unit_parameters(
-            curr_layer, self._unit_count, unit_paras
+            curr_layer, self._unit_count, unit_paras,
+            param_grouping_mask=param_grouping_mask
         )
 
         # Update unit information

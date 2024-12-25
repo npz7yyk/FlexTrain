@@ -61,10 +61,7 @@ class FlexTrainEngine(object):
         self.para_coordinator = get_para_coordinator()
         self.interlayer_coordinator = get_interlayer_coordinator()
         self.opts_coordinator = get_opts_coordinator()
-        self.opts_coordinator.initialize(
-            self.optimizer.cpu_optimizer,
-            self.optimizer.opt_state_per_element
-        )
+        self.opts_coordinator.initialize(optimizer)
 
         # LLM training information
         self.micro_batch_per_batch = self._compute_micro_batch_per_batch()

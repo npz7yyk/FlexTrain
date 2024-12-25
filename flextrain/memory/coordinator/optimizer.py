@@ -1,18 +1,12 @@
 import torch
 
-from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from torch import Tensor
 from tqdm import tqdm
-from typing import List, Dict
 
 from flextrain.checkpointing import set_post_recomputation_function
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
-    Waitable,
     DummyHandle,
-    FunctionHandle,
     FlexTrainDataType as Dtype,
     FlexTrainDataID,
     RotateContainer,
@@ -26,79 +20,15 @@ from flextrain.memory.coordinator import (
     get_interlayer_coordinator
 )
 from flextrain.memory.nvme_swapper import NVMeGroup
+from flextrain.optimizer import (
+    StepContext,
+    FlexTrainOptimizer,
+    slice_segments,
+    merge_segments
+)
 from flextrain.scheduler import LLMTask
 from flextrain.utils import dist
 from flextrain.utils.logging import rank0_logger
-
-
-@dataclass
-class OptTarget(ABC):
-    para: Tensor
-    grad: Tensor
-
-
-STEP_KEY = "step"
-
-
-class FlexTrainCPUOptimizer(ABC):
-    FWD_INDEX = 0
-    BWD_INDEX = 1
-
-    def __init__(
-        self,
-        unit_group_map: Dict[int, Dict],
-        non_layerwise_params: List[Tensor],
-        non_layerwise_param_groups: List[Dict]
-    ):
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._unit_group_map = unit_group_map
-        self._non_layerwise_params = non_layerwise_params
-        self._non_layerwise_param_groups = non_layerwise_param_groups
-
-    @abstractmethod
-    def step(self, closure=None):
-        pass
-
-    @abstractmethod
-    def _step(self, step: int, args: Dict, opt_target: OptTarget):
-        pass
-
-    @abstractmethod
-    def profile_step(self, numel: int, dtype: torch.dtype):
-        pass
-
-    def update_state(self):
-        # Update the step count for each unit group.
-        seen_group_ids = set()
-        for group in self._non_layerwise_param_groups:
-            # Ensure that the group is not visited before.
-            if id(group) not in seen_group_ids:
-                if STEP_KEY not in group:
-                    group[STEP_KEY] = 0
-                group[STEP_KEY] += 1
-                # Mark the group as visited.
-                seen_group_ids.add(id(group))
-
-    def _submit_step(self, unit_index: int, opt_target: OptTarget):
-        assert unit_index in self._unit_group_map, (
-            "The unit index is not in the unit group map."
-        )
-
-        # Submit the step function to the executor.
-        future = self._executor.submit(
-            self._step,
-            self._unit_group_map[unit_index][STEP_KEY],
-            self._unit_group_map[unit_index],
-            opt_target
-        )
-        return FunctionHandle(future.result)
-
-    @abstractmethod
-    def submit_step(
-        self, unit_index: int, para: torch.Tensor, grad: torch.Tensor,
-        *args, **kwargs
-    ) -> Waitable:
-        pass
 
 
 def _convert_dtype_view(
@@ -168,11 +98,7 @@ class FlexTrainOptsCoordinator:
         return self._is_invalid_unit(unit_index) or \
             self._is_invalid_micro_batch(micro_batch_index)
 
-    def initialize(
-        self,
-        cpu_optimizer: FlexTrainCPUOptimizer,
-        opt_state_per_element: int
-    ):
+    def initialize(self, optimizer: FlexTrainOptimizer):
         # 0. Before initialization:
         # Ensure that the parameter coordinator is initialized.
         para = get_para_coordinator()
@@ -182,7 +108,7 @@ class FlexTrainOptsCoordinator:
         self._para = para
 
         # Link the optimizer to the coordinator.
-        self._optimizer = cpu_optimizer
+        self._optimizer = optimizer
         self._inflight_optimizer_step = DummyHandle()
 
         # Link to the same NVMe swapper as the parameter coordinator.
@@ -194,7 +120,7 @@ class FlexTrainOptsCoordinator:
         self._num_units = para.num_units
         self._unit_parameters = para._unit_parameters
         # Master parameters are also regarded as a optimizer state.
-        self._opt_state_per_element = opt_state_per_element + 1
+        self._opt_state_per_element = optimizer.opt_state_per_element + 1
 
         config = get_flextrain_config()
 
@@ -466,6 +392,26 @@ class FlexTrainOptsCoordinator:
             # End of backward parameters.
         # End of optimizer state initialization.
 
+        # 4. Create parameter group segments.
+        self._unit_fwd_segments = {}
+        self._unit_bwd_segments = {}
+        unit_slices = []
+        for _ in range(self._micro_batch_per_rank):
+            unit_slices.extend(self._mb_para_splits)
+        for unit in range(self._num_units):
+            unit_fwd_segments = []
+            unit_bwd_segments = []
+            segment_groups = slice_segments(
+                self._optimizer.unit_group_segments[unit], unit_slices
+            )
+            for i, segment_group in enumerate(segment_groups):
+                if i % 2 == 0:
+                    unit_fwd_segments.extend(segment_group)
+                else:
+                    unit_bwd_segments.extend(segment_group)
+            self._unit_fwd_segments[unit] = merge_segments(unit_fwd_segments)
+            self._unit_bwd_segments[unit] = merge_segments(unit_bwd_segments)
+
     def _initialize_alpha_split(self):
         # If the coordinator is already initialized, return.
         if self._initialized:
@@ -725,8 +671,13 @@ class FlexTrainOptsCoordinator:
         # I.e. after the torch.cuda.synchronize().
         def _submit_step():
             self._inflight_optimizer_step = self._optimizer.submit_step(
-                unit_index, optimizer_states[0],
-                gradients, *optimizer_states[1:]
+                StepContext(
+                    self._unit_fwd_segments[unit_index]
+                    if forward else self._unit_bwd_segments[unit_index],
+                    optimizer_states[0],
+                    gradients,
+                    optimizer_states[1:]
+                )
             )
         if delay:
             self._data_stream.submit(_submit_step)

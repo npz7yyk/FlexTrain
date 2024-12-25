@@ -145,6 +145,10 @@ class FlexTrainParaCoordinator:
         return self._num_units
 
     @property
+    def unit_numel(self):
+        return self._aligned_unit_numel
+
+    @property
     def unit_parameter_map(self):
         return self._unit_parameters
 
@@ -232,7 +236,8 @@ class FlexTrainParaCoordinator:
         self,
         num_layers: int,
         unit_index: int,
-        unit_paras: Iterable[Parameter]
+        unit_paras: Iterable[Parameter],
+        param_grouping_mask: List[int]
     ):
         """
         Initialize the memory for the parameters in a unit.
@@ -244,8 +249,8 @@ class FlexTrainParaCoordinator:
         Args:
             num_layers (int): Number of layers in the unit.
             unit_index (int): Index of the unit.
-            unit_parameters (List[Parameter]): \
-                List of parameters in a unit.
+            unit_parameters (List[Parameter]): List of parameters in a unit.
+            param_grouping_mask (List[int]): Mask for grouping the parameters.
 
         Returns:
             None
@@ -259,7 +264,9 @@ class FlexTrainParaCoordinator:
         # Update the number of units.
         self._num_units += 1
         # Track the unit parameters.
-        self._unit_parameters[unit_index] = ContiguousParaGroup(unit_paras)
+        self._unit_parameters[unit_index] = ContiguousParaGroup(
+            unit_paras, param_grouping_mask
+        )
 
         # Using GPU working window to prepare the parameters.
         temp_gpu_buffer = self._gpu_inflight_paras
@@ -267,7 +274,9 @@ class FlexTrainParaCoordinator:
         temp_nvme_buffer = self._nvme_inflight_paras
 
         # Move parameters into contiguous memory.
-        move_into_contiguous(unit_paras, temp_gpu_buffer)
+        move_into_contiguous(
+            self._unit_parameters[unit_index].paras, temp_gpu_buffer
+        )
 
         # Allocate parameter bases
         self._gpu_para_base.append(allocate_memory_chunks(
@@ -315,9 +324,6 @@ class FlexTrainParaCoordinator:
             FlexTrainDataID(Dtype.PARA, unit_index), temp_nvme_buffer
         )
 
-        # Detach the parameters from the memory.
-        self._detach_unit_parameters(unit_index)
-
     def log_configuration(self):
         """
         Log the parameter coordinator configurations after initialization.
@@ -339,6 +345,13 @@ class FlexTrainParaCoordinator:
             f"  - micro-batch split numels (GPU, CPU, NVMe): "
             f"{self._micro_batch_para_splits}\n"
         )
+
+    def detach_all_parameters(self):
+        """
+        Detach all the parameters.
+        """
+        for unit_index in range(self._num_units):
+            self._detach_unit_parameters(unit_index)
 
     def _async_load_nvme_paras(self, unit_index: int, forward=True):
         """
