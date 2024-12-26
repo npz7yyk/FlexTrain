@@ -846,6 +846,9 @@ class FlexTrainOptsCoordinator:
         if not self.is_initialized:
             return
 
+        # Synchronize the inflight optimizer step.
+        self._inflight_optimizer_step.wait()
+
         # Rotate the buffers.
         self._rotate_buffers()
 
