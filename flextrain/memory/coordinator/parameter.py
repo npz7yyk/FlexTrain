@@ -28,7 +28,11 @@ class FlexTrainParaCoordinator:
         # Lazy initialization of parameter coordinator.
         self._initialized = False
 
-    def _init_coordinator(self, parameters: Iterable[Parameter]):
+    def _init_coordinator(
+        self,
+        num_layers: int,
+        parameters: Iterable[Parameter]
+    ):
         # If already initialized, return.
         if self._initialized:
             return
@@ -55,16 +59,25 @@ class FlexTrainParaCoordinator:
         self._config_para_partition(parameters)
 
         # Number of layers in the model.
-        self._num_layers = 0
+        self._num_layers = num_layers
         # Number of units in the model.
-        self._num_units = 0
+        self._num_units = (num_layers - 1) // config.checkpoint_interval + 1
+        # Current unit index in model initialization.
+        self._curr_unit = 0
         # Map of unit index to its parameters.
         self._unit_parameters: Dict[int, ContiguousParaGroup] = {}
 
         # Allocate parameter base containers.
-        # list[layer][micro_batch] -> Tensor
-        self._gpu_para_base: List[List[Tensor]] = []
-        self._cpu_para_base: List[List[Tensor]] = []
+        self._gpu_para_base = allocate_memory_chunks(
+            self._micro_batch_para_splits[0],
+            (self._num_units, self._micro_batch_per_rank),
+            self._device_dtype, torch.cuda.current_device()
+        )
+        self._cpu_para_base = allocate_memory_chunks(
+            self._micro_batch_para_splits[1],
+            (self._num_units, self._micro_batch_per_rank),
+            self._device_dtype, torch.device('cpu')
+        )
         # Allocate GPU working memory for parameters.
         self._gpu_full_paras = RotateContainer(allocate_memory_chunks(
             self._aligned_unit_numel, 2,
@@ -235,7 +248,6 @@ class FlexTrainParaCoordinator:
     def init_unit_parameters(
         self,
         num_layers: int,
-        unit_index: int,
         unit_paras: Iterable[Parameter],
         param_grouping_mask: List[int]
     ):
@@ -247,8 +259,7 @@ class FlexTrainParaCoordinator:
         Each (GPU, CPU, NVMe) is corresponding to a micro-batch.
 
         Args:
-            num_layers (int): Number of layers in the unit.
-            unit_index (int): Index of the unit.
+            num_layers (int): Number of layers in the model.
             unit_parameters (List[Parameter]): List of parameters in a unit.
             param_grouping_mask (List[int]): Mask for grouping the parameters.
 
@@ -257,14 +268,10 @@ class FlexTrainParaCoordinator:
         """
 
         # Initialize memory allocation if not done.
-        self._init_coordinator(unit_paras)
+        self._init_coordinator(num_layers, unit_paras)
 
-        # Update the number of layers.
-        self._num_layers += num_layers
-        # Update the number of units.
-        self._num_units += 1
         # Track the unit parameters.
-        self._unit_parameters[unit_index] = ContiguousParaGroup(
+        self._unit_parameters[self._curr_unit] = ContiguousParaGroup(
             unit_paras, param_grouping_mask
         )
 
@@ -275,18 +282,8 @@ class FlexTrainParaCoordinator:
 
         # Move parameters into contiguous memory.
         move_into_contiguous(
-            self._unit_parameters[unit_index].paras, temp_gpu_buffer
+            self._unit_parameters[self._curr_unit].paras, temp_gpu_buffer
         )
-
-        # Allocate parameter bases
-        self._gpu_para_base.append(allocate_memory_chunks(
-            self._micro_batch_para_splits[0], self._micro_batch_per_rank,
-            self._device_dtype, torch.cuda.current_device()
-        ))
-        self._cpu_para_base.append(allocate_memory_chunks(
-            self._micro_batch_para_splits[1], self._micro_batch_per_rank,
-            self._device_dtype, torch.device('cpu')
-        ))
 
         # Partition parameters.
         micro_batch_partitioned_paras = torch.chunk(
@@ -310,8 +307,8 @@ class FlexTrainParaCoordinator:
                 tar_mem, self._micro_batch_para_splits
             )
             # Store the views.
-            self._gpu_para_base[unit_index][mb].copy_(gpu_view)
-            self._cpu_para_base[unit_index][mb].copy_(cpu_view)
+            self._gpu_para_base[self._curr_unit][mb].copy_(gpu_view)
+            self._cpu_para_base[self._curr_unit][mb].copy_(cpu_view)
             # Split the NVMe view.
             nvme_forward_view, nvme_backward_view = torch.split(
                 nvme_view, self._micro_batch_nvme_alpha_splits
@@ -321,8 +318,11 @@ class FlexTrainParaCoordinator:
 
         # Offload the NVMe parameters.
         self._nvme_group.group_offload(
-            FlexTrainDataID(Dtype.PARA, unit_index), temp_nvme_buffer
+            FlexTrainDataID(Dtype.PARA, self._curr_unit), temp_nvme_buffer
         )
+
+        # Update the current unit index.
+        self._curr_unit += 1
 
     def log_configuration(self):
         """

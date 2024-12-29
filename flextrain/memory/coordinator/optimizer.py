@@ -234,10 +234,6 @@ class FlexTrainOptsCoordinator:
                 device=torch.cuda.current_device()
             )
 
-        # Return if running in auto-config mode
-        if get_flextrain_config().auto_config:
-            return
-
         # Used for receiving gradients / working with optimizer.
         self._cpu_opt_grad_buffers = RotateContainer(
             allocate_memory_chunks(
@@ -249,7 +245,7 @@ class FlexTrainOptsCoordinator:
         self._cpu_opt_work_buffers = RotateContainer(
             allocate_memory_chunks(
                 max_numel * self._opt_state_per_element,
-                3, master_dtype, torch.device('cpu')
+                3, master_dtype, torch.device('cpu'), pin_memory=False
             )
         )
 
@@ -257,19 +253,23 @@ class FlexTrainOptsCoordinator:
         self._nvme_para_buffers = RotateContainer(
             allocate_memory_chunks(
                 self._mb_bwd_para_splits[2] * self._micro_batch_per_rank,
-                2, device_dtype, torch.device('cpu')
+                2, device_dtype, torch.device('cpu'), pin_memory=False
             )
         )
         self._para_nvme_group = para._nvme_group
 
+        # Return if running in auto-config mode
+        if get_flextrain_config().auto_config:
+            return
+
         # CPU optimizer base.
         self._cpu_opt_fwd_base = allocate_memory_chunks(
             self._unit_fwd_opt_splits[0], self._num_units,
-            master_dtype, torch.device('cpu')
+            master_dtype, torch.device('cpu'), pin_memory=False
         ).zero_()
         self._cpu_opt_bwd_base = allocate_memory_chunks(
             self._unit_bwd_opt_splits[0], self._num_units,
-            master_dtype, torch.device('cpu')
+            master_dtype, torch.device('cpu'), pin_memory=False
         ).zero_()
         # End of memory allocation.
 

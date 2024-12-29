@@ -36,6 +36,7 @@ class Init(object):
     def __init__(
         self,
         layer_class: type,
+        num_layers: int,
         enabled=True,
         param_grouping_func: Callable[[str, Parameter], int] = lambda x, y: 0
     ):
@@ -45,6 +46,7 @@ class Init(object):
 
         Arguments:
             layer_class: Layer class to be managed.
+            num_layers: Number of layers in the model.
             enabled: Enable the model initializer or not.
             param_grouping_func: Function to group the parameters. It takes \
                 the parameter's name and the parameter itself as input, \
@@ -54,6 +56,7 @@ class Init(object):
         """
         self._enabled = enabled
         self._layer_class = layer_class
+        self._num_layers = num_layers
         self._param_grouping_func = param_grouping_func
 
         # Init related configurations
@@ -61,7 +64,6 @@ class Init(object):
 
         # Track units
         self._unit_layers: List[Module] = []
-        self._unit_count = 0
 
         # To avoid re-entrance
         self._exited = False
@@ -120,13 +122,12 @@ class Init(object):
 
         # Manage the unit memory by the parameter coordinator
         get_para_coordinator().init_unit_parameters(
-            curr_layer, self._unit_count, unit_paras,
+            self._num_layers, unit_paras,
             param_grouping_mask=param_grouping_mask
         )
 
         # Update unit information
         self._unit_layers = []
-        self._unit_count += 1
 
     def _override_layer_init(self):
         # Save the original layer init function

@@ -254,7 +254,8 @@ def allocate_memory_chunks(
     numel: int,
     chunks: int | Tuple[int, ...],
     dtype: torch.dtype,
-    device: torch.device
+    device: torch.device,
+    pin_memory: bool = True
 ):
     # Wrap the chunks into a tuple.
     if isinstance(chunks, int):
@@ -274,10 +275,12 @@ def allocate_memory_chunks(
     else:
         torch.cuda.empty_cache()
 
+    # Determine whether to pin CPU memory.
+    pin_memory = (device.type == 'cpu') and total_numel > 0 and pin_memory
+
     return torch.empty(
-        total_numel, dtype=dtype, device=device,
-        pin_memory=True if device.type == 'cpu' else False
-    ).reshape(*chunks, numel)
+        *chunks, numel, dtype=dtype, device=device, pin_memory=pin_memory
+    )
 
 
 def get_allocated_dram_size():

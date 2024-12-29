@@ -389,12 +389,12 @@ class FlexTrainEngine(object):
         self.para_coordinator.clear_backward_pipeline()
         self.opts_coordinator.clear_backward_pipeline()
 
-        # 3. Enter auto-configuration if needed
+        # 3. Conduct optimizer step (for GPU parameters)
+        self.optimizer.step()
+
+        # 4. Enter auto-configuration if needed
         if get_flextrain_config().auto_config:
             system_auto_config()
-
-        # 4. Conduct optimizer step (for GPU parameters)
-        self.optimizer.step()
 
         # 5. Conduct the loss scaling update
         loss_rsts = []
