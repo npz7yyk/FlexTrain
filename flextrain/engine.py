@@ -258,6 +258,17 @@ class FlexTrainEngine(object):
     def _conduct_backward(self, task: LLMTask):
         scheduler = self.scheduler
 
+        import time
+        curr_time = time.time()
+        if hasattr(self, '_test_time'):
+            delta_time = (curr_time - self._test_time) * 1000
+            dist.print_rank0(f"Task {self._last_task} time: {delta_time:.3f} ms")
+        self._test_time = curr_time
+        self._last_task = task
+
+        if scheduler.new_unit_entered:
+            dist.print_rank0()
+
         # Link parameters to memory (prefetch NVMe parameters if needed)
         if scheduler.new_unit_entered:
             # Wait for all in-flight async IO operations.

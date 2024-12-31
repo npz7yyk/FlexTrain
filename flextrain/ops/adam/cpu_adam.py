@@ -12,17 +12,16 @@ from torch import Tensor
 from typing import Dict
 
 from flextrain.config import get_flextrain_config
-from flextrain.optimizer import FlexTrainCPUOptimizer
+from flextrain.optimizer import FlexTrainCPUOptimizer, STEP_KEY
 from flextrain.ops.op_builder import CPUAdamBuilder
 from flextrain.utils import rank0_logger
 
 
-class FlexTrainCPUAdam(FlexTrainCPUOptimizer, torch.optim.Optimizer):
+class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
     optimizer_id = 0
 
     def __init__(
         self,
-        model_params,
         lr=1e-3,
         bias_correction=True,
         betas=(0.9, 0.999),
@@ -83,7 +82,6 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer, torch.optim.Optimizer):
         )
         # Initialize the optimizer
         FlexTrainCPUOptimizer.__init__(self)
-        torch.optim.Optimizer.__init__(self, model_params, self.default_args)
 
         cpu_info = get_cpu_info()
         self.cpu_vendor = cpu_info["vendor_id_raw"].lower() \
@@ -130,7 +128,6 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer, torch.optim.Optimizer):
         parameter: Tensor, gradient: Tensor, *optimizer_states: Tensor
     ):
         # Ensure that the step key is present in the group arguments
-        STEP_KEY = "step"
         assert STEP_KEY in group_args, \
             f"Key '{STEP_KEY}' not found in parameter group arguments."
         # Set default values for the group arguments if not present

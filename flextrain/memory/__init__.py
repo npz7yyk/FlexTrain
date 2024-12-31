@@ -6,7 +6,10 @@ from enum import Enum
 from math import ceil
 from torch import Tensor
 from torch.nn import Parameter
-from typing import SupportsIndex, Iterable, Callable, Tuple, List
+from typing import (
+    TypeVar, Generic,
+    SupportsIndex, Iterable, Callable, Tuple, List
+)
 
 from flextrain.config import get_flextrain_config
 from flextrain.utils.distributed import get_rank
@@ -236,11 +239,14 @@ class FusedHandle(Waitable):
             handle.wait()
 
 
-class RotateContainer:
+T = TypeVar('T')
+
+
+class RotateContainer(Generic[T]):
     def __init__(self, items: Tuple):
         self._items = deque(items)
 
-    def __getitem__(self, index: SupportsIndex):
+    def __getitem__(self, index: SupportsIndex) -> T:
         return self._items[index]
 
     def rotate(self):
@@ -248,6 +254,29 @@ class RotateContainer:
 
 
 _ALLOCATED_DRAM_SIZE = 0
+
+
+def allocate_memory(
+    numel: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    pin_memory: bool = True
+):
+    # Try to free the memory before allocation.
+    device = torch.device(device)
+    if device.type == 'cpu':
+        gc.collect()
+        global _ALLOCATED_DRAM_SIZE
+        _ALLOCATED_DRAM_SIZE += numel * dtype.itemsize
+    else:
+        torch.cuda.empty_cache()
+
+    # Determine whether to pin CPU memory.
+    pin_memory = (device.type == 'cpu') and numel > 0 and pin_memory
+
+    return torch.empty(
+        numel, dtype=dtype, device=device, pin_memory=pin_memory
+    )
 
 
 def allocate_memory_chunks(
@@ -266,21 +295,9 @@ def allocate_memory_chunks(
     for dim in chunks:
         total_numel *= dim
 
-    # Try to free the memory before allocation.
-    device = torch.device(device)
-    if device.type == 'cpu':
-        gc.collect()
-        global _ALLOCATED_DRAM_SIZE
-        _ALLOCATED_DRAM_SIZE += total_numel * dtype.itemsize
-    else:
-        torch.cuda.empty_cache()
-
-    # Determine whether to pin CPU memory.
-    pin_memory = (device.type == 'cpu') and total_numel > 0 and pin_memory
-
-    return torch.empty(
-        *chunks, numel, dtype=dtype, device=device, pin_memory=pin_memory
-    )
+    # Allocate memory.
+    memory = allocate_memory(total_numel, dtype, device, pin_memory)
+    return memory.view(*chunks, numel)
 
 
 def get_allocated_dram_size():
