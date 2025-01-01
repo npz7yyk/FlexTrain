@@ -3,7 +3,6 @@ import torch
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from torch import Tensor
 from typing import Iterator, Tuple, List, Dict
@@ -13,8 +12,7 @@ from flextrain.memory import (
     FunctionHandle,
     RotateContainer,
     move_into_contiguous,
-    allocate_memory,
-    allocate_memory_chunks
+    allocate_memory
 )
 from flextrain.memory.coordinator import get_para_coordinator
 from flextrain.utils import dist
@@ -160,8 +158,7 @@ class StepContext:
 class FlexTrainCPUOptimizer(ABC):
 
     def __init__(self):
-        self._ctx_opts_map: Dict[StepContext, List[Tensor]] = {}
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        pass
 
     @abstractmethod
     def _init_optimizer_states(
@@ -177,11 +174,7 @@ class FlexTrainCPUOptimizer(ABC):
         pass
 
     @torch.no_grad()
-    def step(
-        self,
-        step_contexts: StepContext | List[StepContext],
-        async_op: bool = False
-    ) -> FunctionHandle | None:
+    def step(self, step_contexts: StepContext | List[StepContext]):
         """ Performs a single optimization step.
 
         Arguments:
@@ -190,69 +183,32 @@ class FlexTrainCPUOptimizer(ABC):
                 gradients, and optimizer states, or a list of such objects. \
                 If the context is provided without optimizer states, \
                 the states will be initialized for each context instance.
-            async_op (bool, optional): \
-                Whether to perform the optimization step asynchronously.
-
-        Returns:
-            FunctionHandle | None: \
-                A handle to the optimization step function \
-                if the operation is asynchronous. Otherwise, returns None.
         """
 
         # Wrap the step contexts in a list if not already a list.
         if isinstance(step_contexts, StepContext):
             step_contexts = [step_contexts]
 
-        step_funcs = []
         for step_context in step_contexts:
             # Skip empty parameter segments.
             if not step_context.parameter.numel():
                 continue
 
-            # If optimizer states are not provided,
-            # check whether the optimizer states need to be initialized.
-            if not step_context.optimizer_states and \
-                    id(step_context) not in self._ctx_opts_map:
-                self._ctx_opts_map[id(step_context)] = \
-                    self._init_optimizer_states(
-                        step_context.parameter.numel(),
-                        step_context.parameter.dtype
-                    )
-
             # Get all the data needed for the optimization step.
             parameter = step_context.parameter
             gradient = step_context.gradient
-            optimizer_states = self._ctx_opts_map[id(step_context)] \
-                if not step_context.optimizer_states \
-                else step_context.optimizer_states
+            optimizer_states = step_context.optimizer_states
 
-            # Conduct the optimization step for each group segment.
-            def step_func_producer(cur_context: StepContext):
-                def step_func():
-                    for segment in cur_context.group_segments:
-                        group_args = segment.group
-                        start, end = segment.start, segment.end
-                        self._step(
-                            group_args,
-                            parameter.data[start:end],
-                            gradient.data[start:end],
-                            *[state[start:end] for state in optimizer_states]
-                        )
-                return step_func
-            step_funcs.append(step_func_producer(step_context))
-
-        def execute_step_funcs():
-            for step_func in step_funcs:
-                step_func()
-
-        # If not an asynchronous operation, execute the step function.
-        if async_op:
-            return FunctionHandle(
-                self._executor.submit(execute_step_funcs).result
-            )
-        # Otherwise, execute the step function synchronously.
-        else:
-            execute_step_funcs()
+            # Conduct the optimization step for each segment.
+            for segment in step_context.group_segments:
+                group_args = segment.group
+                start, end = segment.start, segment.end
+                self._step(
+                    group_args,
+                    parameter.data[start:end],
+                    gradient.data[start:end],
+                    *[state[start:end] for state in optimizer_states]
+                )
 
     @torch.no_grad()
     def profile_step(self, numel: int, dtype: torch.dtype):
@@ -268,13 +224,39 @@ class FlexTrainCPUOptimizer(ABC):
         self._step(self._param_group, para, grad, *self._optimizer_states)
 
 
-class Connection:
+class SharedGradBuffer:
+    """ Shared buffer for gradients. """
 
-    def send(self, obj):
-        pass
+    def __init__(
+        self,
+        master_dtype: torch.dtype,
+        unit_fwd_numels: Tuple[int, int],
+        unit_bwd_numels: Tuple[int, int]
+    ):
+        # Structure:
+        # [CPU grad, NVMe grad]
+        self._fwd_splits = unit_fwd_numels
+        self._bwd_splits = unit_bwd_numels
 
-    def recv(self) -> object:
-        pass
+        # Allocate memory for the shared buffer.
+        max_numel = max(sum(self._fwd_splits), sum(self._bwd_splits))
+        self._buffer = allocate_memory(
+            max_numel, master_dtype, torch.device('cpu')
+        ).share_memory_()
+
+    def get_cpu_gradient(self, forward: bool) -> Tensor:
+        """ Get the CPU gradient for the unit. """
+        splits = self._fwd_splits if forward else self._bwd_splits
+        return self._buffer[:splits[0]]
+
+    def get_nvme_gradient(self, forward: bool) -> Tensor:
+        """ Get the NVMe gradient for the unit. """
+        splits = self._fwd_splits if forward else self._bwd_splits
+        return self._buffer[splits[0]:sum(splits)]
+
+    @property
+    def data(self) -> Tensor:
+        return self._buffer
 
 
 # TEMPORARY: use opt_state_per_element to allocate memory for optimizer states.
@@ -294,9 +276,9 @@ class SharedStepBuffer:
         # Structure:
         # [CPU para, NVMe para, NVMe opts1, NVMe opts2, ...]
         self._fwd_splits = [unit_fwd_numels[0]] + \
-            [unit_fwd_numels[1]] * self._opt_state_per_element
+            [unit_fwd_numels[1]] * (opt_state_per_element + 1)
         self._bwd_splits = [unit_bwd_numels[0]] + \
-            [unit_bwd_numels[1]] * self._opt_state_per_element
+            [unit_bwd_numels[1]] * (opt_state_per_element + 1)
 
         # Allocate memory for the shared buffer.
         max_numel = max(
@@ -307,39 +289,55 @@ class SharedStepBuffer:
             torch.device('cpu'), pin_memory=False
         ).share_memory_()
 
-    def get_master_parameters(self, forward: bool) -> Tensor:
+    def zero_(self):
+        self._buffer.zero_()
+
+    def get_master_parameter(self, forward: bool) -> Tensor:
         """ Get the master parameters for the unit. """
         splits = self._fwd_splits if forward else self._bwd_splits
         return self._buffer[:splits[0] + splits[1]]
 
-    def get_cpu_master_parameters(self, forward: bool) -> Tensor:
+    def get_cpu_master_parameter(self, forward: bool) -> Tensor:
         """ Get the CPU master parameters for the unit. """
         splits = self._fwd_splits if forward else self._bwd_splits
         return self._buffer[:splits[0]]
 
-    def get_nvme_master_parameters(self, forward: bool) -> Tensor:
+    def get_nvme_master_parameter(self, forward: bool) -> Tensor:
         """ Get the NVMe master parameters for the unit. """
         splits = self._fwd_splits if forward else self._bwd_splits
         return self._buffer[splits[0]:splits[0] + splits[1]]
 
-    def get_nvme_optimizer_states(self, forward: bool) -> Tensor:
+    def get_nvme_optimizer_states(self, forward: bool) -> List[Tensor]:
         """ Get the NVMe optimizer states for the unit. """
+        splits = self._fwd_splits if forward else self._bwd_splits
+        start = splits[0] + splits[1]
+        end = sum(splits)
+        return self._buffer[start:end].chunk(self._opt_state_per_element)
+
+    def get_nvme_buffer(self, forward: bool) -> Tensor:
+        """ Get the NVMe buffer for the unit. """
         splits = self._fwd_splits if forward else self._bwd_splits
         start = splits[0]
         end = sum(splits)
-        return self._buffer[start:end].chunk(self._opt_state_per_element)[1:]
+        return self._buffer[start:end]
+
+
+class Connection:
+
+    def send(self, obj):
+        pass
+
+    def recv(self) -> object:
+        pass
 
 
 def step_worker_func(
     pipe: Connection,
     optimizer_class: FlexTrainCPUOptimizer,
     optimizer_args: Dict,
-    master_dtype: torch.dtype,
-    num_units: int,
-    unit_fwd_numels: Tuple[int, int],
-    unit_bwd_numels: Tuple[int, int],
-    shared_grad_buffers: RotateContainer[Tensor],
-    shared_step_buffers: RotateContainer[SharedStepBuffer]
+    shared_grad_buffers: RotateContainer[SharedGradBuffer],
+    shared_step_buffers: RotateContainer[SharedStepBuffer],
+    shared_optimizer_states: Tuple[Tensor, Tensor]
 ):
     # Initialize the CPU optimizer.
     optimizer: FlexTrainCPUOptimizer = optimizer_class(**optimizer_args)
@@ -348,49 +346,46 @@ def step_worker_func(
     used_memory = psutil.Process().memory_info().rss
     pipe.send(used_memory)
 
-    # TEMPORARY: assume all optimizer states have the same dtype.
-    # May support different dtypes in the future.
-    opt_state_per_element = sum([
-        s.numel() for s in optimizer._init_optimizer_states(
-            1, get_flextrain_config().mixed_precision.master_dtype
-        )
-    ])
-    fwd_cpu_numel, _ = unit_fwd_numels
-    bwd_cpu_numel, _ = unit_bwd_numels
-    # Allocate memory for the optimizer states.
-    fwd_cpu_opts = allocate_memory_chunks(
-        fwd_cpu_numel, (num_units, opt_state_per_element),
-        master_dtype, torch.device("cpu"), pin_memory=False
-    )
-    bwd_cpu_opts = allocate_memory_chunks(
-        bwd_cpu_numel, (num_units, opt_state_per_element),
-        master_dtype, torch.device("cpu"), pin_memory=False
-    )
+    # Unpack the shared optimizer states.
+    fwd_cpu_opts, bwd_cpu_opts = shared_optimizer_states
 
     # Buffer indices for shared buffers.
     INFLIGHT_BUFFER = 1
 
     # Wait for the parent process to send the step command.
     while True:
-        cmd, *args = pipe.recv()
+        cmd = pipe.recv()
+        if isinstance(cmd, tuple):
+            cmd, *args = cmd
+
+        # Rotate the shared buffers only.
+        if cmd == "ROTATE":
+            # Rotate the shared buffers.
+            shared_grad_buffers.rotate()
+            shared_step_buffers.rotate()
+
+            # Send an acknowledgment to the parent process.
+            pipe.send("ROTATE_COMPLETED")
 
         # Conduct the optimization step.
-        if cmd == "STEP":
+        elif cmd == "STEP":
+            # Rotate the shared buffers.
+            shared_grad_buffers.rotate()
+            shared_step_buffers.rotate()
+
             # Unpack the arguments.
             forward, unit_index, cpu_segments, nvme_segments = args
-            cpu_numel, nvme_numel = unit_fwd_numels \
-                if forward else unit_bwd_numels
 
             # Locate CPU data for optimization.
             grad_buffer = shared_grad_buffers[INFLIGHT_BUFFER]
             step_buffer = shared_step_buffers[INFLIGHT_BUFFER]
 
-            cpu_parameter = step_buffer.get_cpu_master_parameters(forward)
-            cpu_gradient = grad_buffer[:cpu_numel]
-            cpu_optimizer_states = (
+            cpu_parameter = step_buffer.get_cpu_master_parameter(forward)
+            cpu_gradient = grad_buffer.get_cpu_gradient(forward)
+            cpu_optimizer_states = list(
                 fwd_cpu_opts[unit_index]
                 if forward else bwd_cpu_opts[unit_index]
-            ).chunk(opt_state_per_element)
+            )
 
             # Build CPU step context.
             cpu_step_context = StepContext(
@@ -401,8 +396,8 @@ def step_worker_func(
             )
 
             # Locate NVMe data for optimization.
-            nvme_parameter = step_buffer.get_nvme_master_parameters(forward)
-            nvme_gradient = grad_buffer[cpu_numel:cpu_numel + nvme_numel]
+            nvme_parameter = step_buffer.get_nvme_master_parameter(forward)
+            nvme_gradient = grad_buffer.get_nvme_gradient(forward)
             nvme_optimizer_states = \
                 step_buffer.get_nvme_optimizer_states(forward)
 
@@ -416,7 +411,6 @@ def step_worker_func(
 
             # Conduct the optimization step.
             optimizer.step([cpu_step_context, nvme_step_context])
-            print(f"[StepWorker] Step {unit_index} completed.")
 
             # Send an acknowledgment to the parent process.
             pipe.send(f"STEP_UNIT_{unit_index}_COMPLETED")
@@ -559,7 +553,9 @@ class FlexTrainOptimizer:
             ),
             parameter=self._master_para,
             gradient=self._master_grad,
-            optimizer_states=[]
+            optimizer_states=self.cpu_optimizer._init_optimizer_states(
+                total_numel, master_dtype
+            )
         )
 
         # Detach all parameters from the coordinator.
@@ -592,11 +588,9 @@ class FlexTrainOptimizer:
 
     def init_step_worker(
         self,
-        num_units: int,
-        unit_fwd_numels: Tuple[int, int],
-        unit_bwd_numels: Tuple[int, int],
         shared_grad_buffers: RotateContainer,
-        shared_step_buffers: RotateContainer
+        shared_step_buffers: RotateContainer,
+        shared_optimizer_states: Tuple[Tensor, Tensor]
     ):
         # Initialize the step worker.
         self.parent_conn, child_conn = torch.multiprocessing.Pipe()
@@ -606,12 +600,9 @@ class FlexTrainOptimizer:
                 child_conn,
                 self.cpu_optimizer_class,
                 self.cpu_optimizer_args,
-                get_flextrain_config().mixed_precision.master_dtype,
-                num_units,
-                unit_fwd_numels,
-                unit_bwd_numels,
                 shared_grad_buffers,
-                shared_step_buffers
+                shared_step_buffers,
+                shared_optimizer_states
             )
         )
         self.step_worker.daemon = True
@@ -619,6 +610,14 @@ class FlexTrainOptimizer:
 
         # Get the baseline memory usage of the worker.
         self.baseline_memory = self.parent_conn.recv()
+
+    def submit_rotate(self):
+        # Submit a command to rotate the shared buffers.
+        self.parent_conn.send("ROTATE")
+
+        # Wait for the completion of the rotation.
+        msg = self.parent_conn.recv()
+        assert msg == "ROTATE_COMPLETED"
 
     def submit_step(
         self,
