@@ -188,7 +188,6 @@ class FlexTrainOptsCoordinator:
         # Configuration for mixed precision.
         device_dtype = config.mixed_precision.device_dtype
         gradacc_dtype = config.mixed_precision.gradacc_dtype
-        master_dtype = config.mixed_precision.master_dtype
         self._gradacc_dtype_incompatible = device_dtype != gradacc_dtype
 
         # Configuration for optimizer partition.
@@ -242,9 +241,40 @@ class FlexTrainOptsCoordinator:
             self._unit_bwd_numel,
             opts_cpu_nvme_ratio, num_levels=2
         )
+
+        # 2. Create parameter group segments.
+        self._unit_fwd_segments = {}
+        self._unit_bwd_segments = {}
+        unit_slices = []
+        for _ in range(self._micro_batch_per_rank):
+            unit_slices.extend(self._mb_para_splits)
+        for unit in range(self._num_units):
+            unit_fwd_segments = []
+            unit_bwd_segments = []
+            segment_groups = slice_segments(
+                self._optimizer.unit_group_segments[unit], unit_slices
+            )
+            for i, segment_group in enumerate(segment_groups):
+                if i % 2 == 0:
+                    unit_fwd_segments.extend(segment_group)
+                else:
+                    unit_bwd_segments.extend(segment_group)
+            fwd_segment_groups = slice_segments(
+                unit_fwd_segments, self._unit_fwd_opt_splits
+            )
+            self._unit_fwd_segments[unit] = [
+                merge_segments(segments) for segments in fwd_segment_groups
+            ]
+            bwd_segment_groups = slice_segments(
+                unit_bwd_segments, self._unit_bwd_opt_splits
+            )
+            self._unit_bwd_segments[unit] = [
+                merge_segments(segments) for segments in bwd_segment_groups
+            ]
+
         # End of configuration.
 
-        # 2. Allocate memory for the optimizer.
+        # 3. Allocate memory for the optimizer.
         # Used for accumulating / transferring backward gradients.
         self._gpu_bwd_grad_buffers = RotateContainer(
             allocate_memory_chunks(
@@ -290,13 +320,9 @@ class FlexTrainOptsCoordinator:
             shared_optimizer_states=self._shared_cpu_opts
         )
 
-        # Return if running in auto-config mode.
-        if get_flextrain_config().auto_config:
-            return
-
         # End of memory allocation.
 
-        # 3. Initialize master parameters from device parameters.
+        # 4. Initialize master parameters from device parameters.
         gpu_base = para._gpu_para_base
         cpu_base = para._cpu_para_base
         nvme_mem = para._nvme_available_paras
@@ -305,7 +331,7 @@ class FlexTrainOptsCoordinator:
         )
         nvme_fwd_base = torch.chunk(nvme_fwd_mem, self._micro_batch_per_rank)
         nvme_bwd_base = torch.chunk(nvme_bwd_mem, self._micro_batch_per_rank)
-        temp_cpu_buffer = self._cpu_step_receive_buffer
+        temp_buffer = self._cpu_step_receive_buffer
 
         dist.barrier()
         units = tqdm(
@@ -318,10 +344,10 @@ class FlexTrainOptsCoordinator:
                 nvme_mem, async_op=False
             )
 
-            # 3. Create the forward optimizer states.
+            # 2. Create the forward optimizer states.
             # 2.1 Locate the target memory.
-            temp_cpu_buffer.zero_()
-            fwd_tar_mem = temp_cpu_buffer.get_master_parameter(forward=True)
+            temp_buffer.zero_()
+            fwd_tar_mem = temp_buffer.get_master_parameter(forward=True)
             fwd_tars = torch.chunk(fwd_tar_mem, self._micro_batch_per_rank)
 
             # 2.2 Locate the source memory and copy the parameters.
@@ -350,8 +376,8 @@ class FlexTrainOptsCoordinator:
 
             # 2.3 Store the forward optimizer states.
             # Locate the source memory.
-            cpu_fwd_src = temp_cpu_buffer.get_cpu_master_parameter(forward=True)
-            nvme_fwd_src = temp_cpu_buffer.get_nvme_buffer(forward=True)
+            cpu_fwd_src = temp_buffer.get_cpu_master_parameter(forward=True)
+            nvme_fwd_src = temp_buffer.get_nvme_buffer(forward=True)
 
             # Locate the target memory.
             cpu_fwd_tar = self._fwd_cpu_paras[unit]
@@ -366,8 +392,8 @@ class FlexTrainOptsCoordinator:
 
             # 3. Create the backward optimizer states.
             # 3.1 Locate the target memory.
-            temp_cpu_buffer.zero_()
-            bwd_tar_mem = temp_cpu_buffer.get_master_parameter(forward=False)
+            temp_buffer.zero_()
+            bwd_tar_mem = temp_buffer.get_master_parameter(forward=False)
             bwd_tars = torch.chunk(bwd_tar_mem, self._micro_batch_per_rank)
 
             # 3.2 Locate the source memory and copy the parameters.
@@ -396,8 +422,8 @@ class FlexTrainOptsCoordinator:
 
             # 3.3 Store the backward optimizer states.
             # Locate the source memory.
-            cpu_bwd_src = temp_cpu_buffer.get_cpu_master_parameter(forward=False)
-            nvme_bwd_src = temp_cpu_buffer.get_nvme_buffer(forward=False)
+            cpu_bwd_src = temp_buffer.get_cpu_master_parameter(forward=False)
+            nvme_bwd_src = temp_buffer.get_nvme_buffer(forward=False)
 
             # Locate the target memory.
             cpu_bwd_tar = self._bwd_cpu_paras[unit]
@@ -410,36 +436,6 @@ class FlexTrainOptsCoordinator:
             )
             # End of backward parameters.
         # End of optimizer state initialization.
-
-        # 4. Create parameter group segments.
-        self._unit_fwd_segments = {}
-        self._unit_bwd_segments = {}
-        unit_slices = []
-        for _ in range(self._micro_batch_per_rank):
-            unit_slices.extend(self._mb_para_splits)
-        for unit in range(self._num_units):
-            unit_fwd_segments = []
-            unit_bwd_segments = []
-            segment_groups = slice_segments(
-                self._optimizer.unit_group_segments[unit], unit_slices
-            )
-            for i, segment_group in enumerate(segment_groups):
-                if i % 2 == 0:
-                    unit_fwd_segments.extend(segment_group)
-                else:
-                    unit_bwd_segments.extend(segment_group)
-            fwd_segment_groups = slice_segments(
-                unit_fwd_segments, self._unit_fwd_opt_splits
-            )
-            self._unit_fwd_segments[unit] = [
-                merge_segments(segments) for segments in fwd_segment_groups
-            ]
-            bwd_segment_groups = slice_segments(
-                unit_bwd_segments, self._unit_bwd_opt_splits
-            )
-            self._unit_bwd_segments[unit] = [
-                merge_segments(segments) for segments in bwd_segment_groups
-            ]
 
     def _initialize_alpha_split(self):
         # If the coordinator is already initialized, return.
@@ -780,10 +776,6 @@ class FlexTrainOptsCoordinator:
 
     def pre_micro_batch_forward(self, curr_task: LLMTask):
         """ Submit tasks for the given micro-batch in forward pass. """
-        # If running in auto-config mode, return.
-        if get_flextrain_config().auto_config:
-            return
-
         # For the first iteration, the optimizer is not ready.
         if not self.is_initialized:
             return
@@ -804,10 +796,6 @@ class FlexTrainOptsCoordinator:
 
     def pre_micro_batch_backward(self, curr_task: LLMTask):
         """ Submit tasks for the given micro-batch in backward pass. """
-        # If running in auto-config mode, return.
-        if get_flextrain_config().auto_config:
-            return
-
         # Zero the extra buffer if necessary.
         if self._gradacc_dtype_incompatible:
             torch.zero_(self._gpu_bwd_extra_grads)
@@ -832,10 +820,6 @@ class FlexTrainOptsCoordinator:
 
     def post_micro_batch_backward(self, curr_task: LLMTask):
         """ Conduct post-processing after the backward of the micro-batch. """
-        # If running in auto-config mode, return.
-        if get_flextrain_config().auto_config:
-            return
-
         # If the gradients are not compatible with the device dtype,
         # we need explicitly accumulate the gradients.
         if self._gradacc_dtype_incompatible:
@@ -843,10 +827,6 @@ class FlexTrainOptsCoordinator:
             gradacc_buffer += self._gpu_bwd_extra_grads
 
     def pre_unit_forward(self, unit_index: int):
-        # If running in auto-config mode, return.
-        if get_flextrain_config().auto_config:
-            return
-
         # If the optimizer is not initialized, return.
         if not self.is_initialized:
             return
@@ -873,12 +853,6 @@ class FlexTrainOptsCoordinator:
         Returns:
             None
         """
-        # Return if running in auto-config mode
-        if get_flextrain_config().auto_config:
-            # Just ensure gradients are pre-allocated.
-            self._prepare_unit_grads(unit_index)
-            return
-
         # Synchrnoize the inflight optimizer step.
         self._inflight_optimizer_step.wait()
 
@@ -894,10 +868,6 @@ class FlexTrainOptsCoordinator:
         self._prepare_unit_grads(unit_index)
 
     def warmup_forward_pipeline(self):
-        # If running in auto-config mode, return.
-        if get_flextrain_config().auto_config:
-            return
-
         # If the optimizer is not initialized, return.
         if not self.is_initialized:
             return
@@ -928,10 +898,6 @@ class FlexTrainOptsCoordinator:
             self._submit_update_para(1, mb, forward=True)()
 
     def warmup_backward_pipeline(self):
-        # If running in auto-config mode, return.
-        if get_flextrain_config().auto_config:
-            return
-
         # Complete the initialization.
         self._initialize_alpha_split()
         # Inform the parameter coordinator that future updates are coming.
@@ -941,10 +907,6 @@ class FlexTrainOptsCoordinator:
         """
         Cleanup the backward pipeline.
         """
-        # If running in auto-config mode, return.
-        if get_flextrain_config().auto_config:
-            return
-
         # Synchronize the inflight tasks.
         self._nvme_swapper.synchronize()
         self._data_stream.synchronize()

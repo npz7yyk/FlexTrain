@@ -7,14 +7,11 @@
 
 import torch
 
-from cpuinfo import get_cpu_info
 from torch import Tensor
 from typing import Dict
 
-from flextrain.config import get_flextrain_config
 from flextrain.optimizer import FlexTrainCPUOptimizer, STEP_KEY
 from flextrain.ops.op_builder import CPUAdamBuilder
-from flextrain.utils import rank0_logger
 
 
 class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
@@ -82,13 +79,6 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
         )
         # Initialize the optimizer
         FlexTrainCPUOptimizer.__init__(self)
-
-        cpu_info = get_cpu_info()
-        self.cpu_vendor = cpu_info["vendor_id_raw"].lower() \
-            if "vendor_id_raw" in cpu_info else "unknown"
-        master_dtype = get_flextrain_config().mixed_precision.master_dtype
-        if "amd" in self.cpu_vendor and master_dtype == torch.float16:
-            rank0_logger.warning("FP16 for CPUAdam may not work on AMD CPUs")
 
         self.opt_id = FlexTrainCPUAdam.optimizer_id
         FlexTrainCPUAdam.optimizer_id += 1

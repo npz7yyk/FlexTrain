@@ -1,4 +1,3 @@
-import psutil
 import torch
 
 from abc import ABC, abstractmethod
@@ -82,6 +81,11 @@ def slice_segments(
         List[List[GroupSegment]]: a list of lists of segments that \
             reconstruct the coverage for the original segments.
     """
+
+    # If there are no segments, return len(lengths) empty lists
+    if not segments:
+        assert sum(lengths) == 0
+        return [[] for _ in lengths]
 
     results = []
     segments: Iterator[GroupSegment] = iter(segments)
@@ -213,15 +217,20 @@ class FlexTrainCPUOptimizer(ABC):
     @torch.no_grad()
     def profile_step(self, numel: int, dtype: torch.dtype):
         # Initialize the optimizer states.
-        if not hasattr(self, "_optimizer_states"):
-            self._optimizer_states = self._init_optimizer_states(numel, dtype)
+        if not hasattr(self, "_parameter"):
             self._param_group = {STEP_KEY: 0}
+            self._parameter = torch.randn(numel, dtype=dtype)
+            self._gradient = torch.randn(numel, dtype=dtype)
+            self._optimizer_states = self._init_optimizer_states(numel, dtype)
+
+        # Increment the step key.
         self._param_group[STEP_KEY] += 1
-        # Create the parameter and gradient tensors.
-        para = torch.empty(numel, dtype=dtype)
-        grad = torch.empty(numel, dtype=dtype)
+
         # Conduct the optimization step.
-        self._step(self._param_group, para, grad, *self._optimizer_states)
+        self._step(
+            self._param_group,
+            self._parameter, self._gradient, *self._optimizer_states
+        )
 
 
 class SharedGradBuffer:
@@ -342,9 +351,8 @@ def step_worker_func(
     # Initialize the CPU optimizer.
     optimizer: FlexTrainCPUOptimizer = optimizer_class(**optimizer_args)
 
-    # Report the memory usage.
-    used_memory = psutil.Process().memory_info().rss
-    pipe.send(used_memory)
+    # Acknowledge the parent process.
+    pipe.send("WORKER_STARTED")
 
     # Unpack the shared optimizer states.
     fwd_cpu_opts, bwd_cpu_opts = shared_optimizer_states
@@ -608,8 +616,9 @@ class FlexTrainOptimizer:
         self.step_worker.daemon = True
         self.step_worker.start()
 
-        # Get the baseline memory usage of the worker.
-        self.baseline_memory = self.parent_conn.recv()
+        # Wait for the worker to start.
+        msg = self.parent_conn.recv()
+        assert msg == "WORKER_STARTED"
 
     def submit_rotate(self):
         # Submit a command to rotate the shared buffers.
