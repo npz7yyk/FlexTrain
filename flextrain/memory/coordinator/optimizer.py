@@ -666,10 +666,10 @@ class FlexTrainOptsCoordinator:
 
         # 3. Copy the source memory to the target memory.
         cpu_tar.copy_(cpu_src, non_blocking=True)
-        # self._opt_nvme_group.single_reload(
-        #     FlexTrainDataID(Dtype.OPTS, unit_index),
-        #     nvme_tar, index=0 if forward else 1, async_op=True
-        # )
+        self._opt_nvme_group.single_reload(
+            FlexTrainDataID(Dtype.OPTS, unit_index),
+            nvme_tar, index=0 if forward else 1, async_op=True
+        )
 
     def _submit_optimizer_step(
         self, unit_index: int, forward: bool, delay: bool = False
@@ -711,10 +711,10 @@ class FlexTrainOptsCoordinator:
 
         # 3. Copy the source memory to the target memory.
         cpu_tar.copy_(cpu_src, non_blocking=True)
-        # self._opt_nvme_group.single_offload(
-        #     FlexTrainDataID(Dtype.OPTS, unit_index),
-        #     nvme_src, index=0 if forward else 1, async_op=True
-        # )
+        self._opt_nvme_group.single_offload(
+            FlexTrainDataID(Dtype.OPTS, unit_index),
+            nvme_src, index=0 if forward else 1, async_op=True
+        )
 
     def _submit_update_para(
         self,
