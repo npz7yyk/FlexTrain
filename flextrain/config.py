@@ -40,7 +40,7 @@ class SplitRatioConfig:
     """
     How to split the checkpointed activations among the memory hierarchy.
     Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
-    Defaults to (1.0, 0.0) if not provided.
+    Defaults to (0.0, 1.0) if not provided.
     """
 
     gradient: Tuple[float, float]
@@ -48,14 +48,14 @@ class SplitRatioConfig:
     How to split the gradients of activations among the memory hierarchy.
     Note: These gradients are NOT those of the model parameters.
     Ratio = (GPU, CPU), GPU + CPU = 1.0 is required.
-    Defaults to (1.0, 0.0) if not provided.
+    Defaults to (0.0, 1.0) if not provided.
     """
 
     parameter: Tuple[float, float]
     """
     How to split the parameters among the memory hierarchy.
     Ratio = (GPU, CPU), and NVMe = 1 - GPU - CPU.
-    Defaults to (1.0, 0.0) if not provided.
+    Defaults to (0.0, 1.0) if not provided.
     """
 
     optimizer: Tuple[float, float]

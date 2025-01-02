@@ -25,22 +25,22 @@ SPLIT_RATIO = "split_ratio"
 # Name of the checkpoint split ratio configuration
 CHECKPOINT = "checkpoint"
 # Default checkpoint split ratio
-CHECKPOINT_DEFAULT = (1.0, 0.0)
+CHECKPOINT_DEFAULT = (0.0, 1.0)
 
 # Name of the gradient split ratio configuration
 GRADIENT = "gradient"
 # Default gradient split ratio
-GRADIENT_DEFAULT = (1.0, 0.0)
+GRADIENT_DEFAULT = (0.0, 1.0)
 
 # Name of the parameter split ratio configuration
 PARAMETER = "parameter"
 # Default parameter split ratio
-PARAMETER_DEFAULT = (1.0, 0.0)
+PARAMETER_DEFAULT = (0.0, 1.0)
 
 # Name of the optimizer split ratio configuration
 OPTIMIZER = "optimizer"
 # Default optimizer split ratio
-OPTIMIZER_DEFAULT = (1.0, 0.0)
+OPTIMIZER_DEFAULT = (0.0, 1.0)
 
 # Name of the optimizer step split ratio configuration
 ALPHA = "alpha"
