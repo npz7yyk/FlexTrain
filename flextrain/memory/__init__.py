@@ -3,7 +3,7 @@ import torch
 
 from collections import deque, defaultdict
 from enum import Enum
-from math import ceil
+from math import ceil, prod
 from torch import Tensor
 from torch.nn import Parameter
 from typing import (
@@ -13,6 +13,8 @@ from typing import (
 
 from flextrain.config import get_flextrain_config
 from flextrain.utils.distributed import get_rank
+
+from .pin_memory import allocate_pin_memory_blocks
 
 
 class FlexTrainDataType(Enum):
@@ -294,9 +296,14 @@ def allocate_memory_chunks(
         chunks = (chunks,)
 
     # Calculate the total memory size.
-    total_numel = numel
-    for dim in chunks:
-        total_numel *= dim
+    total_numel = numel * prod(chunks)
+
+    # If allocating CPU pinned memory, use the optimal allocation plan.
+    device = torch.device(device)
+    if device.type == 'cpu' and pin_memory:
+        global _ALLOCATED_DRAM_SIZE
+        _ALLOCATED_DRAM_SIZE += total_numel * dtype.itemsize
+        return allocate_pin_memory_blocks(numel, dtype, chunks)
 
     # Allocate memory.
     memory = allocate_memory(total_numel, dtype, device, pin_memory)

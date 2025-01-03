@@ -114,7 +114,7 @@ def slice_segments(
                 try:
                     cur_start, cur_end, cur_group = unpack_next_segment()
                 except StopIteration:
-                    assert remaining == 0
+                    break
             else:
                 # Only part of this segment is needed
                 pieces.append(

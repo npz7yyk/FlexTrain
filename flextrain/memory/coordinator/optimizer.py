@@ -1,5 +1,6 @@
 import torch
 
+from collections.abc import Iterable
 from torch import Tensor
 from tqdm import tqdm
 
@@ -489,6 +490,9 @@ class FlexTrainOptsCoordinator:
             )
 
         def _create_view(tensor: Tensor, numel: int, dtype: torch.dtype):
+            if not isinstance(tensor, Tensor):
+                assert isinstance(tensor, Iterable)
+                return [_create_view(t, numel, dtype) for t in tensor]
             return _convert_dtype_view(tensor, dtype)[..., :numel]
 
         # Create the gradient buffers.
@@ -502,7 +506,7 @@ class FlexTrainOptsCoordinator:
         )
 
         # How to reconstruct the forward gradients.
-        self._forward_grad_splits = [
+        forward_grad_splits = [
             cpu_buffer_needed_numel, gpu_buffer_needed_numel
         ]
         # End of assignment. Incredible!!!
@@ -528,8 +532,7 @@ class FlexTrainOptsCoordinator:
             f"  - Gradient dtype itemsize / device dtype itemsize: {ratio}\n"
             f"  - Checkpoint borrowable numels (CPU, GPU): "
             f"({cvtd_cpu_grad_buffer_numel}, {cvtd_gpu_grad_buffer_numel})\n"
-            f"  - Gradient buffer numels (CPU, GPU): "
-            f"{self._forward_grad_splits}\n"
+            f"  - Gradient buffer numels (CPU, GPU): {forward_grad_splits}\n"
         )
 
     def _rotate_buffers(self):
