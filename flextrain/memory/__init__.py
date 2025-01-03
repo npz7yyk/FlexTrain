@@ -253,6 +253,7 @@ class RotateContainer(Generic[T]):
         self._items.rotate(1)
 
 
+_ALLOCATED_VRAM_SIZE = 0
 _ALLOCATED_DRAM_SIZE = 0
 
 
@@ -270,6 +271,8 @@ def allocate_memory(
         _ALLOCATED_DRAM_SIZE += numel * dtype.itemsize
     else:
         torch.cuda.empty_cache()
+        global _ALLOCATED_VRAM_SIZE
+        _ALLOCATED_VRAM_SIZE += numel * dtype.itemsize
 
     # Determine whether to pin CPU memory.
     pin_memory = (device.type == 'cpu') and numel > 0 and pin_memory
@@ -302,6 +305,10 @@ def allocate_memory_chunks(
 
 def get_allocated_dram_size():
     return _ALLOCATED_DRAM_SIZE
+
+
+def get_allocated_vram_size():
+    return _ALLOCATED_VRAM_SIZE
 
 
 def get_split_numels(

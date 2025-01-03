@@ -11,6 +11,7 @@ from flextrain.memory import (
     FlexTrainDataID,
     RotateContainer,
     get_split_numels,
+    allocate_memory,
     allocate_memory_chunks,
     copy_segments,
     get_data_stream
@@ -100,7 +101,7 @@ class FlexTrainOptsCoordinator:
 
         # TEMPORARY: use opt_state_per_element to build the coordinator.
         # May support complex optimizer states in the future.
-        opt_state_per_element = sum([s.numel() for s in test_state])
+        opt_state_per_element = sum(s.numel() for s in test_state)
 
         # Optimizer working buffer.
         # Will be shared with the co-process dedicated to optimizer steps.
@@ -286,7 +287,7 @@ class FlexTrainOptsCoordinator:
         # If gradacc_dtype is different from device_dtype,
         # we need an extra buffer for backward gradients.
         if self._gradacc_dtype_incompatible:
-            self._gpu_bwd_extra_grads = torch.empty(
+            self._gpu_bwd_extra_grads = allocate_memory(
                 self._unit_numel, dtype=device_dtype,
                 device=torch.cuda.current_device()
             )
