@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 from typing import Dict
 
-from flextrain.memory import allocate_memory_chunks
+from flextrain.memory import allocate_memory
 from flextrain.optimizer import FlexTrainCPUOptimizer, STEP_KEY
 from flextrain.ops.op_builder import CPUAdamBuilder
 
@@ -109,9 +109,11 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
 
     def _init_optimizer_states(self, numel: int, dtype: torch.dtype):
         # Create exp_avg and exp_avg_sq
-        return list(allocate_memory_chunks(
-            numel, 2, dtype, torch.device('cpu'), pin_memory=False
-        ).zero_())
+        return [
+            allocate_memory(
+                numel, dtype, torch.device('cpu'), pin_memory=False
+            ).zero_() for _ in range(2)
+        ]
 
     def _step(
         self, group_args: Dict,
@@ -127,5 +129,6 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
             self.opt_id, group_args["step"], group_args["lr"],
             *group_args["betas"], group_args["eps"],
             group_args["weight_decay"], group_args["bias_correction"],
-            parameter, gradient, *optimizer_states
+            parameter.data, gradient.data,
+            optimizer_states[0].data, optimizer_states[1].data
         )
