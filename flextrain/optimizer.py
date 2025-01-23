@@ -508,23 +508,25 @@ class FlexTrainOptimizer:
 
         # Allocate gradient buffers & create / link the master parameters.
         total_numel = sum(p.numel() for p in non_layerwise_params)
-        self._device_para = allocate_memory(
+        self._device_para = torch.zeros(
             total_numel, dtype=device_dtype, device=torch.cuda.current_device()
-        ).zero_()
-        self._device_grad = allocate_memory(
+        )
+        self._device_grad = torch.zeros(
             total_numel, dtype=device_dtype, device=torch.cuda.current_device()
-        ).zero_()
+        )
         if self._gradacc_dtype_incompatible:
-            self._device_acc_grad = allocate_memory(
+            self._device_acc_grad = torch.zeros(
                 total_numel, dtype=gradacc_dtype,
                 device=torch.cuda.current_device()
-            ).zero_()
-        self._master_para = allocate_memory(
-            total_numel, dtype=master_dtype, device=torch.device('cpu')
-        ).zero_()
-        self._master_grad = allocate_memory(
-            total_numel, dtype=master_dtype, device=torch.device('cpu')
-        ).zero_()
+            )
+        self._master_para = torch.zeros(
+            total_numel, dtype=master_dtype,
+            device=torch.device('cpu'), pin_memory=True
+        )
+        self._master_grad = torch.zeros(
+            total_numel, dtype=master_dtype,
+            device=torch.device('cpu'), pin_memory=True
+        )
         move_into_contiguous(non_layerwise_params, self._device_para)
         self._master_para.copy_(self._device_para)
 

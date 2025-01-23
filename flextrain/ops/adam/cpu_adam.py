@@ -10,7 +10,6 @@ import torch
 from torch import Tensor
 from typing import Dict
 
-from flextrain.memory import allocate_memory
 from flextrain.optimizer import FlexTrainCPUOptimizer, STEP_KEY
 from flextrain.ops.op_builder import CPUAdamBuilder
 
@@ -97,11 +96,6 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
         except BaseException:
             pass
 
-    def __setstate__(self, state):
-        super(FlexTrainCPUAdam, self).__setstate__(state)
-        for group in self.param_groups:
-            group.setdefault('amsgrad', False)
-
     def _set_defaults_args(self, group_args: Dict):
         for k, v in self.default_args.items():
             if k not in group_args:
@@ -109,11 +103,7 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
 
     def _init_optimizer_states(self, numel: int, dtype: torch.dtype):
         # Create exp_avg and exp_avg_sq
-        return [
-            allocate_memory(
-                numel, dtype, torch.device('cpu'), pin_memory=False
-            ).zero_() for _ in range(2)
-        ]
+        return [torch.zeros(numel, dtype=dtype) for _ in range(2)]
 
     def _step(
         self, group_args: Dict,

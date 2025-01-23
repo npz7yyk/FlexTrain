@@ -175,6 +175,7 @@ class FlexTrainOptsCoordinator:
         self._data_stream = get_data_stream()
 
         # 1. Set the configuration for the optimizer.
+        self._auto_config = get_flextrain_config().auto_config
         self._num_units = para.num_units
         self._unit_parameters = para._unit_parameters
 
@@ -386,10 +387,12 @@ class FlexTrainOptsCoordinator:
 
             # Copy the optimizer states.
             cpu_fwd_tar.copy_(cpu_fwd_src)
-            self._opt_nvme_group.single_offload(
-                FlexTrainDataID(Dtype.OPTS, unit),
-                nvme_fwd_src, index=0, async_op=False
-            )
+            # Skip the NVMe offload if running in the auto-config mode.
+            if not self._auto_config:
+                self._opt_nvme_group.single_offload(
+                    FlexTrainDataID(Dtype.OPTS, unit),
+                    nvme_fwd_src, index=0, async_op=False
+                )
             # End of forward parameters.
 
             # 3. Create the backward optimizer states.
@@ -432,10 +435,12 @@ class FlexTrainOptsCoordinator:
 
             # Copy the optimizer states.
             cpu_bwd_tar.copy_(cpu_bwd_src)
-            self._opt_nvme_group.single_offload(
-                FlexTrainDataID(Dtype.OPTS, unit),
-                nvme_bwd_src, index=1, async_op=False
-            )
+            # Skip the NVMe offload if running in the auto-config mode.
+            if not self._auto_config:
+                self._opt_nvme_group.single_offload(
+                    FlexTrainDataID(Dtype.OPTS, unit),
+                    nvme_bwd_src, index=1, async_op=False
+                )
             # End of backward parameters.
         # End of optimizer state initialization.
 
@@ -482,11 +487,14 @@ class FlexTrainOptsCoordinator:
             cpu_buffer_needed_numel = cvtd_cpu_grad_buffer_numel
             gpu_buffer_needed_numel = forward_grad_numel - sum(numels[:1])
         else:
+            max_alpha = sum(numels) / (self._mb_fwd_numel + self._mb_bwd_numel)
             raise NotImplementedError(
                 "The forward gradient numel is too large to fit into the "
                 "gradient buffers, consider either:\n"
                 "  - Increase the checkpoint buffer numel, or\n"
-                "  - Reduce the alpha split ratio."
+                "  - Reduce the alpha split ratio.\n"
+                "Current alpha split ratio: {:.3f}\n".format(self._alpha) +
+                "The maximum allowed alpha: {:.3f}".format(max_alpha)
             )
 
         def _create_view(tensor: Tensor, numel: int, dtype: torch.dtype):
@@ -651,6 +659,9 @@ class FlexTrainOptsCoordinator:
 
     def _submit_transfer_opts(self, unit_index: int, forward: bool):
         """ Launch the async IO operation to transfer CPU optimizer states. """
+        # If running in the auto-config mode, return.
+        if self._auto_config:
+            return
         # Return if the task is invalid.
         if self._is_invalid_unit(unit_index):
             return
@@ -696,6 +707,9 @@ class FlexTrainOptsCoordinator:
 
     def _submit_update_opts(self, unit_index: int, forward: bool):
         """ Launch the async IO operation to update CPU optimizer states. """
+        # If running in the auto-config mode, return.
+        if self._auto_config:
+            return
         # Return if the task is invalid.
         if self._is_invalid_unit(unit_index):
             return

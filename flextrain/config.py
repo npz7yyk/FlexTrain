@@ -387,30 +387,17 @@ class FlexTrainConfig:
             mixed_precision=config_dict.get(MIXED_PRECISION, {})
         )
 
-        if self.auto_config:
-            # Log FlexTrain configuration for auto-config mode.
-            rank0_logger.info(
-                f"\n\n> FlexTrain conducting auto-configuration ...\n"
-                f"Test configuration: {LEFT_BRACE}\n"
-                f"\t\"batch_size\": {self.batch_size},\n"
-                f"\t\"micro_batch_size\": {self.micro_batch_size},\n"
-                f"\t\"{CHECKPOINT_INTERVAL}\": {self.checkpoint_interval},\n"
-                f"{self.nvme_swap.to_log(indent=1)},\n"
-                f"{self.mixed_precision.to_log(indent=1)}\n"
-                f"{RIGHT_BRACE}\n"
-            )
-        else:
-            # Log FlexTrain configuration.
-            rank0_logger.info(
-                f"\n\n> FlexTrain configuration: {LEFT_BRACE}\n"
-                f"\t\"batch_size\": {self.batch_size},\n"
-                f"\t\"micro_batch_size\": {self.micro_batch_size},\n"
-                f"\t\"{CHECKPOINT_INTERVAL}\": {self.checkpoint_interval},\n"
-                f"{self.split_ratio.to_log(indent=1)},\n"
-                f"{self.nvme_swap.to_log(indent=1)},\n"
-                f"{self.mixed_precision.to_log(indent=1)}\n"
-                f"{RIGHT_BRACE}\n"
-            )
+        # Log FlexTrain configuration.
+        rank0_logger.info(
+            f"\n\n> FlexTrain configuration: {LEFT_BRACE}\n"
+            f"\t\"batch_size\": {self.batch_size},\n"
+            f"\t\"micro_batch_size\": {self.micro_batch_size},\n"
+            f"\t\"{CHECKPOINT_INTERVAL}\": {self.checkpoint_interval},\n"
+            f"{self.split_ratio.to_log(indent=1)},\n"
+            f"{self.nvme_swap.to_log(indent=1)},\n"
+            f"{self.mixed_precision.to_log(indent=1)}\n"
+            f"{RIGHT_BRACE}\n"
+        )
 
 
 _CONFIG = None

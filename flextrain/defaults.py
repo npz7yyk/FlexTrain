@@ -53,7 +53,7 @@ ALPHA_DEFAULT = 0.25
 # # --- Benchmark configuration defaults ---
 
 # Number of iterations to run GPU related benchmarks
-BENCHMARK_GPU_ITERATIONS = 100
+BENCHMARK_GPU_ITERATIONS = 200
 
 # Number of iterations to run PCIe related benchmarks
 BENCHMARK_PCIE_ITERATIONS = 200
@@ -64,11 +64,14 @@ BENCHMARK_NVME_ITERATIONS = 50
 # Number of iterations to run CPU related benchmarks
 BENCHMARK_CPU_ITERATIONS = 50
 
-# Size of the data blocks to test
-BENCHMARK_BLOCK_SIZE = 2 ** 30
+# Size of the data blocks to test for data traffic
+BENCHMARK_TRAFFIC_BLOCK_SIZE = 2 ** 32
+
+# Size of the data blocks to test for optimizer step
+BENCHMARK_OPTIMIZER_BLOCK_SIZE = 2 ** 28
 
 # Number of data blocks to test
-BENCHMARK_NUM_BLOCKS = 4
+BENCHMARK_NUM_BLOCKS = 16
 
 # # --- end of Benchmark configuration defaults ---
 
@@ -79,7 +82,19 @@ BENCHMARK_NUM_BLOCKS = 4
 ACCESSIBLE_GPU_MEMORY_RATIO = 0.95
 
 # Ratio of the accessible CPU memory to the total CPU memory
-ACCESSIBLE_CPU_MEMORY_RATIO = 0.90
+ACCESSIBLE_CPU_MEMORY_RATIO = 1.00
+
+# Potential alpha values to test
+POTENTIAL_ALPHA_VALUES = [0.01 * i for i in range(31)]
+
+# If above this threshold, the throughput is considered to be better
+THROUGHPUT_STABLE_THRESHOLD = 1.01
+
+# A small penalty for CPU activation gradient / NVMe data
+REGULARIZATION_PENALTY = 1e-8
+
+# Number of extra configurations to collect after the best configuration
+NUM_EXTRA_CONFIGS = 20
 
 # # --- end of Auto-config configuration defaults ---
 
