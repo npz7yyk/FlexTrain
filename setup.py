@@ -10,10 +10,8 @@ FlexTrain library
 """
 
 import os
-import sys
 import subprocess
 from setuptools import setup, find_packages
-from setuptools.command import egg_info
 import time
 import typing
 
@@ -160,31 +158,13 @@ setup(
     description='FlexTrain library',
     long_description=readme_text,
     long_description_content_type='text/markdown',
-    # author='ALCHEM, Purdue University',
-    # author_email='yue63@purdue.edu',
-    # url='http://deepspeed.ai',
     project_urls={
-        # 'Documentation': 'https://deepspeed.readthedocs.io',
         'Source': 'https://github.com/npz7yyk/FlexTrain',
     },
     install_requires=install_requires,
-    # extras_require=extras_require,
     packages=find_packages(include=['flextrain', 'flextrain.*']),
     include_package_data=True,
-    # scripts=[
-    #     'bin/deepspeed', 'bin/deepspeed.pt', 'bin/ds', 'bin/ds_ssh', 'bin/ds_report', 'bin/ds_bench', 'bin/dsr',
-    #     'bin/ds_elastic'
-    # ],
-    classifiers=[
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10'
-    ],
-    license='Apache Software License 2.0',
-    # ext_modules=ext_modules,
-    # cmdclass=cmdclass
+    license='Apache Software License 2.0'
 )
 
 end_time = time.time()
