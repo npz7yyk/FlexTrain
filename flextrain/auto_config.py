@@ -16,7 +16,8 @@ from flextrain.defaults import (
     BENCHMARK_CPU_ITERATIONS,
     BENCHMARK_NVME_ITERATIONS,
     BENCHMARK_NUM_BLOCKS,
-    BENCHMARK_TRAFFIC_BLOCK_SIZE,
+    BENCHMARK_PCIE_BLOCK_SIZE,
+    BENCHMARK_NVME_BLOCK_SIZE,
     BENCHMARK_OPTIMIZER_BLOCK_SIZE,
     ACCESSIBLE_GPU_MEMORY_RATIO,
     ACCESSIBLE_CPU_MEMORY_RATIO,
@@ -182,10 +183,10 @@ def system_auto_config():
     # 2. Benchmark the PCIe bandwidth
     pcie_times = []
     read_buffer = torch.empty(
-        BENCHMARK_TRAFFIC_BLOCK_SIZE, dtype=torch.uint8, pin_memory=True
+        BENCHMARK_PCIE_BLOCK_SIZE, dtype=torch.uint8, pin_memory=True
     )
     write_buffer = torch.empty(
-        BENCHMARK_TRAFFIC_BLOCK_SIZE, dtype=torch.uint8,
+        BENCHMARK_PCIE_BLOCK_SIZE, dtype=torch.uint8,
         device=torch.cuda.current_device()
     )
     iterations = tqdm(
@@ -202,20 +203,20 @@ def system_auto_config():
 
     # Compute the average time
     avg_pcie = _world_20_80_percentile_avg(pcie_times) / 1000
-    pcie_bandwidth = _to_gb(BENCHMARK_TRAFFIC_BLOCK_SIZE) / avg_pcie
+    pcie_bandwidth = _to_gb(BENCHMARK_PCIE_BLOCK_SIZE) / avg_pcie
     dist.rank0_logger.info(
         "\n\n> FlexTrain PCIe bandwidth benchmarking results:\n"
         f"  - Average PCIe bandwidth: {pcie_bandwidth:.3f} GB/s\n"
     )
-    pcie_bandwidth = BENCHMARK_TRAFFIC_BLOCK_SIZE / avg_pcie
+    pcie_bandwidth = BENCHMARK_PCIE_BLOCK_SIZE / avg_pcie
 
     # 3. Benchmark the NVMe swapper
     swap_times = []
     swapper = get_nvme_swapper()
     swapper.synchronize()
 
-    read_buffer = torch.empty(BENCHMARK_TRAFFIC_BLOCK_SIZE, dtype=torch.uint8)
-    write_buffer = torch.empty(BENCHMARK_TRAFFIC_BLOCK_SIZE, dtype=torch.uint8)
+    read_buffer = torch.empty(BENCHMARK_NVME_BLOCK_SIZE, dtype=torch.uint8)
+    write_buffer = torch.empty(BENCHMARK_NVME_BLOCK_SIZE, dtype=torch.uint8)
 
     for i in range(BENCHMARK_NUM_BLOCKS):
         write_buffer += 1
@@ -246,7 +247,7 @@ def system_auto_config():
     # Compute the average time
     avg_swap_time = _world_20_80_percentile_avg(swap_times)
     # Compute the bandwidth
-    avg_swap_bandwidth = 2 * BENCHMARK_TRAFFIC_BLOCK_SIZE / avg_swap_time
+    avg_swap_bandwidth = 2 * BENCHMARK_NVME_BLOCK_SIZE / avg_swap_time
     nvme_swap = _to_gb(avg_swap_bandwidth)
     world_size = dist.get_world_size()
     dist.rank0_logger.info(

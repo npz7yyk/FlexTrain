@@ -64,8 +64,11 @@ BENCHMARK_NVME_ITERATIONS = 50
 # Number of iterations to run CPU related benchmarks
 BENCHMARK_CPU_ITERATIONS = 50
 
-# Size of the data blocks to test for data traffic
-BENCHMARK_TRAFFIC_BLOCK_SIZE = 2 ** 32
+# Size of the data blocks to test for PCIe throughput
+BENCHMARK_PCIE_BLOCK_SIZE = 2 ** 30
+
+# Size of the data blocks to test for NVMe throughput
+BENCHMARK_NVME_BLOCK_SIZE = 2 ** 32
 
 # Size of the data blocks to test for optimizer step
 BENCHMARK_OPTIMIZER_BLOCK_SIZE = 2 ** 28
