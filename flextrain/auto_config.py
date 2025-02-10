@@ -306,7 +306,7 @@ def system_auto_config():
         layer_numel=get_para_coordinator().unit_numel,
         interlayer_numel=get_interlayer_coordinator()._tensor_numel,
         pcie_bandwidth=pcie_bandwidth,
-        nvme_swap_bandwidth=avg_swap_bandwidth,
+        nvme_swap_bandwidth=avg_swap_bandwidth * world_size,
         opt_step_throughput=step_throughput
     )
 
