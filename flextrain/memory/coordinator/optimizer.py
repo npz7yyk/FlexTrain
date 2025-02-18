@@ -480,10 +480,10 @@ class FlexTrainOptsCoordinator:
         cvtd_gpu_grad_buffer_numel = gpu_grad_buffer_numel // ratio
         numels = [cvtd_cpu_grad_buffer_numel, cvtd_gpu_grad_buffer_numel]
 
-        if forward_grad_numel < sum(numels[:1]):
+        if forward_grad_numel <= sum(numels[:1]):
             cpu_buffer_needed_numel = forward_grad_numel - sum(numels[:0])
             gpu_buffer_needed_numel = 0
-        elif forward_grad_numel < sum(numels[:2]):
+        elif forward_grad_numel <= sum(numels[:2]):
             cpu_buffer_needed_numel = cvtd_cpu_grad_buffer_numel
             gpu_buffer_needed_numel = forward_grad_numel - sum(numels[:1])
         else:
