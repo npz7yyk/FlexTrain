@@ -85,7 +85,7 @@ BENCHMARK_NUM_BLOCKS = 16
 ACCESSIBLE_GPU_MEMORY_RATIO = 0.95
 
 # Ratio of the accessible CPU memory to the total CPU memory
-ACCESSIBLE_CPU_MEMORY_RATIO = 1.00
+ACCESSIBLE_CPU_MEMORY_RATIO = 0.95
 
 # Potential alpha values to test
 POTENTIAL_ALPHA_VALUES = [0.01 * i for i in range(31)]
