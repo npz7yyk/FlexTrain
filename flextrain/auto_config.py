@@ -575,7 +575,7 @@ class FlexTrainConfigSolver:
         self.problem += \
             dist.get_world_size() * (
                 rank_cpu_ckpt_base + rank_cpu_grad_base +
-                rank_nvme_ckpt_margin_base, rank_nvme_ckpt_prefetch_buffer
+                rank_nvme_ckpt_margin_base + rank_nvme_ckpt_prefetch_buffer
             ) + world_cpu_para_base + world_nvme_para_prefetch_buffer + \
             world_cpu_opts_base + world_cpu_opt_grad_buffer + \
             world_cpu_opt_work_buffer + world_nvme_para_update_buffer <= \

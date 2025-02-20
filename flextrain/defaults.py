@@ -94,7 +94,7 @@ POTENTIAL_ALPHA_VALUES = [0.01 * i for i in range(31)]
 THROUGHPUT_STABLE_THRESHOLD = 1.01
 
 # A small penalty for CPU activation gradient / NVMe data
-REGULARIZATION_PENALTY = 1e-6
+REGULARIZATION_PENALTY = 1e-2
 
 # Number of extra configurations to collect after the best configuration
 NUM_EXTRA_CONFIGS = 20
