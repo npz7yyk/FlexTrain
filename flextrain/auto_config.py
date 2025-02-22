@@ -78,17 +78,11 @@ def system_auto_config():
 
     process_used_dram = psutil.Process().memory_info().rss
     process_baseline_dram = process_used_dram - get_allocated_dram_size()
-
-    process_used_dram = torch.tensor(process_used_dram).cuda()
-    dist.all_reduce(process_used_dram, op=dist.ReduceOp.SUM)
-    total_used_mem = process_used_dram.item()
-
     process_baseline_dram = torch.tensor(process_baseline_dram).cuda()
     dist.all_reduce(process_baseline_dram, op=dist.ReduceOp.SUM)
     baseline_dram = process_baseline_dram.item()
 
-    available_dram = psutil.virtual_memory().available
-    total_dram = total_used_mem + available_dram
+    total_dram = get_flextrain_config().max_dram_usage * 1024 ** 3
     usable_dram = total_dram - baseline_dram
     usable_dram = usable_dram * ACCESSIBLE_CPU_MEMORY_RATIO
 

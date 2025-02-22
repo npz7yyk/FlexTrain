@@ -313,6 +313,11 @@ class FlexTrainConfig:
     Defaults to False if not provided.
     """
 
+    max_dram_usage: int
+    """
+    Maximum DRAM usage in GBs for FlexTrain optimizations.
+    """
+
     batch_size: int
     """
     Batch size required by training algorithm.
@@ -350,7 +355,7 @@ class FlexTrainConfig:
     Defaults values will be used if not provided.
     """
 
-    _NECESSARY_KEYS = ["batch_size", "micro_batch_size"]
+    _NECESSARY_KEYS = ["max_dram_usage", "batch_size", "micro_batch_size"]
 
     def __init__(self, config_dict: dict):
         # Assertions.
@@ -361,6 +366,7 @@ class FlexTrainConfig:
         )
 
         # Set necessary keys.
+        self.max_dram_usage = config_dict["max_dram_usage"]
         self.batch_size = config_dict["batch_size"]
         self.micro_batch_size = config_dict["micro_batch_size"]
 
@@ -390,6 +396,7 @@ class FlexTrainConfig:
         # Log FlexTrain configuration.
         rank0_logger.info(
             f"\n\n> FlexTrain configuration: {LEFT_BRACE}\n"
+            f"\t\"max_dram_usage\": {self.max_dram_usage},\n"
             f"\t\"batch_size\": {self.batch_size},\n"
             f"\t\"micro_batch_size\": {self.micro_batch_size},\n"
             f"\t\"{CHECKPOINT_INTERVAL}\": {self.checkpoint_interval},\n"
