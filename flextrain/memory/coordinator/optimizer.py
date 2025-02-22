@@ -144,14 +144,14 @@ class FlexTrainOptsCoordinator:
             (self._num_units, opt_state_per_element),
             get_flextrain_config().mixed_precision.master_dtype,
             torch.device('cpu'), pin_memory=False
-        ).zero_().share_memory_()
+        ).share_memory_().zero_()
 
         bwd_cpu_opts = allocate_memory_chunks(
             self._unit_bwd_opt_splits[0],
             (self._num_units, opt_state_per_element),
             get_flextrain_config().mixed_precision.master_dtype,
             torch.device('cpu'), pin_memory=False
-        ).zero_().share_memory_()
+        ).share_memory_().zero_()
 
         self._shared_cpu_opts = (fwd_cpu_opts, bwd_cpu_opts)
         # End of optimizer state allocation.
