@@ -1,1 +1,1 @@
-include flextrain/ops/csrc/*
+recursive-include flextrain/ops/csrc *
