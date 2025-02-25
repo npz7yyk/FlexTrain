@@ -399,16 +399,7 @@ class FlexTrainConfigSolver:
             mbpr_max_throughput = 0
             mbpr_best_result = None
 
-            # Try potential best alpha first
-            potential_best_alpha = \
-                self.mpp.layer_fwd_time / \
-                (2 * self.mpp.layer_fwd_time + self.mpp.layer_bwd_time)
-            result = self._solve_given_hypers(mbpr, potential_best_alpha)
-            if result is not None:
-                mbpr_max_throughput = result.mbpr / result.iteration_time
-                mbpr_best_result = result
-
-            # Then try all potential alpha values
+            # Try all potential alpha values
             for alpha in POTENTIAL_ALPHA_VALUES:
                 result = self._solve_given_hypers(mbpr, alpha)
                 if result is None:
@@ -451,10 +442,8 @@ class FlexTrainConfigSolver:
         iteration_time = self.unit_fwd_time + self.unit_bwd_time
         self.problem += \
             iteration_time + \
-            REGULARIZATION_PENALTY * (
-                self.nvme_ckpt + self.cpu_grad +
-                self.nvme_para + self.nvme_opts
-            ), "Objective function"
+            REGULARIZATION_PENALTY * (self.nvme_para + self.nvme_opts), \
+            "Objective function"
 
         # Define the constraints
         # 0. Basic constraints
