@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from torch import Tensor
-from typing import Iterator, Tuple, List, Dict
+from typing import Type, Iterator, Tuple, List, Dict
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory import (
@@ -342,7 +342,7 @@ class Connection:
 
 def step_worker_func(
     pipe: Connection,
-    optimizer_class: FlexTrainCPUOptimizer,
+    optimizer_class: Type[FlexTrainCPUOptimizer],
     optimizer_args: Dict,
     shared_grad_buffers: RotateContainer[SharedGradBuffer],
     shared_step_buffers: RotateContainer[SharedStepBuffer],
@@ -438,14 +438,14 @@ class FlexTrainOptimizer:
     Args:
         param_groups (List[Dict]): A list where each dictionary contains
             the parameters and their respective arguments.
-        optimizer_class (FlexTrainCPUOptimizer): The CPU optimizer class.
+        optimizer_class (Type[FlexTrainCPUOptimizer]): The CPU optimizer class.
         optimizer_args (Dict): The arguments to initialize the CPU optimizer.
     """
 
     def __init__(
         self,
         param_groups: List[Dict],
-        optimizer_class: FlexTrainCPUOptimizer,
+        optimizer_class: Type[FlexTrainCPUOptimizer],
         optimizer_args: Dict
     ):
         # Ensure that the param_groups is a list of dictionaries.
