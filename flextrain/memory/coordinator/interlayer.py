@@ -132,7 +132,7 @@ class FlexTrainInterLayerCoordinator:
                 self._ckpt_numels[2],
                 (2, max(self._micro_batch_per_rank - 4, 0)),
                 config.mixed_precision.device_dtype,
-                torch.device('cpu')
+                torch.device('cpu'), mem_efficient=False
             )
         )
 

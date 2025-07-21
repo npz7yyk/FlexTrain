@@ -289,7 +289,8 @@ def allocate_memory_chunks(
     chunks: int | Tuple[int, ...],
     dtype: torch.dtype,
     device: torch.device,
-    pin_memory: bool = True
+    pin_memory: bool = True,
+    mem_efficient: bool = True
 ):
     # Wrap the chunks into a tuple.
     if isinstance(chunks, int):
@@ -300,7 +301,7 @@ def allocate_memory_chunks(
 
     # If allocating CPU pinned memory, use the optimal allocation plan.
     device = torch.device(device)
-    if device.type == 'cpu' and pin_memory:
+    if device.type == 'cpu' and pin_memory and mem_efficient:
         global _ALLOCATED_DRAM_SIZE
         _ALLOCATED_DRAM_SIZE += total_numel * dtype.itemsize
         return allocate_pin_memory_blocks(numel, dtype, chunks)
