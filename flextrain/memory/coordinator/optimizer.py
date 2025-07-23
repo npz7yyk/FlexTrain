@@ -910,6 +910,7 @@ class FlexTrainOptsCoordinator:
         # Get the first unit parameters ready.
         # Prepare the second unit parameters.
         self._para._async_load_nvme_paras(1)
+        self._para._async_offload_nvme_paras(0)
         for mb in range(self._micro_batch_per_rank):
             self._para._async_load_gpu_paras(0, mb)()
             self._submit_recover_grad(3, mb)()
