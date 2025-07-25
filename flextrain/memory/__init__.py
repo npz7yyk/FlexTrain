@@ -49,10 +49,6 @@ class FlexTrainDataID:
         )
 
 
-def align_numel(original_numel: int, align_size: int):
-    return (original_numel + align_size - 1) // align_size * align_size
-
-
 def free_tensor(tensor: Tensor, record_stream=False):
     # Record the current stream if the tensor is on CUDA.
     if tensor.is_cuda and record_stream:
@@ -319,26 +315,44 @@ def get_allocated_vram_size():
     return _ALLOCATED_VRAM_SIZE
 
 
+def align_numel(original_numel: int, align_size: int):
+    return (original_numel + align_size - 1) // align_size * align_size
+
+
+def get_page_aligned_numel(
+    numel: int,
+    itemsize: int,
+    alignment_bytes: int = 4096
+):
+    alignment_numel = alignment_bytes // itemsize
+    aligned_numel = align_numel(numel, alignment_numel)
+    return aligned_numel
+
+
+def get_page_aligned_padding_numel(
+    numel: int,
+    itemsize: int,
+    alignment_bytes: int = 4096
+):
+    return get_page_aligned_numel(numel, itemsize, alignment_bytes) - numel
+
+
 def get_split_numels(
     total_numel: int,
     ratios: Iterable[float],
-    num_levels: int = 3,
-    aligned_numel: int = 4096
+    itemsize: int,
+    num_levels: int = 3
 ):
     # Ensure the number of levels is num_levels - 1.
     if len(ratios) == num_levels:
         ratios = ratios[:num_levels - 1]
 
-    # User provides integer splits, compute the rest.
-    if sum(ratios) > 1 and all(isinstance(r, int) for r in ratios):
-        numels = ratios + [total_numel - sum(ratios)]
-        return tuple(numels)
-
-    # Try to avoid the last one being 0.
-    numels = [
-        ceil(r * total_numel / aligned_numel) * aligned_numel
-        for r in ratios
-    ]
+    # Best effort to make the last numel 0.
+    numels = []
+    for ratio in ratios:
+        numel = ceil(total_numel * ratio)
+        numel = get_page_aligned_numel(numel, itemsize)
+        numels.append(numel)
     if sum(numels) > total_numel:
         numels[-1] -= sum(numels) - total_numel
     numels.append(total_numel - sum(numels))

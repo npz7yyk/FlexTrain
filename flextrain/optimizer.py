@@ -10,6 +10,7 @@ from flextrain.config import get_flextrain_config
 from flextrain.memory import (
     FunctionHandle,
     RotateContainer,
+    get_page_aligned_padding_numel,
     move_into_contiguous,
     allocate_memory
 )
@@ -289,6 +290,18 @@ class SharedStepBuffer:
         self._bwd_splits = [unit_bwd_numels[0]] + \
             [unit_bwd_numels[1]] * (opt_state_per_element + 1)
 
+        # Padding numels
+        self._fwd_splits.append(
+            get_page_aligned_padding_numel(
+                sum(self._fwd_splits[1:]), master_dtype.itemsize
+            )
+        )
+        self._bwd_splits.append(
+            get_page_aligned_padding_numel(
+                sum(self._bwd_splits[1:]), master_dtype.itemsize
+            )
+        )
+
         # Allocate memory for the shared buffer.
         max_numel = max(
             sum(self._fwd_splits), sum(self._bwd_splits)
@@ -320,10 +333,10 @@ class SharedStepBuffer:
         """ Get the NVMe optimizer states for the unit. """
         splits = self._fwd_splits if forward else self._bwd_splits
         start = splits[0] + splits[1]
-        end = sum(splits)
+        end = sum(splits[:-1])  # Exclude padding
         return self._buffer[start:end].chunk(self._opt_state_per_element)
 
-    def get_nvme_buffer(self, forward: bool) -> Tensor:
+    def get_nvme_asyncio_buffer(self, forward: bool) -> Tensor:
         """ Get the NVMe buffer for the unit. """
         splits = self._fwd_splits if forward else self._bwd_splits
         start = splits[0]

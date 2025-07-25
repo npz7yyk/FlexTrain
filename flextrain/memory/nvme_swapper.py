@@ -109,10 +109,15 @@ class AsyncNVMeSwapper:
 
         filenames = list(map(self._filename, data_ids))
         swap_out_tensors(self._aio_write_handle, mem_srcs, filenames)
+        self._inflight_write_tasks += len(filenames)
+
+        # If async operation, return immediately.
         if async_op:
-            self._inflight_write_tasks += len(filenames)
-        else:
-            assert self._aio_write_handle.wait() == len(filenames)
+            return
+
+        # Wait for all write tasks to complete.
+        assert self._aio_write_handle.wait() == self._inflight_write_tasks
+        self._inflight_write_tasks = 0
 
     def swap_in(
         self,
@@ -129,10 +134,15 @@ class AsyncNVMeSwapper:
 
         filenames = list(map(self._filename, data_ids))
         swap_in_tensors(self._aio_read_handle, mem_dsts, filenames)
+        self._inflight_read_tasks += len(filenames)
+
+        # If async operation, return immediately.
         if async_op:
-            self._inflight_read_tasks += len(filenames)
-        else:
-            assert self._aio_read_handle.wait() == len(filenames)
+            return
+
+        # Wait for all read tasks to complete.
+        assert self._aio_read_handle.wait() == self._inflight_read_tasks
+        self._inflight_read_tasks = 0
 
     def synchronize(self):
         # If not initialized, return.

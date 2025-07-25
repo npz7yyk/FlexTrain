@@ -76,7 +76,8 @@ class FlexTrainOptsCoordinator:
 
     @property
     def _nvme_para_receive_buffer(self):
-        return self._nvme_para_buffers[0]
+        padding_numel = self._para._unit_nvme_padding_numel
+        return self._nvme_para_buffers[0][:-padding_numel]
 
     @property
     def _nvme_para_offload_buffer(self):
@@ -117,9 +118,10 @@ class FlexTrainOptsCoordinator:
 
         # NVMe group for master parameters and optimizer states.
         # Therefore, opt_state_per_element + 1.
+        step_buffer = self._shared_step_buffers[0]
         self._opt_nvme_group = NVMeGroup([
-            self._unit_fwd_opt_splits[1] * (opt_state_per_element + 1),
-            self._unit_bwd_opt_splits[1] * (opt_state_per_element + 1)
+            sum(step_buffer._fwd_splits[1:]),
+            sum(step_buffer._bwd_splits[1:])
         ])
 
         # Allocate memory for master parameters.
@@ -191,6 +193,7 @@ class FlexTrainOptsCoordinator:
         # Configuration for mixed precision.
         device_dtype = config.mixed_precision.device_dtype
         gradacc_dtype = config.mixed_precision.gradacc_dtype
+        master_dtype = config.mixed_precision.master_dtype
         self._gradacc_dtype_incompatible = device_dtype != gradacc_dtype
 
         # Configuration for optimizer partition.
@@ -236,13 +239,11 @@ class FlexTrainOptsCoordinator:
 
         # How to split the forward optimizer states across devices.
         self._unit_fwd_opt_splits = get_split_numels(
-            self._unit_fwd_numel,
-            opts_cpu_nvme_ratio, num_levels=2
+            self._unit_fwd_numel, opts_cpu_nvme_ratio, master_dtype.itemsize, 2
         )
         # How to split the backward optimizer states across devices.
         self._unit_bwd_opt_splits = get_split_numels(
-            self._unit_bwd_numel,
-            opts_cpu_nvme_ratio, num_levels=2
+            self._unit_bwd_numel, opts_cpu_nvme_ratio, master_dtype.itemsize, 2
         )
 
         # 2. Create parameter group segments.
@@ -310,8 +311,8 @@ class FlexTrainOptsCoordinator:
         # NVMe parameter offload buffer for backward NVMe parameters.
         self._nvme_para_buffers = RotateContainer(
             allocate_memory_chunks(
-                self._mb_bwd_para_splits[2] * self._micro_batch_per_rank,
-                2, device_dtype, torch.device('cpu'), pin_memory=False
+                para._nvme_group._numels[1],   # NVMe backward parameters
+                2, device_dtype, torch.device('cpu')
             )
         )
         self._para_nvme_group = para._nvme_group
@@ -328,7 +329,7 @@ class FlexTrainOptsCoordinator:
         # 4. Initialize master parameters from device parameters.
         gpu_base = para._gpu_para_base
         cpu_base = para._cpu_para_base
-        nvme_mem = para._nvme_available_paras
+        nvme_mem = para._nvme_inflight_paras
         nvme_fwd_mem, nvme_bwd_mem = torch.split(
             nvme_mem, para._unit_nvme_alpha_splits
         )
@@ -344,7 +345,7 @@ class FlexTrainOptsCoordinator:
             # 1. Load the NVMe parameters.
             self._para_nvme_group.group_reload(
                 FlexTrainDataID(Dtype.PARA, unit),
-                nvme_mem, async_op=False
+                para._nvme_asyncio_paras, async_op=False
             )
 
             # 2. Create the forward optimizer states.
@@ -380,7 +381,7 @@ class FlexTrainOptsCoordinator:
             # 2.3 Store the forward optimizer states.
             # Locate the source memory.
             cpu_fwd_src = temp_buffer.get_cpu_master_parameter(forward=True)
-            nvme_fwd_src = temp_buffer.get_nvme_buffer(forward=True)
+            nvme_fwd_src = temp_buffer.get_nvme_asyncio_buffer(forward=True)
 
             # Locate the target memory.
             cpu_fwd_tar = self._fwd_cpu_paras[unit]
@@ -428,7 +429,7 @@ class FlexTrainOptsCoordinator:
             # 3.3 Store the backward optimizer states.
             # Locate the source memory.
             cpu_bwd_src = temp_buffer.get_cpu_master_parameter(forward=False)
-            nvme_bwd_src = temp_buffer.get_nvme_buffer(forward=False)
+            nvme_bwd_src = temp_buffer.get_nvme_asyncio_buffer(forward=False)
 
             # Locate the target memory.
             cpu_bwd_tar = self._bwd_cpu_paras[unit]
@@ -673,7 +674,7 @@ class FlexTrainOptsCoordinator:
         # 2. Locate the target memory.
         receive_buffer = self._cpu_step_receive_buffer
         cpu_tar = receive_buffer.get_cpu_master_parameter(forward)
-        nvme_tar = receive_buffer.get_nvme_buffer(forward)
+        nvme_tar = receive_buffer.get_nvme_asyncio_buffer(forward)
 
         # 3. Copy the source memory to the target memory.
         cpu_tar.copy_(cpu_src, non_blocking=True)
@@ -717,7 +718,7 @@ class FlexTrainOptsCoordinator:
         # 1. Locate the source memory.
         writeback_buffer = self._cpu_step_transfer_buffer
         cpu_src = writeback_buffer.get_cpu_master_parameter(forward)
-        nvme_src = writeback_buffer.get_nvme_buffer(forward)
+        nvme_src = writeback_buffer.get_nvme_asyncio_buffer(forward)
 
         # 2. Locate the target memory.
         cpu_tar = self._fwd_cpu_paras if forward else self._bwd_cpu_paras

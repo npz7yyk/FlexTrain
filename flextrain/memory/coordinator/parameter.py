@@ -11,6 +11,7 @@ from flextrain.memory import (
     FlexTrainDataID,
     ContiguousParaGroup,
     align_numel,
+    get_page_aligned_padding_numel,
     get_split_numels,
     move_into_contiguous,
     allocate_memory_chunks,
@@ -85,7 +86,7 @@ class FlexTrainParaCoordinator:
         ))
         # Allocate NVMe prefetch buffer in CPU memory.
         self._nvme_prefetch_buffer = RotateContainer(allocate_memory_chunks(
-            sum(self._unit_nvme_alpha_splits), 2,
+            self._nvme_group._group_numel, 2,
             self._device_dtype, torch.device('cpu')
         ))
 
@@ -115,25 +116,26 @@ class FlexTrainParaCoordinator:
 
         # How to split the parameters at micro-batch level.
         self._micro_batch_para_splits = get_split_numels(
-            self._aligned_micro_batch_numel, config.split_ratio.parameter
+            self._aligned_micro_batch_numel,
+            config.split_ratio.parameter, self._device_dtype.itemsize
         )
 
         # How to split the GPU parameters at micro-batch level.
         self._micro_batch_gpu_alpha_splits = get_split_numels(
             self._micro_batch_para_splits[0],
-            config.split_ratio.alpha, num_levels=2
+            config.split_ratio.alpha, self._device_dtype.itemsize, num_levels=2
         )
 
         # How to split the CPU parameters at micro-batch level.
         self._micro_batch_cpu_alpha_splits = get_split_numels(
             self._micro_batch_para_splits[1],
-            config.split_ratio.alpha, num_levels=2
+            config.split_ratio.alpha, self._device_dtype.itemsize, num_levels=2
         )
 
         # How to split the NVMe parameters at micro-batch level.
         self._micro_batch_nvme_alpha_splits = get_split_numels(
             self._micro_batch_para_splits[2],
-            config.split_ratio.alpha, num_levels=2
+            config.split_ratio.alpha, self._device_dtype.itemsize, num_levels=2
         )
         # How to split the NVMe parameters at unit level.
         self._unit_nvme_alpha_splits = [
@@ -141,9 +143,17 @@ class FlexTrainParaCoordinator:
             for split in self._micro_batch_nvme_alpha_splits
         ]
 
+        # The padding numel for NVMe parameters to be page-aligned.
+        # Only the backward NVMe parameters need padding.
+        self._unit_nvme_padding_numel = get_page_aligned_padding_numel(
+            self._unit_nvme_alpha_splits[1], self._device_dtype.itemsize
+        )
         # NVMe group for offloading and reloading a group of data.
         # Here it is used for offloading and reloading the NVMe parameters.
-        self._nvme_group = NVMeGroup(self._unit_nvme_alpha_splits)
+        self._nvme_group = NVMeGroup([
+            self._unit_nvme_alpha_splits[0],
+            self._unit_nvme_alpha_splits[1] + self._unit_nvme_padding_numel
+        ])
 
     @property
     def is_initialized(self):
@@ -175,11 +185,17 @@ class FlexTrainParaCoordinator:
 
     @property
     def _nvme_inflight_paras(self):
-        return self._nvme_prefetch_buffer[0]
+        padding_numel = self._unit_nvme_padding_numel
+        return self._nvme_prefetch_buffer[0][:-padding_numel]
 
     @property
     def _nvme_available_paras(self):
-        return self._nvme_prefetch_buffer[1]
+        padding_numel = self._unit_nvme_padding_numel
+        return self._nvme_prefetch_buffer[1][:-padding_numel]
+
+    @property
+    def _nvme_asyncio_paras(self):
+        return self._nvme_prefetch_buffer[0]
 
     @property
     def nvme_forward_update_paras(self):
@@ -318,7 +334,8 @@ class FlexTrainParaCoordinator:
 
         # Offload the NVMe parameters.
         self._nvme_group.group_offload(
-            FlexTrainDataID(Dtype.PARA, self._curr_unit), temp_nvme_buffer
+            FlexTrainDataID(Dtype.PARA, self._curr_unit),
+            self._nvme_asyncio_paras
         )
 
         # Update the current unit index.
@@ -373,9 +390,9 @@ class FlexTrainParaCoordinator:
         self._inflight_nvme_unit = unit_index
 
         if self.parameter_updated and forward:
-            _, bwd_para = torch.split(
-                self._nvme_inflight_paras, self._unit_nvme_alpha_splits
-            )
+            # If parameters are updated, only load backward NVMe parameters.
+            fwd_numel = self._unit_nvme_alpha_splits[0]
+            bwd_para = self._nvme_asyncio_paras[fwd_numel:]
             # Forward parameters are being copied from optimizer coordinator.
             # Only load backward NVMe parameters.
             self._nvme_group.single_reload(
@@ -386,7 +403,7 @@ class FlexTrainParaCoordinator:
             # Load both forward and backward NVMe parameters.
             self._nvme_group.group_reload(
                 FlexTrainDataID(Dtype.PARA, unit_index),
-                self._nvme_inflight_paras, async_op=True
+                self._nvme_asyncio_paras, async_op=True
             )
 
     def _async_offload_nvme_paras(self, unit_index: int):

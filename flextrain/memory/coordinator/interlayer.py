@@ -66,13 +66,13 @@ class FlexTrainInterLayerCoordinator:
 
         # How to split the checkpoint tensor.
         self._ckpt_numels = get_split_numels(
-            tensor.numel(), config.split_ratio.checkpoint
+            tensor.numel(), config.split_ratio.checkpoint, tensor.itemsize
         )
         # How to split the gradient tensor.
         assert sum(config.split_ratio.gradient) == 1.0, \
             "Gradient split ratio must sum to 1.0."
         self._grad_numels = get_split_numels(
-            tensor.numel(), config.split_ratio.gradient, num_levels=2
+            tensor.numel(), config.split_ratio.gradient, tensor.itemsize, 2
         )
 
         # Allocate memory for GPU checkpoint buffer.

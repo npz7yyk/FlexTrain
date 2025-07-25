@@ -209,8 +209,12 @@ def system_auto_config():
     swapper = get_nvme_swapper()
     swapper.synchronize()
 
-    read_buffer = torch.empty(BENCHMARK_NVME_BLOCK_SIZE, dtype=torch.uint8)
-    write_buffer = torch.empty(BENCHMARK_NVME_BLOCK_SIZE, dtype=torch.uint8)
+    read_buffer = torch.empty(
+        BENCHMARK_NVME_BLOCK_SIZE, dtype=torch.uint8, pin_memory=True
+    )
+    write_buffer = torch.empty(
+        BENCHMARK_NVME_BLOCK_SIZE, dtype=torch.uint8, pin_memory=True
+    )
 
     for i in range(BENCHMARK_NUM_BLOCKS):
         write_buffer += 1
