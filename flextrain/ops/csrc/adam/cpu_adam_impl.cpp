@@ -1,5 +1,4 @@
 // Parts of the code here are adapted from DeepSpeed
-// Mainly about removing useless but expensive cudaStreamSynchronize calls
 //
 // Repository: https://github.com/microsoft/DeepSpeed
 // File: deepspeed/ops/csrc/adam/cpu_adam_impl.cpp
@@ -13,14 +12,6 @@
 #include <type_traits>
 #include <unordered_map>
 #include "cpu_adam.h"
-
-#if defined(__ENABLE_CUDA__)
-#include <cuda_runtime_api.h>
-#include "cublas_v2.h"
-#include "cuda.h"
-#include "curand.h"
-#include "custom_cuda_layers.h"
-#endif
 
 static std::unordered_map<int, std::shared_ptr<void>> s_optimizers;
 
@@ -51,26 +42,15 @@ void Adam_Optimizer::Step_1(float* _params,
 
         float step_size = -1 * _alpha / _bias_correction1;
         float w_decay = -1 * _alpha * _weight_decay;
-        ds_half_precision_t* grads_cast_h;
-        ds_half_precision_t* params_cast_h;
-        if (half_precision) {
-            grads_cast_h = reinterpret_cast<ds_half_precision_t*>(grads);
-            params_cast_h = reinterpret_cast<ds_half_precision_t*>(_params);
-        }
 
         for (size_t t = rounded_size; t < _param_size; t += TILE) {
             size_t copy_size = TILE;
             if ((t + TILE) > _param_size) copy_size = _param_size - t;
             size_t offset = copy_size + t;
-#if defined(__ENABLE_CUDA__) and False  // FlexTrain modifications
-            if ((t / TILE) >= 2) { cudaStreamSynchronize(_streams[_buf_index]); }
-#elif defined(__ENABLE_CANN__)
-            if ((t / TILE) >= 2) { aclrtSynchronizeStream(_streams[_buf_index].stream()); }
-#endif
 #pragma omp parallel for
             for (size_t k = t; k < offset; k++) {
-                float grad = half_precision ? (float)grads_cast_h[k] : grads[k];
-                float param = half_precision ? (float)params_cast_h[k] : _params[k];
+                float grad = grads[k];
+                float param = _params[k];
                 float momentum = _exp_avg[k];
                 float variance = _exp_avg_sq[k];
                 if (_weight_decay > 0 && !_adamw_mode) { grad = param * _weight_decay + grad; }
@@ -86,35 +66,18 @@ void Adam_Optimizer::Step_1(float* _params,
                 grad = momentum / grad;
                 if (_weight_decay > 0 && _adamw_mode) { param += w_decay * param; }
                 param = grad * step_size + param;
-#if defined(__ENABLE_CUDA__) or defined(__ENABLE_CANN__)
-                if (dev_params) _doubled_buffer[_buf_index][k - t] = param;
-#endif
-                if (half_precision)
-                    params_cast_h[k] = (ds_half_precision_t)param;
-                else
-                    _params[k] = param;
+                _params[k] = param;
                 _exp_avg[k] = momentum;
                 _exp_avg_sq[k] = variance;
             }
-#if defined(__ENABLE_CUDA__)
-            if (dev_params) {
-                launch_param_update(
-                    _doubled_buffer[_buf_index], dev_params + t, (copy_size), _streams[_buf_index]);
+        }
 
-                _buf_index = !_buf_index;
-            }
-#elif defined(__ENABLE_CANN__)
-            if (dev_params) {
-                size_t memcpy_size = copy_size * sizeof(_doubled_buffer[_buf_index][0]);
-                aclrtMemcpy(dev_params + t,
-                            memcpy_size,
-                            _doubled_buffer[_buf_index],
-                            memcpy_size,
-                            aclrtMemcpyKind::ACL_MEMCPY_HOST_TO_DEVICE);
-
-                _buf_index = !_buf_index;
-            }
-#endif
+        if (dev_params) {
+            auto remain_dev_params = torch::from_blob(
+                dev_params + rounded_size, {(long)(_param_size - rounded_size)}, torch::kHalf);
+            auto remain_params = torch::from_blob(
+                _params + rounded_size, {(long)(_param_size - rounded_size)}, torch::kFloat32);
+            remain_dev_params.copy_(remain_params, true);
         }
     }
 }
@@ -235,8 +198,6 @@ int ds_adam_step(int optimizer_id,
     auto exp_avg_c = exp_avg.contiguous();
     auto exp_avg_sq_c = exp_avg_sq.contiguous();
 
-    // assert(params.options().dtype() == grads.options().dtype());
-
     float* params_ptr = (float*)params_c.data_ptr();
     float* grads_ptr = (float*)grads_c.data_ptr();
     float* exp_avg_ptr = (float*)exp_avg_c.data_ptr();
@@ -247,6 +208,8 @@ int ds_adam_step(int optimizer_id,
     opt->IncrementStep(step, beta1, beta2);
     opt->update_state(lr, epsilon, weight_decay, bias_correction);
 
+    // FlexTrain modifications: do not allow half precision
+    assert(params.options().dtype() != at::kHalf);
     opt->Step_8(params_ptr,
                 grads_ptr,
                 exp_avg_ptr,
@@ -254,9 +217,6 @@ int ds_adam_step(int optimizer_id,
                 params_c.numel(),
                 nullptr,
                 (params.options().dtype() == at::kHalf));
-
-    // FlexTrain modifications: removed cudaStreamSynchronize
-    // opt->SynchronizeStreams();
 
     return 0;
 }
@@ -275,7 +235,6 @@ int ds_adam_step_plus_copy(int optimizer_id,
                            torch::Tensor& exp_avg_sq,
                            torch::Tensor& device_params)
 {
-#if defined(__ENABLE_CUDA__) or defined(__ENABLE_CANN__)
     auto params_c = params.contiguous();
     auto device_params_c = device_params.contiguous();
     auto exp_avg_c = exp_avg.contiguous();
@@ -292,6 +251,9 @@ int ds_adam_step_plus_copy(int optimizer_id,
         std::static_pointer_cast<Adam_Optimizer>(s_optimizers[optimizer_id]);
     opt->IncrementStep(step, beta1, beta2);
     opt->update_state(lr, epsilon, weight_decay, bias_correction);
+
+    // FlexTrain modifications: do not allow half precision
+    assert(params.options().dtype() != at::kHalf);
     opt->Step_8(params_ptr,
                 grads_ptr,
                 exp_avg_ptr,
@@ -300,10 +262,6 @@ int ds_adam_step_plus_copy(int optimizer_id,
                 device_params_ptr,
                 (params.options().dtype() == at::kHalf));
 
-    opt->SynchronizeStreams();
-#else
-    assert(false);
-#endif
     return 0;
 }
 
