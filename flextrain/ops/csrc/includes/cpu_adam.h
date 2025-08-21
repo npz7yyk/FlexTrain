@@ -72,16 +72,19 @@ public:
             _betta2 = beta2;
             _betta1_t = std::pow(_betta1, step);
             _betta2_t = std::pow(_betta2, step);
+        } else if (_step == step) {
+            // Do nothing.
+            // This is to avoid an inconsistency in _betta1_t and _betta2_t:
+            // Previously, they can be updated by both "*= _betta1, *= _betta2"
+            // and "std::pow(_betta1, step), std::pow(_betta2, step)", which
+            // can cause a small value mismatch at the level of fp32 precision.
+            // However, such discrepancies accumulate over multiple iterations,
+            // leading to different training losses with different FlexTrain alpha values.
+            // Therefore, drop the "*= _betta1, *= _betta2" branch.
         } else {
-            _step++;
-            if (_step != step) {
-                _betta1_t = std::pow(_betta1, step);
-                _betta2_t = std::pow(_betta2, step);
-                _step = step;
-            } else {
-                _betta1_t *= _betta1;
-                _betta2_t *= _betta2;
-            }
+            _step = step;
+            _betta1_t = std::pow(_betta1, step);
+            _betta2_t = std::pow(_betta2, step);
         }
     }
     inline void update_state(float lr, float epsilon, float weight_decay, bool bias_correction)
