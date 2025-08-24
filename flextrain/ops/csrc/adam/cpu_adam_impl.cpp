@@ -35,6 +35,35 @@ void Adam_Optimizer::Step_1(float* _params,
                 _param_size,
                 dev_params,
                 half_precision);
+    if (_param_size > rounded_size) {
+        int tail_size = _param_size - rounded_size;
+        int master_copy_size = tail_size * sizeof(float);
+        int device_copy_size = tail_size * sizeof(ds_half_precision_t);
+
+        memcpy(_tail_params, _params + rounded_size, master_copy_size);
+        memcpy(_tail_grads, grads + rounded_size, master_copy_size);
+        memcpy(_tail_exp_avg, _exp_avg + rounded_size, master_copy_size);
+        memcpy(_tail_exp_avg_sq, _exp_avg_sq + rounded_size, master_copy_size);
+        if (dev_params)
+        memcpy(_tail_dev_params, dev_params + rounded_size, device_copy_size);
+
+        size_t _sink;
+        Step_AVX<1>(&_sink,
+                    _tail_params,
+                    _tail_grads,
+                    _tail_exp_avg,
+                    _tail_exp_avg_sq,
+                    SIMD_WIDTH,
+                    (dev_params? _tail_dev_params : nullptr),
+                    half_precision);
+
+        memcpy(_params + rounded_size, _tail_params, master_copy_size);
+        memcpy(_exp_avg + rounded_size, _tail_exp_avg, master_copy_size);
+        memcpy(_exp_avg_sq + rounded_size, _tail_exp_avg_sq, master_copy_size);
+        if (dev_params)
+        memcpy(dev_params + rounded_size, _tail_dev_params, device_copy_size);
+    }
+    return;
 #endif
     if (_param_size > rounded_size) {
         float betta1_minus1 = 1 - _betta1;

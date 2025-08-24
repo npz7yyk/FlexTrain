@@ -117,6 +117,13 @@ private:
 
     bool _adamw_mode;
 
+#if defined(__AVX512__) or defined(__AVX256__)
+    float _tail_params[SIMD_WIDTH];
+    float _tail_grads[SIMD_WIDTH];
+    float _tail_exp_avg[SIMD_WIDTH];
+    float _tail_exp_avg_sq[SIMD_WIDTH];
+    ds_half_precision_t _tail_dev_params[SIMD_WIDTH];
+#endif
 };
 
 #if defined(__AVX512__) or defined(__AVX256__)
