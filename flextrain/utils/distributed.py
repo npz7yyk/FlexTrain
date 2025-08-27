@@ -75,8 +75,20 @@ def init_distributed(
     _ALL_GATHER_FUNCTION = get_all_gather_function()
     _REDUCE_SCATTER_FUNCTION = get_reduce_scatter_function()
 
+    # Get the number of CPU threads available
+    n_cpu_threads = os.cpu_count()
+    n_cpu_threads = max(1, n_cpu_threads // int(os.getenv("WORLD_SIZE")))
+    # Set the number of CPU threads to use for distributed training
+    # torch.distributed will set OMP_NUM_THREADS to 1 if not set
+    if int(os.getenv("OMP_NUM_THREADS", "0")) <= n_cpu_threads:
+        os.environ["OMP_NUM_THREADS"] = str(n_cpu_threads)
+    if torch.get_num_threads() <= n_cpu_threads:
+        torch.set_num_threads(n_cpu_threads)
+
     rank0_logger.info(
-        f"\n> FlexTrain initializing backend {dist_backend}"
+        f"\n\n> FlexTrain initializing backend {dist_backend}\n"
+        f"  - Number of processes: {os.getenv('WORLD_SIZE')}\n"
+        f"  - OMP_NUM_THREADS per process: {os.getenv('OMP_NUM_THREADS')}\n"
     )
 
     if not torch.distributed.is_initialized():
