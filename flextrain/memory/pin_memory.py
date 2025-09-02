@@ -144,7 +144,7 @@ def allocate_pin_memory_blocks(
                 break
 
             # Allocate one big buffer as int8, pinned memory
-            chunk_buffer = torch.empty(
+            chunk_buffer = torch.zeros(
                 chunk_bytes, dtype=torch.int8, pin_memory=True
             )
 

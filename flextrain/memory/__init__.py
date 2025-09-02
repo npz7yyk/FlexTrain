@@ -275,7 +275,7 @@ def allocate_memory(
     # Determine whether to pin CPU memory.
     pin_memory = (device.type == 'cpu') and numel > 0 and pin_memory
 
-    return torch.empty(
+    return torch.zeros(
         numel, dtype=dtype, device=device, pin_memory=pin_memory
     )
 
