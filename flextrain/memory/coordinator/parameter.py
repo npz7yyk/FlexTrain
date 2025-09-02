@@ -96,6 +96,14 @@ class FlexTrainParaCoordinator:
     def _config_para_partition(self, parameters: Iterable[Parameter]):
         # Get the configuration.
         config = get_flextrain_config()
+        assert config.split_ratio.parameter[0] == 0, (
+            "GPU parameter support is dropped in FlexTrain, "
+            "please set split_ratio.parameter[0] to 0."
+        )
+        assert config.split_ratio.alpha[0] <= 0.5, (
+            f"FlexTrain only supports alpha <= 0.5, "
+            f"but got {config.split_ratio.alpha[0]}."
+        )
 
         # The original numel of the parameters in a unit.
         self._original_unit_numel = sum(p.numel() for p in parameters)
