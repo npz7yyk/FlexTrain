@@ -97,7 +97,8 @@ def init_distributed(
             timeout=timeout,
             init_method=init_method,
             rank=rank,
-            world_size=world_size
+            world_size=world_size,
+            device_id=int(os.getenv("LOCAL_RANK"))
         )
 
     # FlexTrain currently only supports single-node training
@@ -150,7 +151,7 @@ def barrier(group=None):
     _info_not_initialized()
     if is_single_process():
         return DummyHandle()
-    return torch.distributed.barrier(group)
+    return torch.distributed.barrier(group, device_ids=_LOCAL_RANK)
 
 
 def print_rank0(*args, **kwargs):
