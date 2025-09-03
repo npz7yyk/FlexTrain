@@ -49,11 +49,11 @@ class GreedySnakeBlockScheduler:
                     self._in_forward = True
                     break
 
-    def _generate_task(self, cur_task_num, force_forward=False):
+    def _generate_task(self, cur_task_num):
         # Calculate the current unit
         cur_unit = cur_task_num // self._num_micro_batch
         is_forwarding = cur_unit < self._num_unit - 1
-        if not is_forwarding and not force_forward:
+        if not is_forwarding:
             cur_unit = 2 * self._num_unit - 2 - cur_unit
 
         # Calculate the current micro batch
@@ -88,6 +88,3 @@ class GreedySnakeBlockScheduler:
             return self._generate_task(0)
         else:
             return self._generate_task(self.cur_task_num + 1)
-
-    def kth_next_forward_task(self, k):
-        return self._generate_task(self.cur_task_num + k, True)
