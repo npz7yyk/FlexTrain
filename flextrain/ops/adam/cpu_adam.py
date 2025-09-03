@@ -107,7 +107,8 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
 
     def _step(
         self, group_args: Dict,
-        parameter: Tensor, gradient: Tensor, *optimizer_states: Tensor
+        half_parameter: Tensor | None, full_parameter: Tensor,
+        gradient: Tensor, *optimizer_states: Tensor
     ):
         # Ensure that the step key is present in the group arguments
         assert STEP_KEY in group_args, \
@@ -115,10 +116,20 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
         # Set default values for the group arguments if not present
         self._set_defaults_args(group_args)
         # Perform the Adam update
-        self.cpu_adam.adam_update(
-            self.opt_id, group_args["step"], group_args["lr"],
-            *group_args["betas"], group_args["eps"],
-            group_args["weight_decay"], group_args["bias_correction"],
-            parameter.data, gradient.data,
-            optimizer_states[0].data, optimizer_states[1].data
-        )
+        if half_parameter is None:
+            self.cpu_adam.adam_update(
+                self.opt_id, group_args["step"], group_args["lr"],
+                *group_args["betas"], group_args["eps"],
+                group_args["weight_decay"], group_args["bias_correction"],
+                full_parameter.data, gradient.data,
+                optimizer_states[0].data, optimizer_states[1].data
+            )
+        else:
+            self.cpu_adam.adam_update_copy(
+                self.opt_id, group_args["step"], group_args["lr"],
+                *group_args["betas"], group_args["eps"],
+                group_args["weight_decay"], group_args["bias_correction"],
+                full_parameter.data, gradient.data,
+                optimizer_states[0].data, optimizer_states[1].data,
+                half_parameter.data
+            )

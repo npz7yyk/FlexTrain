@@ -148,7 +148,7 @@ class ContiguousParaGroup:
         paras: Iterable[Parameter],
         param_grouping_mask: Iterable[int] = None
     ):
-        # Coalesce the parameters with the potential grouping mask.
+        # Coalesce the parameters based on parameter groups.
         param_groups = defaultdict(list)
         for mask, para in zip(param_grouping_mask, paras):
             param_groups[mask].append(para)

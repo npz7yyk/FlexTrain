@@ -18,18 +18,17 @@ class FlexTrainAdam(FlexTrainOptimizer):
         amsgrad=False,
         adamw_mode=True
     ):
-        # 1. Group the parameters and their arguments.
-        #    Initialize the optimizer coordinator.
-        super().__init__(
-            param_groups=param_groups,
-            optimizer_class=FlexTrainCPUAdam,
-            optimizer_args=dict(
-                lr=lr,
-                bias_correction=bias_correction,
-                betas=betas,
-                eps=eps,
-                weight_decay=weight_decay,
-                amsgrad=amsgrad,
-                adamw_mode=adamw_mode
-            )
+        # 1. Initialize the CPU Adam optimizer.
+        self.cpu_optimizer = FlexTrainCPUAdam(
+            lr=lr,
+            bias_correction=bias_correction,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            amsgrad=amsgrad,
+            adamw_mode=adamw_mode
         )
+
+        # 2. Group the parameters and their arguments.
+        #    Initialize the optimizer coordinator.
+        super().__init__(param_groups=param_groups)

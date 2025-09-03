@@ -206,6 +206,9 @@ class FlexTrainEngine(object):
             task.unit, task.micro_batch, retrieve_tensor(passed_down)
         )
 
+        # Execute CPU optimizer step
+        self.opts_coordinator.post_micro_batch_forward(task)
+
     @torch.enable_grad()
     def _conduct_last_unit(self, task: LLMTask):
         config = get_flextrain_config()
@@ -318,7 +321,7 @@ class FlexTrainEngine(object):
             task.unit - 1, task.micro_batch, retrieve_tensor(passed_back)
         ) if not scheduler.in_first_unit else None
 
-        # Conduct gradient accumulation
+        # Execute gradient accumulation and CPU optimizer step
         self.opts_coordinator.post_micro_batch_backward(task)
 
     def override_loss_scale(self, loss_scale: float):
@@ -347,8 +350,8 @@ class FlexTrainEngine(object):
         self.delayed_functions.append(func)
 
     def _update_engine(self):
-        # Update the optimizer state for the backward pass
-        self.optimizer.update_state()
+        # Update the optimizer states for the backward pass
+        self.optimizer.update_states()
 
         # Conduct delayed tasks
         for func in self.delayed_functions:
