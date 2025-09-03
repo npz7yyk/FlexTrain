@@ -195,12 +195,18 @@ class FlexTrainParaCoordinator:
     @property
     def _nvme_inflight_paras(self):
         padding_numel = self._unit_nvme_padding_numel
-        return self._nvme_prefetch_buffer[0][:-padding_numel]
+        if padding_numel:
+            return self._nvme_prefetch_buffer[0][:-padding_numel]
+        else:
+            return self._nvme_prefetch_buffer[0]
 
     @property
     def _nvme_available_paras(self):
         padding_numel = self._unit_nvme_padding_numel
-        return self._nvme_prefetch_buffer[1][:-padding_numel]
+        if padding_numel:
+            return self._nvme_prefetch_buffer[1][:-padding_numel]
+        else:
+            return self._nvme_prefetch_buffer[1]
 
     @property
     def _nvme_asyncio_paras(self):

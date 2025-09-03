@@ -77,7 +77,10 @@ class FlexTrainOptsCoordinator:
     @property
     def _nvme_para_receive_buffer(self):
         padding_numel = self._para._unit_nvme_padding_numel
-        return self._nvme_para_buffers[0][:-padding_numel]
+        if padding_numel:
+            return self._nvme_para_buffers[0][:-padding_numel]
+        else:
+            return self._nvme_para_buffers[0]
 
     @property
     def _nvme_para_offload_buffer(self):
