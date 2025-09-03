@@ -315,24 +315,31 @@ def get_allocated_vram_size():
     return _ALLOCATED_VRAM_SIZE
 
 
-def align_numel(original_numel: int, align_size: int):
+def _get_aligned_numel(original_numel: int, align_size: int):
     return (original_numel + align_size - 1) // align_size * align_size
+
+
+_PAGE_SIZE = 4096
+
+
+def get_partition_aligned_numel(numel: int, partition: int, itemsize: int):
+    return _get_aligned_numel(numel, partition * _PAGE_SIZE // itemsize)
 
 
 def get_page_aligned_numel(
     numel: int,
     itemsize: int,
-    alignment_bytes: int = 4096
+    alignment_bytes: int = _PAGE_SIZE
 ):
     alignment_numel = alignment_bytes // itemsize
-    aligned_numel = align_numel(numel, alignment_numel)
+    aligned_numel = _get_aligned_numel(numel, alignment_numel)
     return aligned_numel
 
 
 def get_page_aligned_padding_numel(
     numel: int,
     itemsize: int,
-    alignment_bytes: int = 4096
+    alignment_bytes: int = _PAGE_SIZE
 ):
     return get_page_aligned_numel(numel, itemsize, alignment_bytes) - numel
 

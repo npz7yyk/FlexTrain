@@ -10,7 +10,7 @@ from flextrain.memory import (
     FlexTrainDataType as Dtype,
     FlexTrainDataID,
     ContiguousParaGroup,
-    align_numel,
+    get_partition_aligned_numel,
     get_page_aligned_padding_numel,
     get_split_numels,
     move_into_contiguous,
@@ -114,8 +114,9 @@ class FlexTrainParaCoordinator:
         self._num_micro_batches = num_micro_batches
 
         # The aligned numel of the parameters in a unit.
-        self._aligned_unit_numel = align_numel(
-            self._original_unit_numel, self._num_micro_batches
+        self._aligned_unit_numel = get_partition_aligned_numel(
+            self._original_unit_numel,
+            self._num_micro_batches, self._device_dtype.itemsize
         )
         # The aligned numel of the parameters prepared in a micro-batch.
         assert self._aligned_unit_numel % self._num_micro_batches == 0
