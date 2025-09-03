@@ -237,14 +237,11 @@ class FusedHandle(Waitable):
             handle.wait()
 
 
-T = TypeVar('T')
-
-
-class RotateContainer(Generic[T]):
+class RotateContainer:
     def __init__(self, items: Tuple):
         self._items = deque(items)
 
-    def __getitem__(self, index: SupportsIndex) -> T:
+    def __getitem__(self, index: SupportsIndex):
         return self._items[index]
 
     def rotate(self):
