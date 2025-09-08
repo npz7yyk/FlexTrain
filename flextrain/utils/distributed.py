@@ -79,16 +79,19 @@ def init_distributed(
     n_cpu_threads = os.cpu_count()
     n_cpu_threads = max(1, n_cpu_threads // int(os.getenv("WORLD_SIZE")))
     # Set the number of CPU threads to use for distributed training
-    # torch.distributed will set OMP_NUM_THREADS to 1 if not set
-    if int(os.getenv("OMP_NUM_THREADS", "0")) <= n_cpu_threads:
+    # Because torch.distributed will set OMP_NUM_THREADS to 1 if not set
+    # Ensure WORLD_SIZE > 1 to avoid using multiple CPU sockets
+    if int(os.getenv("OMP_NUM_THREADS", "0")) <= n_cpu_threads \
+            and int(os.getenv("WORLD_SIZE")) > 1:
         os.environ["OMP_NUM_THREADS"] = str(n_cpu_threads)
-    if torch.get_num_threads() <= n_cpu_threads:
+    if torch.get_num_threads() <= n_cpu_threads \
+            and int(os.getenv("WORLD_SIZE")) > 1:
         torch.set_num_threads(n_cpu_threads)
 
     rank0_logger.info(
         f"\n\n> FlexTrain initializing backend {dist_backend}\n"
         f"  - Number of processes: {os.getenv('WORLD_SIZE')}\n"
-        f"  - OMP_NUM_THREADS per process: {os.getenv('OMP_NUM_THREADS')}\n"
+        f"  - OMP_NUM_THREADS per process: {n_cpu_threads}\n"
     )
 
     if not torch.distributed.is_initialized():
