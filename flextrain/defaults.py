@@ -62,7 +62,7 @@ BENCHMARK_PCIE_ITERATIONS = 200
 BENCHMARK_NVME_ITERATIONS = 50
 
 # Number of iterations to run CPU related benchmarks
-BENCHMARK_CPU_ITERATIONS = 50
+BENCHMARK_CPU_ITERATIONS = 100
 
 # Size of the data blocks to test for PCIe throughput
 BENCHMARK_PCIE_BLOCK_SIZE = 2 ** 30
@@ -82,7 +82,7 @@ BENCHMARK_NUM_BLOCKS = 16
 # # --- Auto-config configuration defaults ---
 
 # Ratio of the accessible GPU memory to the total GPU memory
-ACCESSIBLE_GPU_MEMORY_RATIO = 0.95
+ACCESSIBLE_GPU_MEMORY_RATIO = 0.99
 
 # Ratio of the accessible CPU memory to the total CPU memory
 ACCESSIBLE_CPU_MEMORY_RATIO = 0.95

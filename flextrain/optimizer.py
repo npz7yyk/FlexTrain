@@ -73,11 +73,14 @@ class FlexTrainCPUOptimizer(ABC):
         self, numel: int, device_dtype: torch.dtype, master_dtype: torch.dtype
     ):
         # Initialize the optimizer states.
-        if not hasattr(self, "_parameter"):
+        if not hasattr(self, "_param_group"):
             self._param_group = {STEP_KEY: 0}
-            self._half_parameter = torch.randn(numel, dtype=device_dtype)
-            self._full_parameter = torch.randn(numel, dtype=master_dtype)
-            self._gradient = torch.randn(numel, dtype=master_dtype)
+            self._half_parameter = \
+                torch.empty(numel, dtype=device_dtype).pin_memory()
+            self._full_parameter = \
+                torch.randn(numel, dtype=master_dtype).pin_memory()
+            self._gradient = \
+                torch.randn(numel, dtype=master_dtype).pin_memory()
             self._optimizer_states = \
                 self._init_optimizer_states(numel, master_dtype)
 

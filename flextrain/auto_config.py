@@ -176,6 +176,7 @@ def system_auto_config():
 
     # 2. Benchmark the PCIe bandwidth
     pcie_times = []
+    torch.cuda.empty_cache()
     read_buffer = torch.empty(
         BENCHMARK_PCIE_BLOCK_SIZE, dtype=torch.uint8, pin_memory=True
     )
@@ -205,52 +206,67 @@ def system_auto_config():
     pcie_bandwidth = BENCHMARK_PCIE_BLOCK_SIZE / avg_pcie
 
     # 3. Benchmark the NVMe swapper
-    swap_times = []
+    read_times, write_times = [], []
     swapper = get_nvme_swapper()
     swapper.synchronize()
-
     read_buffer = torch.empty(
         BENCHMARK_NVME_BLOCK_SIZE, dtype=torch.uint8, pin_memory=True
     )
     write_buffer = torch.empty(
         BENCHMARK_NVME_BLOCK_SIZE, dtype=torch.uint8, pin_memory=True
     )
-
     for i in range(BENCHMARK_NUM_BLOCKS):
         write_buffer += 1
         swapper.swap_out(
             FlexTrainDataID(FlexTrainDataType.PARA, i), write_buffer
         )
 
-    # Benchmark the overlap swap
+    # Benchmark the NVMe read bandwidth
     iterations = tqdm(
-        range(BENCHMARK_NVME_ITERATIONS), desc="NVMe Read-Write Benchmarking"
+        range(BENCHMARK_NVME_ITERATIONS), desc="NVMe Read Benchmarking"
     ) if dist.get_rank() == 0 else range(BENCHMARK_NVME_ITERATIONS)
     for i in iterations:
-        read_index = (i + 1) % BENCHMARK_NUM_BLOCKS
-        write_index = i % BENCHMARK_NUM_BLOCKS
+        read_index = i % BENCHMARK_NUM_BLOCKS
         overlap_start = time.time()
         swapper.swap_in(
             FlexTrainDataID(FlexTrainDataType.PARA, read_index),
             read_buffer, async_op=True
         )
+        swapper.synchronize()
+        overlap_end = time.time()
+        read_times.append(overlap_end - overlap_start)
+    # Compute the average time
+    avg_read_time = _world_20_80_percentile_avg(read_times)
+    # Compute the bandwidth
+    avg_read_bandwidth = BENCHMARK_NVME_BLOCK_SIZE / avg_read_time
+
+    # Benchmark the NVMe write bandwidth
+    iterations = tqdm(
+        range(BENCHMARK_NVME_ITERATIONS), desc="NVMe Write Benchmarking"
+    ) if dist.get_rank() == 0 else range(BENCHMARK_NVME_ITERATIONS)
+    for i in iterations:
+        write_index = i % BENCHMARK_NUM_BLOCKS
+        overlap_start = time.time()
         swapper.swap_out(
             FlexTrainDataID(FlexTrainDataType.PARA, write_index),
             write_buffer, async_op=True
         )
         swapper.synchronize()
         overlap_end = time.time()
-        swap_times.append(overlap_end - overlap_start)
-
+        write_times.append(overlap_end - overlap_start)
     # Compute the average time
-    avg_swap_time = _world_20_80_percentile_avg(swap_times)
+    avg_write_time = _world_20_80_percentile_avg(write_times)
     # Compute the bandwidth
-    avg_swap_bandwidth = 2 * BENCHMARK_NVME_BLOCK_SIZE / avg_swap_time
-    nvme_swap = _to_gb(avg_swap_bandwidth)
+    avg_write_bandwidth = BENCHMARK_NVME_BLOCK_SIZE / avg_write_time
+
+    # Report the average bandwidth
+    nvme_read = _to_gb(avg_read_bandwidth)
+    nvme_write = _to_gb(avg_write_bandwidth)
     world_size = dist.get_world_size()
     dist.rank0_logger.info(
         "\n\n> FlexTrain NVMe swapper benchmarking results:\n"
-        f"  - Average swap bandwidth: {world_size} x {nvme_swap:.3f} GB/s\n"
+        f"  - Average read bandwidth: {world_size} x {nvme_read:.3f} GB/s\n"
+        f"  - Average write bandwidth: {world_size} x {nvme_write:.3f} GB/s\n"
     )
 
     # 4. Benchmark the optimizer step throughput
@@ -258,7 +274,8 @@ def system_auto_config():
     # Initialize the optimizer states
     cpu_optimizer.profile_step(
         BENCHMARK_OPTIMIZER_BLOCK_SIZE,
-        dtype=get_flextrain_config().mixed_precision.master_dtype
+        device_dtype=get_flextrain_config().mixed_precision.device_dtype,
+        master_dtype=get_flextrain_config().mixed_precision.master_dtype
     )
     # TEMPORARY: use opt_state_per_element to estimate the memory usage
     opt_state_per_element = sum(
@@ -274,7 +291,8 @@ def system_auto_config():
         opt_step_start = time.time()
         cpu_optimizer.profile_step(
             BENCHMARK_OPTIMIZER_BLOCK_SIZE,
-            dtype=get_flextrain_config().mixed_precision.master_dtype
+            device_dtype=get_flextrain_config().mixed_precision.device_dtype,
+            master_dtype=get_flextrain_config().mixed_precision.master_dtype
         )
         opt_step_end = time.time()
         step_times.append(opt_step_end - opt_step_start)
@@ -304,7 +322,8 @@ def system_auto_config():
         layer_numel=get_para_coordinator().unit_numel,
         interlayer_numel=get_interlayer_coordinator()._tensor_numel,
         pcie_bandwidth=pcie_bandwidth,
-        nvme_swap_bandwidth=avg_swap_bandwidth * world_size,
+        nvme_read_bandwidth=avg_read_bandwidth * world_size,
+        nvme_write_bandwidth=avg_write_bandwidth * world_size,
         opt_step_throughput=step_throughput
     )
 
@@ -340,7 +359,8 @@ class MachinePerfParams:
 
     # Bandwidth in B/s
     pcie_bandwidth: float
-    nvme_swap_bandwidth: float
+    nvme_read_bandwidth: float
+    nvme_write_bandwidth: float
 
     # Throughput in element/s
     opt_step_throughput: float
@@ -550,9 +570,9 @@ class FlexTrainConfigSolver:
         world_cpu_opt_grad_buffer = \
             max(alpha, 1 - alpha) * self.mpp.layer_numel * 2 * \
             master_element_size
-        world_cpu_opt_work_buffer = \
+        world_nvme_opts_buffer = \
             max(alpha, 1 - alpha) * self.mpp.layer_numel * 3 * \
-            (self.mpp.opt_state_per_element * self.nvme_opts + 1) * \
+            (self.mpp.opt_state_per_element + 1) * self.nvme_opts * \
             master_element_size
         world_nvme_para_update_buffer = \
             self.nvme_para * (1 - alpha) * self.mpp.layer_numel * 2 * \
@@ -565,7 +585,7 @@ class FlexTrainConfigSolver:
                 rank_nvme_ckpt_margin_base + rank_nvme_ckpt_prefetch_buffer
             ) + world_cpu_para_base + world_nvme_para_prefetch_buffer + \
             world_cpu_opts_base + world_cpu_opt_grad_buffer + \
-            world_cpu_opt_work_buffer + world_nvme_para_update_buffer <= \
+            world_nvme_opts_buffer + world_nvme_para_update_buffer <= \
             self.mpp.usable_dram, \
             "CPU memory constraint"
 
@@ -630,17 +650,16 @@ class FlexTrainConfigSolver:
             master_element_size * (self.mpp.opt_state_per_element + 1)
 
         # 2. NVMe bandwidth (due to SSD's design, we add each operation)
-        #    Attention: each process DOES share the same NVMe bandwidth
         self.problem += \
             (
                 (1 - alpha) * world_nvme_para +
                 alpha * world_nvme_opts
-            ) / self.mpp.nvme_swap_bandwidth + \
+            ) / self.mpp.nvme_read_bandwidth + \
             (
                 rank_nvme_ckpt * self.world_size +
                 alpha * world_nvme_para +
                 alpha * world_nvme_opts
-            ) / self.mpp.nvme_swap_bandwidth <= self.unit_fwd_time, \
+            ) / self.mpp.nvme_write_bandwidth <= self.unit_fwd_time, \
             "Forward NVMe bandwidth constraint"
 
         self.problem += \
@@ -648,9 +667,9 @@ class FlexTrainConfigSolver:
                 rank_nvme_ckpt * self.world_size +
                 world_nvme_para +
                 (1 - alpha) * world_nvme_opts
-            ) / self.mpp.nvme_swap_bandwidth + \
+            ) / self.mpp.nvme_read_bandwidth + \
             (
                 (1 - alpha) * world_nvme_para +
                 (1 - alpha) * world_nvme_opts
-            ) / self.mpp.nvme_swap_bandwidth <= self.unit_bwd_time, \
+            ) / self.mpp.nvme_write_bandwidth <= self.unit_bwd_time, \
             "Backward NVMe bandwidth constraint"

@@ -103,7 +103,7 @@ class FlexTrainCPUAdam(FlexTrainCPUOptimizer):
 
     def _init_optimizer_states(self, numel: int, dtype: torch.dtype):
         # Create exp_avg and exp_avg_sq
-        return [torch.zeros(numel, dtype=dtype) for _ in range(2)]
+        return [torch.zeros(numel, dtype=dtype).pin_memory() for _ in range(2)]
 
     def _step(
         self, group_args: Dict,
