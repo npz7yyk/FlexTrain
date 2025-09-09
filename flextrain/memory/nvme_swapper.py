@@ -2,7 +2,7 @@ import os
 import torch
 
 from torch import Tensor
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, List
 
 from flextrain.config import get_flextrain_config
 from flextrain.memory import FlexTrainDataID, Waitable
@@ -11,12 +11,12 @@ from flextrain.ops.aio import AsyncIOBuilder
 
 def swap_in_tensors(swap_handle, tensor_buffers, swap_paths):
     for buffer, path in zip(tensor_buffers, swap_paths):
-        assert (swap_handle.async_pread(buffer, path) == 0)
+        assert (swap_handle.async_pread(buffer, path, 0) == 0)
 
 
 def swap_out_tensors(swap_handle, tensor_buffers, swap_paths):
     for buffer, path in zip(tensor_buffers, swap_paths):
-        assert (swap_handle.async_pwrite(buffer, path) == 0)
+        assert (swap_handle.async_pwrite(buffer, path, 0) == 0)
 
 
 def _filter_tensors(
@@ -28,8 +28,8 @@ def _filter_tensors(
     if isinstance(tensors, Tensor):
         tensors = [tensors]
 
-    non_empty_data_ids = []
-    non_empty_tensors = []
+    non_empty_data_ids: List[FlexTrainDataID] = []
+    non_empty_tensors: List[Tensor] = []
     for data_id, tensor in zip(data_ids, tensors):
         if tensor.numel() == 0:
             continue
@@ -62,18 +62,18 @@ class AsyncNVMeSwapper:
         # Create the aio read and write handles.
         aio_handle = AsyncIOBuilder().load().aio_handle
         self._aio_read_handle: Waitable = aio_handle(
-            nvme_swap_config.aio_block_size,
-            nvme_swap_config.aio_queue_depth,
-            nvme_swap_config.aio_thread_count,
-            nvme_swap_config.aio_single_submit,
-            nvme_swap_config.aio_overlap_events
+            block_size=nvme_swap_config.aio_block_size,
+            queue_depth=nvme_swap_config.aio_queue_depth,
+            single_submit=nvme_swap_config.aio_single_submit,
+            overlap_events=nvme_swap_config.aio_overlap_events,
+            intra_op_parallelism=nvme_swap_config.aio_thread_count
         )
         self._aio_write_handle: Waitable = aio_handle(
-            nvme_swap_config.aio_block_size,
-            nvme_swap_config.aio_queue_depth,
-            nvme_swap_config.aio_thread_count,
-            nvme_swap_config.aio_single_submit,
-            nvme_swap_config.aio_overlap_events
+            block_size=nvme_swap_config.aio_block_size,
+            queue_depth=nvme_swap_config.aio_queue_depth,
+            single_submit=nvme_swap_config.aio_single_submit,
+            overlap_events=nvme_swap_config.aio_overlap_events,
+            intra_op_parallelism=nvme_swap_config.aio_thread_count
         )
 
         # Numbers of inflight read and write handles.
@@ -150,11 +150,11 @@ class AsyncNVMeSwapper:
             return
         # Synchronize inflight read tasks if needed.
         if self._inflight_read_tasks:
-            self._aio_read_handle.wait() == self._inflight_read_tasks
+            assert self._aio_read_handle.wait() == self._inflight_read_tasks
             self._inflight_read_tasks = 0
         # Synchronize inflight write tasks if needed.
         if self._inflight_write_tasks:
-            self._aio_write_handle.wait() == self._inflight_write_tasks
+            assert self._aio_write_handle.wait() == self._inflight_write_tasks
             self._inflight_write_tasks = 0
 
 
