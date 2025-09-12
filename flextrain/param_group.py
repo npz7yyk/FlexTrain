@@ -370,7 +370,8 @@ class StepContextContainer(Sequence[List[StepContext]]):
         num_partitions: int,
         group_segments: List[GroupSegment],
         device_param_numels: List[int],
-        master_param_numels: List[int]
+        master_param_numels: List[int],
+        gradient_numels: List[int]
     ):
         # Merge the segments to ensure continuity
         group_segments = merge_segments(group_segments, is_remapping=True)
@@ -385,6 +386,7 @@ class StepContextContainer(Sequence[List[StepContext]]):
         total_numel = group_segments[-1].end
         assert sum(device_param_numels) == total_numel
         assert sum(master_param_numels) == total_numel
+        assert sum(gradient_numels) == total_numel
         assert total_numel % num_partitions == 0
 
         # Slice the segments into even parts
@@ -392,20 +394,22 @@ class StepContextContainer(Sequence[List[StepContext]]):
         pg_slice_plan = [gs.end - gs.start for gs in group_segments]
         dp_slice_plan = device_param_numels
         mp_slice_plan = master_param_numels
+        gd_slice_plan = gradient_numels
         self._merged_plan = merge_slice_plans(
-            ep_slice_plan, pg_slice_plan, dp_slice_plan, mp_slice_plan
+            ep_slice_plan, pg_slice_plan,
+            dp_slice_plan, mp_slice_plan, gd_slice_plan
         )
 
         # Create the split plans for each tensor
         self._ep_slice_plan = ep_slice_plan
+        self._group_segments: List[GroupSegment] = \
+            flatten_list(slice_segments(group_segments, self._merged_plan))
         self._half_paremter_splits = \
             create_tensor_split_plans(device_param_numels, self._merged_plan)
         self._full_parameter_splits = \
             create_tensor_split_plans(master_param_numels, self._merged_plan)
         self._gradient_splits = \
-            create_tensor_split_plans(ep_slice_plan, self._merged_plan)
-        self._group_segments: List[GroupSegment] = \
-            flatten_list(slice_segments(group_segments, self._merged_plan))
+            create_tensor_split_plans(gradient_numels, self._merged_plan)
 
         # Grouped step contexts
         self._grouped_step_contexts: List[List[StepContext]] = []

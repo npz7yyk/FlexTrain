@@ -229,18 +229,13 @@ class FlexTrainParaCoordinator:
         return self._is_invalid_unit(unit_index) or \
             self._is_invalid_micro_batch(micro_batch_index)
 
-    def _link_unit_parameters(
-        self,
-        unit_index: int,
-        buffer: Tensor
-    ):
+    def _link_unit_parameters(self, unit_index: int):
         """
-        Link the parameters in the unit to the buffer.
+        Link the parameters in the unit to the GPU working buffer.
         We assume that data is reconstructed (or being) in the buffer.
 
         Args:
             unit_index (int): Index of the unit.
-            buffer (Tensor): Buffer to link the parameters.
 
         Returns:
             None
@@ -253,7 +248,7 @@ class FlexTrainParaCoordinator:
         unit_paras = self._unit_parameters[unit_index]
 
         # Link the parameters.
-        unit_paras.link_para_to(buffer)
+        unit_paras.link_para_to(self._gpu_available_paras)
 
     def _detach_unit_parameters(self, unit_index: int):
         """
@@ -606,7 +601,7 @@ class FlexTrainParaCoordinator:
         self._async_offload_nvme_paras(unit_index + 1)
 
         # Link the parameters to the unit.
-        self._link_unit_parameters(unit_index, self._gpu_available_paras)
+        self._link_unit_parameters(unit_index)
 
     def pre_unit_backward(self, unit_index: int):
         """
@@ -644,7 +639,7 @@ class FlexTrainParaCoordinator:
         self._async_load_nvme_paras(unit_index - 2, forward=False)
 
         # Link the parameters to the unit.
-        self._link_unit_parameters(unit_index, self._gpu_available_paras)
+        self._link_unit_parameters(unit_index)
 
     def warmup_forward_pipeline(self):
         # If parameters are updated, warm-up will be managed by optimizer.

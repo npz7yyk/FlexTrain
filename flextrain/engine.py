@@ -69,8 +69,7 @@ class FlexTrainEngine(object):
 
         # Create computation scheduler
         self.scheduler = GreedySnakeBlockScheduler(
-            self.micro_batch_per_batch,
-            self.num_units
+            self.micro_batch_per_batch, self.num_units
         )
 
         # Link / Create loss scaler

@@ -146,7 +146,6 @@ class FlexTrainOptsCoordinator:
         self._alpha = config.split_ratio.alpha[0]
         self._unit_numel = para._aligned_unit_numel
         self._micro_batch_per_rank = para._micro_batch_per_rank
-        num_micro_batches = self._micro_batch_per_rank * dist.get_world_size()
 
         mb_gpu_alpha_splits = para._micro_batch_gpu_alpha_splits
         mb_cpu_alpha_splits = para._micro_batch_cpu_alpha_splits
@@ -174,40 +173,7 @@ class FlexTrainOptsCoordinator:
             self._unit_bwd_numel, opts_cpu_nvme_ratio, master_dtype.itemsize, 2
         )
 
-        # 2. Create optimizer step contexts for each unit.
-        self._unit_fwd_step_ctxts: Dict[int, StepContextContainer] = {}
-        self._unit_bwd_step_ctxts: Dict[int, StepContextContainer] = {}
-        unit_slices = self._mb_para_splits * num_micro_batches
-        for unit in range(self._num_units):
-            # Slice the segments for each unit.
-            segment_groups = slice_segments(
-                self._optimizer.unit_group_segments[unit], unit_slices
-            )
-            # micro_batch, rank, (GPU, CPU, NVMe), (fwd, bwd)
-            segment_groups = reshape_list(
-                segment_groups,
-                (self._micro_batch_per_rank, dist.get_world_size(), 3, 2)
-            )
-            # layout: mb * (GPU, CPU, NVMe)
-            fwd_segments = segment_groups[:, dist.get_rank(), :, 0]
-            fwd_segments = flatten_list(fwd_segments.tolist())
-            self._unit_fwd_step_ctxts[unit] = StepContextContainer(
-                self._micro_batch_per_rank, fwd_segments,
-                self._mb_fwd_para_splits * self._micro_batch_per_rank,
-                self._unit_fwd_mpara_splits
-            )
-            # layout: mb * (GPU, CPU, NVMe)
-            bwd_segments = segment_groups[:, dist.get_rank(), :, 1]
-            bwd_segments = flatten_list(bwd_segments.tolist())
-            self._unit_bwd_step_ctxts[unit] = StepContextContainer(
-                self._micro_batch_per_rank, bwd_segments,
-                self._mb_bwd_para_splits * self._micro_batch_per_rank,
-                self._unit_bwd_mpara_splits
-            )
-
-        # End of slice configuration and step context creation.
-
-        # 3. Allocate memory for the optimizer.
+        # 2. Allocate memory for the optimizer.
         # Used for accumulating / transferring backward gradients.
         self._gpu_bwd_grad_buffers = RotateContainer(allocate_memory_chunks(
             self._unit_numel, 2, gradacc_dtype, torch.cuda.current_device()
@@ -270,7 +236,7 @@ class FlexTrainOptsCoordinator:
 
         # End of memory allocation.
 
-        # 4. Initialize master parameters from device parameters.
+        # 3. Initialize master parameters from device parameters.
         gpu_base = para._gpu_para_base
         cpu_base = para._cpu_para_base
         nvme_mem = para._nvme_inflight_paras
@@ -398,9 +364,11 @@ class FlexTrainOptsCoordinator:
         assert interlayer.is_initialized, \
             "Interlayer coordinator must be initialized."
 
-        # Figure out the numel each buffer can hold.
-        cpu_grad_buffer_numel = interlayer._ckpt_numels[1]
-        gpu_grad_buffer_numel = interlayer._ckpt_numels[0]
+        # Figure out the borrowable numel from each buffer.
+        # The whole checkpoint buffer is borrowable.
+        ckpt_buffer_numel = interlayer._ckpt_numels[1]
+        # Only the forward part of the parameter buffer is borrowable.
+        para_buffer_numel = para._micro_batch_cpu_alpha_splits[0]
 
         # Total forward gradient numel.
         forward_grad_numel = self._mb_fwd_numel
@@ -412,28 +380,26 @@ class FlexTrainOptsCoordinator:
         ratio = gradacc_itemsize // device_itemsize
 
         # Assign memory buffers and update plans.
-        # cvtd = converted
-        cvtd_cpu_grad_buffer_numel = cpu_grad_buffer_numel // ratio
-        cvtd_gpu_grad_buffer_numel = gpu_grad_buffer_numel // ratio
-        numels = [cvtd_cpu_grad_buffer_numel, cvtd_gpu_grad_buffer_numel]
-        # GPU buffers are no longer used
-        assert cvtd_gpu_grad_buffer_numel == 0
-
-        if forward_grad_numel <= sum(numels[:1]):
-            cpu_buffer_needed_numel = forward_grad_numel - sum(numels[:0])
-            gpu_buffer_needed_numel = 0
-        elif forward_grad_numel <= sum(numels[:2]):
-            cpu_buffer_needed_numel = cvtd_cpu_grad_buffer_numel
-            gpu_buffer_needed_numel = forward_grad_numel - sum(numels[:1])
+        ckpt_buffer_numel = ckpt_buffer_numel // ratio
+        para_buffer_numel = para_buffer_numel // ratio
+        if forward_grad_numel <= ckpt_buffer_numel:
+            ckpt_buffer_needed_numel = forward_grad_numel
+            para_buffer_needed_numel = 0
+        elif forward_grad_numel <= ckpt_buffer_numel + para_buffer_numel:
+            ckpt_buffer_needed_numel = ckpt_buffer_numel
+            para_buffer_needed_numel = forward_grad_numel - ckpt_buffer_numel
         else:
-            max_alpha = sum(numels) / (self._mb_fwd_numel + self._mb_bwd_numel)
+            assert ratio >= 2
+            max_alpha = ratio / (ratio - 1) * ckpt_buffer_numel \
+                / (self._mb_fwd_numel + self._mb_bwd_numel)
             raise NotImplementedError(
                 "The forward gradient numel is too large to fit into the "
-                "gradient buffers, consider either:\n"
-                "  - Increase the checkpoint buffer numel, or\n"
+                "gradient buffers, consider:\n"
+                "  - Increase the CPU checkpoint buffer numel, or\n"
+                "  - Increase the CPU parameter buffer numel, or\n"
                 "  - Reduce the alpha split ratio.\n"
-                "Current alpha split ratio: {:.3f}\n".format(self._alpha) +
-                "The maximum allowed alpha: {:.3f}".format(max_alpha)
+                "Current alpha split ratio: {:.5f}\n".format(self._alpha) +
+                "The maximum allowed alpha: {:.5f}".format(max_alpha)
             )
 
         def _create_view(tensor: Tensor, numel: int, dtype: torch.dtype):
@@ -443,19 +409,60 @@ class FlexTrainOptsCoordinator:
             return _convert_dtype_view(tensor, dtype)[..., :numel]
 
         # Create the gradient buffers.
-        self._cpu_grad_buffer = _create_view(
-            interlayer.cpu_ckpt_base, cpu_buffer_needed_numel,
+        self._borrowed_ckpt_buffer = _create_view(
+            interlayer.cpu_ckpt_base, ckpt_buffer_needed_numel,
             config.mixed_precision.gradacc_dtype
         )
-        self._gpu_grad_buffer = _create_view(
-            interlayer.gpu_ckpt_base, gpu_buffer_needed_numel,
+        self._borrowed_para_buffer = _create_view(
+            para._cpu_para_base, para_buffer_needed_numel,
             config.mixed_precision.gradacc_dtype
         )
 
         # How to reconstruct the forward gradients.
-        forward_grad_splits = \
-            [cpu_buffer_needed_numel, gpu_buffer_needed_numel]
-        # End of assignment. Incredible!!!
+        fwd_grad_splits = [ckpt_buffer_needed_numel, para_buffer_needed_numel]
+
+        # Create an extra gradient buffer for the last unit.
+        # Otherwise, the borrowed parameter buffer is also the write target.
+        # Avoid this by applying an offset of one unit.
+        num_micro_batches = self._micro_batch_per_rank * dist.get_world_size()
+        self._extra_grad_buffer = allocate_memory_chunks(
+            para_buffer_needed_numel, num_micro_batches,
+            config.mixed_precision.gradacc_dtype, torch.device('cpu')
+        )
+
+        # Create optimizer step contexts for each unit.
+        self._unit_fwd_step_ctxts: Dict[int, StepContextContainer] = {}
+        self._unit_bwd_step_ctxts: Dict[int, StepContextContainer] = {}
+        unit_slices = self._mb_para_splits * num_micro_batches
+        for unit in range(self._num_units):
+            # Slice the segments for each unit.
+            segment_groups = slice_segments(
+                self._optimizer.unit_group_segments[unit], unit_slices
+            )
+            # micro_batch, rank, (GPU, CPU, NVMe), (fwd, bwd)
+            segment_groups = reshape_list(
+                segment_groups,
+                (self._micro_batch_per_rank, dist.get_world_size(), 3, 2)
+            )
+            # layout: mb * (GPU, CPU, NVMe)
+            fwd_segments = segment_groups[:, dist.get_rank(), :, 0]
+            fwd_segments = flatten_list(fwd_segments.tolist())
+            self._unit_fwd_step_ctxts[unit] = StepContextContainer(
+                self._micro_batch_per_rank, fwd_segments,
+                self._mb_fwd_para_splits * self._micro_batch_per_rank,
+                self._unit_fwd_mpara_splits,
+                fwd_grad_splits * self._micro_batch_per_rank
+            )
+            # layout: mb * (GPU, CPU, NVMe)
+            bwd_segments = segment_groups[:, dist.get_rank(), :, 1]
+            bwd_segments = flatten_list(bwd_segments.tolist())
+            self._unit_bwd_step_ctxts[unit] = StepContextContainer(
+                self._micro_batch_per_rank, bwd_segments,
+                self._mb_bwd_para_splits * self._micro_batch_per_rank,
+                self._unit_bwd_mpara_splits,
+                [self._unit_bwd_numel]
+            )
+        # End of slice configuration and step context creation.
 
         # Log the configuration.
         rank0_logger.info(
@@ -476,9 +483,10 @@ class FlexTrainOptsCoordinator:
             f"{self._unit_bwd_mpara_splits}\n"
             f"  - Forward gradient numel: {forward_grad_numel}\n"
             f"  - Gradient dtype itemsize / device dtype itemsize: {ratio}\n"
-            f"  - Checkpoint borrowable numels (CPU, GPU): "
-            f"({cvtd_cpu_grad_buffer_numel}, {cvtd_gpu_grad_buffer_numel})\n"
-            f"  - Gradient buffer numels (CPU, GPU): {forward_grad_splits}\n"
+            f"  - Borrowable numels (checkpoint, parameter): "
+            f"({ckpt_buffer_numel}, {para_buffer_numel})\n"
+            f"  - Gradient borrowed numels (checkpoint, parameter): "
+            f"({ckpt_buffer_needed_numel}, {para_buffer_needed_numel})\n"
         )
 
     def _rotate_buffers(self):
@@ -546,9 +554,17 @@ class FlexTrainOptsCoordinator:
                 torch.split(mem_partition, self._mb_para_splits)
 
             # Store forward gradients into buffers.
+            # The borrowed parameter buffer should have an offset of one unit.
+            borrowed_ckpt_buffer = self._borrowed_ckpt_buffer[unit_index]
+            borrowed_para_buffer = \
+                self._extra_grad_buffer if unit_index == self._num_units - 1\
+                else self._borrowed_para_buffer[unit_index + 1]
             copy_segments(
                 [fwd_gpu, fwd_cpu, fwd_nvme],
-                [self._cpu_grad_buffer[unit_index][micro_batch_index]]
+                [
+                    borrowed_ckpt_buffer[micro_batch_index],
+                    borrowed_para_buffer[micro_batch_index]
+                ]
             )
 
             # Move backward gradients into working buffer.
@@ -632,20 +648,21 @@ class FlexTrainOptsCoordinator:
             nvme_opts.chunk(1 + self._optimizer.optimizer_state_per_element)
         full_parameter = [
             self._cpu_fwd_opts[unit_index][0] if forward else
-            self._cpu_bwd_opts[unit_index][0],
-            nvme_para
+            self._cpu_bwd_opts[unit_index][0], nvme_para
         ]
 
-        # Gradients
-        gradient = self._cpu_grad_buffer[unit_index] if forward else \
-            torch.chunk(self._cpu_opt_step_grads, self._micro_batch_per_rank)
+        # Gradients, (2, micro_batch) -> (micro_batch * 2)
+        gradient = list(chain.from_iterable(zip(
+            self._borrowed_ckpt_buffer[unit_index],
+            self._borrowed_para_buffer[unit_index + 1]
+            if unit_index < self._num_units - 1 else self._extra_grad_buffer
+        ))) if forward else self._cpu_opt_step_grads
 
         # Optimizer states
         # Shape: (2, optimizer_state_per_element), need transpose
         optimizer_states = list(map(list, zip(
             self._cpu_fwd_opts[unit_index][1:] if forward else
-            self._cpu_bwd_opts[unit_index][1:],
-            nvme_opts
+            self._cpu_bwd_opts[unit_index][1:], nvme_opts
         )))
 
         # 3. Plan the steps.

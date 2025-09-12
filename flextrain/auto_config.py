@@ -45,12 +45,6 @@ def _to_gb(size: int):
     return size / 1024 ** 3
 
 
-def _record_event():
-    event = torch.cuda.Event(enable_timing=True)
-    event.record()
-    return event
-
-
 def _world_20_80_percentile_avg(nums: List[float]):
     nums.sort()
     start = int(len(nums) * 0.2)
@@ -98,28 +92,39 @@ def system_auto_config():
     layer_fwd_times, layer_bwd_times = [], []
 
     # Get the first LLM layer ready
-    get_para_coordinator()._link_unit_parameters(
-        0, get_para_coordinator()._gpu_available_paras
-    )
-    get_opts_coordinator().pre_unit_backward(0)
+    get_para_coordinator()._link_unit_parameters(0)
+    get_opts_coordinator()._prepare_unit_grads(0)
+    grad_receive_buffer = get_opts_coordinator()._gpu_bwd_extra_grads
+    grad_accmulate_buffer = get_opts_coordinator()._gpu_bwd_receive_grads
+
+    pre_fwd_start = torch.cuda.Event(enable_timing=True)
+    pre_fwd_end = torch.cuda.Event(enable_timing=True)
+    layer_fwd_start = torch.cuda.Event(enable_timing=True)
+    layer_fwd_end = torch.cuda.Event(enable_timing=True)
+    post_start = torch.cuda.Event(enable_timing=True)
+    post_end = torch.cuda.Event(enable_timing=True)
+    layer_bwd_start = torch.cuda.Event(enable_timing=True)
+    layer_bwd_end = torch.cuda.Event(enable_timing=True)
+    pre_bwd_start = torch.cuda.Event(enable_timing=True)
+    pre_bwd_end = torch.cuda.Event(enable_timing=True)
 
     iterations = tqdm(
         range(BENCHMARK_GPU_ITERATIONS), desc="LLM Perf. Benchmarking"
     ) if dist.get_rank() == 0 else range(BENCHMARK_GPU_ITERATIONS)
     for _ in iterations:
         # 1. Benchmark the forward time of pre-process
-        pre_fwd_start = _record_event()
+        pre_fwd_start.record()
         pre_inputs, post_inputs, loss_inputs = LLMFunc.get_batch()
         first_passed_down, every_layer = LLMFunc.pre_process(pre_inputs)
-        pre_fwd_end = _record_event()
+        pre_fwd_end.record()
 
         # 2. Benchmark the forward time of each layer
         passed_down = detach_variable(first_passed_down)
-        unit_fwd_start = _record_event()
+        layer_fwd_start.record()
         unit_passed_down = LLMFunc.layer_forward(0, 1)(
             *passed_down, *every_layer
         )
-        unit_fwd_end = _record_event()
+        layer_fwd_end.record()
 
         # IMPORTANT: initialize the interlayer coordinator
         passed_down_tensor = retrieve_tensor(unit_passed_down)
@@ -127,34 +132,36 @@ def system_auto_config():
 
         # 3. Benchmark the post-process time
         last_passed_down = detach_variable(unit_passed_down)
-        post_start = _record_event()
+        post_start.record()
         llm_outputs = LLMFunc.post_process(last_passed_down, post_inputs)
         llm_loss_rst = LLMFunc.loss(llm_outputs, loss_inputs)
         loss = retrieve_llm_loss(llm_loss_rst)
         torch.autograd.backward(loss)
-        post_end = _record_event()
+        post_end.record()
 
         # 4. Benchmark the backward time of each layer
         tensor = retrieve_tensor(unit_passed_down)
         gradient = torch.ones_like(tensor)
-        unit_bwd_start = _record_event()
+        layer_bwd_start.record()
+        grad_receive_buffer.zero_()
         torch.autograd.backward(tensor, gradient)
-        unit_bwd_end = _record_event()
+        grad_accmulate_buffer += grad_receive_buffer
+        layer_bwd_end.record()
 
         # 5. Benchmark the backward time of pre-process
         tensor = retrieve_tensor(first_passed_down)
         gradient = torch.ones_like(tensor)
-        pre_bwd_start = _record_event()
+        pre_bwd_start.record()
         torch.autograd.backward(tensor, gradient)
-        pre_bwd_end = _record_event()
+        pre_bwd_end.record()
 
         # Record the time
         torch.cuda.synchronize()
         pre_fwd_times.append(pre_fwd_start.elapsed_time(pre_fwd_end))
         pre_bwd_times.append(pre_bwd_start.elapsed_time(pre_bwd_end))
         post_times.append(post_start.elapsed_time(post_end))
-        layer_fwd_times.append(unit_fwd_start.elapsed_time(unit_fwd_end))
-        layer_bwd_times.append(unit_bwd_start.elapsed_time(unit_bwd_end))
+        layer_fwd_times.append(layer_fwd_start.elapsed_time(layer_fwd_end))
+        layer_bwd_times.append(layer_bwd_start.elapsed_time(layer_bwd_end))
 
     # Compute the average time
     avg_pre_fwd = _world_20_80_percentile_avg(pre_fwd_times)
@@ -176,6 +183,8 @@ def system_auto_config():
 
     # 2. Benchmark the PCIe bandwidth
     pcie_times = []
+    pcie_start = torch.cuda.Event(enable_timing=True)
+    pcie_end = torch.cuda.Event(enable_timing=True)
     torch.cuda.empty_cache()
     read_buffer = torch.empty(
         BENCHMARK_PCIE_BLOCK_SIZE, dtype=torch.uint8, pin_memory=True
@@ -189,9 +198,9 @@ def system_auto_config():
     ) if dist.get_rank() == 0 else range(BENCHMARK_PCIE_ITERATIONS)
     for _ in iterations:
         write_buffer += 1
-        pcie_start = _record_event()
+        pcie_start.record()
         read_buffer.copy_(write_buffer)
-        pcie_end = _record_event()
+        pcie_end.record()
         # Record the time
         torch.cuda.synchronize()
         pcie_times.append(pcie_start.elapsed_time(pcie_end))
@@ -552,6 +561,7 @@ class FlexTrainConfigSolver:
             <= self.mpp.usable_vram, "GPU memory constraint"
 
         # Figure out CPU memory consumptions on each buffer
+        # NOTE: A tiny buffer named _extra_grad_buffer is ignored here
         rank_cpu_ckpt_base = self.cpu_ckpt * rank_ckpt_size
         rank_cpu_grad_base = self.cpu_grad * rank_grad_size
         rank_nvme_ckpt_margin_base = \
@@ -590,8 +600,8 @@ class FlexTrainConfigSolver:
             "CPU memory constraint"
 
         # Add alpha constraint
-        self.problem += world_cpu_ckpt_base >= world_fwd_grad_size, \
-            "Alpha lower bound constraint"
+        self.problem += alpha * world_cpu_para_base + world_cpu_ckpt_base \
+            >= world_fwd_grad_size, "Alpha lower bound constraint"
 
     def _add_computation_constraint(self):
         # Basic parameters
