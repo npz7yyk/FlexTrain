@@ -311,13 +311,15 @@ def system_auto_config():
     step_throughput = _to_gb(BENCHMARK_OPTIMIZER_BLOCK_SIZE) / avg_opt_step
     dist.rank0_logger.info(
         "\n\n> FlexTrain optimizer step throughput benchmarking results:\n"
-        f"  - Average optimizer step throughput: {step_throughput:.3f} G/s\n"
+        f"  - Average optimizer step throughput: "
+        f"{world_size} x {step_throughput:.3f} G/s\n"
     )
     step_throughput = BENCHMARK_OPTIMIZER_BLOCK_SIZE / avg_opt_step
 
     # 5. Fill in the machine performance parameters
     mixed_precision = get_flextrain_config().mixed_precision
     perf_params = MachinePerfParams(
+        world_size=world_size,
         num_layers=get_para_coordinator().num_layers,
         opt_state_per_element=opt_state_per_element,
         device_dtype_itemsize=mixed_precision.device_dtype.itemsize,
@@ -333,13 +335,13 @@ def system_auto_config():
         pcie_bandwidth=pcie_bandwidth,
         nvme_read_bandwidth=avg_read_bandwidth * world_size,
         nvme_write_bandwidth=avg_write_bandwidth * world_size,
-        opt_step_throughput=step_throughput
+        opt_step_throughput=step_throughput * world_size
     )
 
     # 6. Solve the optimization problem
-    solver = FlexTrainConfigSolver(perf_params)
-    solver.solve()
-
+    if dist.get_rank() == 0:
+        solver = FlexTrainConfigSolver(perf_params)
+        solver.solve()
     # Exit the script
     exit()
 
@@ -347,6 +349,7 @@ def system_auto_config():
 @dataclass
 class MachinePerfParams:
     # Basic parameters
+    world_size: int
     num_layers: int
     opt_state_per_element: int
     device_dtype_itemsize: int
@@ -393,7 +396,7 @@ class FlexTrainConfigSolver:
         pulp.LpSolverDefault.msg = False
 
         # Get basic parameters
-        self.world_size = dist.get_world_size()
+        self.world_size = machine_perf_params.world_size
         # Link to the machine performance parameters
         self.mpp = machine_perf_params
 
@@ -590,7 +593,7 @@ class FlexTrainConfigSolver:
 
         # Add the CPU memory constraint
         self.problem += \
-            dist.get_world_size() * (
+            self.world_size * (
                 rank_cpu_ckpt_base + rank_cpu_grad_base +
                 rank_nvme_ckpt_margin_base + rank_nvme_ckpt_prefetch_buffer
             ) + world_cpu_para_base + world_nvme_para_prefetch_buffer + \
@@ -618,11 +621,11 @@ class FlexTrainConfigSolver:
             ) * mbpr, "Backward layer computation constraint"
 
         # 2. Optimizer step throughput
-        rank_step_numel = self.mpp.layer_numel / self.world_size
+        step_numel = self.mpp.layer_numel
         self.problem += self.unit_fwd_time * self.mpp.opt_step_throughput >= \
-            alpha * rank_step_numel, "Forward optimizer step constraint"
+            alpha * step_numel, "Forward optimizer step constraint"
         self.problem += self.unit_bwd_time * self.mpp.opt_step_throughput >= \
-            (1 - alpha) * rank_step_numel, "Backward optimizer step constraint"
+            (1 - alpha) * step_numel, "Backward optimizer step constraint"
 
     def _add_bandwidth_constraint(self):
         # Basic parameters
