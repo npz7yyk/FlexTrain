@@ -390,8 +390,10 @@ class FlexTrainOptsCoordinator:
             para_buffer_needed_numel = forward_grad_numel - ckpt_buffer_numel
         else:
             assert ratio >= 2
-            max_alpha = ratio / (ratio - 1) * ckpt_buffer_numel \
-                / (self._mb_fwd_numel + self._mb_bwd_numel)
+            mb_ckpt = interlayer._ckpt_numels[1]
+            mb_para = self._mb_fwd_numel + self._mb_bwd_numel
+            mb_cpu_para = sum(self._mb_cpu_alpha_splits)
+            max_alpha = mb_ckpt / (ratio * mb_para - mb_cpu_para)
             raise NotImplementedError(
                 "The forward gradient numel is too large to fit into the "
                 "gradient buffers, consider:\n"
